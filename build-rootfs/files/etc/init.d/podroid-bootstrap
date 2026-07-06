@@ -51,18 +51,24 @@ start() {
         [ -w "$q" ] && echo mq-deadline > "$q" 2>/dev/null
     done
 
-    # Downloads share — self-gating: host only adds the virtio-9p device when
-    # the user enables the toggle, so this returns ENODEV and exits silently
-    # when off. Foreground so a missing /dev/fuse or kernel feature surfaces
-    # in the boot log instead of being swallowed.
+    # Downloads share (QEMU virtio-9p). On AVF, podroid-downloads owns
+    # /mnt/downloads instead (9p over vsock, rendezvous with the Android-side
+    # 9p2000.L server) — skip the virtio-9p attempt there entirely.
+    #
+    # QEMU path: self-gating — host only adds the virtio-9p device when the
+    # user enables the toggle, so this returns ENODEV and exits silently when
+    # off. Foreground so a missing /dev/fuse or kernel feature surfaces in the
+    # boot log instead of being swallowed.
     # msize=262144 (256 KB) — well under QEMU's virtio-9p 512 KB ceiling and
     # large enough to amortize round-trips for big reads. cache=mmap is the
     # next-best after cache=fscache (which requires CONFIG_9P_FSCACHE=y, not
     # in this kernel build); mmap still page-caches mapped regions and is
     # noticeably better than cache=loose for re-reads.
-    mkdir -p /mnt/downloads 2>/dev/null
-    mount -t 9p -o trans=virtio,version=9p2000.L,rw,msize=262144,cache=mmap,noatime \
-        downloads /mnt/downloads 2>/dev/null
+    if ! grep -q 'podroid\.backend=avf' /proc/cmdline 2>/dev/null; then
+        mkdir -p /mnt/downloads 2>/dev/null
+        mount -t 9p -o trans=virtio,version=9p2000.L,rw,msize=262144,cache=mmap,noatime \
+            downloads /mnt/downloads 2>/dev/null
+    fi
 
     mkdir -p /dev/net 2>/dev/null
     [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200 2>/dev/null

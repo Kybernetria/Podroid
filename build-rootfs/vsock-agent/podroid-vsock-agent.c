@@ -30,6 +30,11 @@
  *
  * All TCP listeners bind to AF_VSOCK with CID = VMADDR_CID_ANY (host can reach
  * us regardless of the assigned CID).
+ *
+ * Invoked as `podroid-vsock-agent downloads-9p` (argv[1] dispatch, separate
+ * from the config-driven modes above): runs only the Downloads share's 9p
+ * rendezvous listener (see downloads_9p_serve()) instead of the forwards.conf
+ * + ctl loop.
  */
 
 #define _GNU_SOURCE
@@ -40,11 +45,13 @@
 #include <linux/vm_sockets.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -56,6 +63,11 @@
 #define CONFIG_PATH     "/etc/podroid/forwards.conf"
 #define TERM_SIZE_PATH  "/run/term_size"
 #define LOG_TAG         "podroid-vsock-agent"
+
+/* Reserved vsock port for the AVF Downloads share's 9p rendezvous. Keep this
+ * equal to AvfDownloadsShare.DOWNLOADS_VSOCK_PORT in the Android code. */
+#define PODROID_DOWNLOADS_VSOCK_PORT 200000
+#define PODROID_DOWNLOADS_MOUNT      "/mnt/downloads"
 
 /* ── Logging ─────────────────────────────────────────────────────────────── */
 
@@ -681,6 +693,88 @@ static void ctl_loop(int fd) {
     fclose(out);
 }
 
+/* ── Downloads 9p rendezvous (downloads-9p mode) ────────────────────────────
+ *
+ * Android's AvfDownloadsShare connectVsock()s to this port and runs its own
+ * in-process 9p2000.L server directly against the resulting socket. We are
+ * only the transport rendezvous: accept the one connection, hand its fd to
+ * the guest kernel's 9p client via `mount -t 9p -o trans=fd`, then get out of
+ * the way. The mounted fd carries live 9p protocol traffic between the guest
+ * kernel and Android's server - we must never read() or write() it ourselves,
+ * that would steal or corrupt protocol bytes.
+ *
+ * mount(2) with trans=fd has the kernel take its own reference to rfdno/wfdno
+ * (net/9p/trans_fd.c fgets them), so our own fd stays valid across the call
+ * and keeps working afterwards purely as an observation handle: poll() only
+ * reports readiness, it never consumes data, so it is safe to watch even
+ * though the bytes flowing through the fd belong to the 9p session. POLLHUP/
+ * POLLERR/POLLNVAL are reported by the kernel regardless of the requested
+ * events, so polling with events=0 gives us exactly "the peer went away"
+ * without also waking on ordinary 9p traffic.
+ */
+static void downloads_9p_serve(void) {
+    int s = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0) { LOG_E("downloads-9p: vsock socket() failed: %s", strerror(errno)); return; }
+    int one = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_vm sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.svm_family = AF_VSOCK;
+    sa.svm_cid    = VMADDR_CID_ANY;
+    sa.svm_port   = PODROID_DOWNLOADS_VSOCK_PORT;
+    if (bind(s, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        LOG_E("downloads-9p: vsock bind(%d) failed: %s", PODROID_DOWNLOADS_VSOCK_PORT, strerror(errno));
+        close(s);
+        return;
+    }
+    if (listen(s, 1) < 0) {
+        LOG_E("downloads-9p: vsock listen(%d) failed: %s", PODROID_DOWNLOADS_VSOCK_PORT, strerror(errno));
+        close(s);
+        return;
+    }
+    LOG_I("downloads-9p: listening on vsock:%d", PODROID_DOWNLOADS_VSOCK_PORT);
+
+    for (;;) {
+        int cfd = accept4(s, NULL, NULL, 0);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            LOG_E("downloads-9p: accept() failed: %s", strerror(errno));
+            break;
+        }
+
+        mkdir(PODROID_DOWNLOADS_MOUNT, 0755);
+        char opts[160];
+        snprintf(opts, sizeof(opts),
+                 "trans=fd,rfdno=%d,wfdno=%d,version=9p2000.L,msize=262144,cache=none,access=any",
+                 cfd, cfd);
+        if (mount("downloads", PODROID_DOWNLOADS_MOUNT, "9p", 0, opts) < 0) {
+            LOG_W("downloads-9p: mount failed: %s", strerror(errno));
+            close(cfd);
+            continue;  // non-fatal - wait for Android to reconnect
+        }
+        LOG_I("downloads-9p: mounted %s", PODROID_DOWNLOADS_MOUNT);
+
+        /* Block until the connection dies (Android side closed, VM stopping,
+         * sharing toggled off), then unmount and go back to accept(). */
+        for (;;) {
+            struct pollfd pfd = { .fd = cfd, .events = 0 };
+            int pr = poll(&pfd, 1, -1);
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) break;
+        }
+
+        LOG_I("downloads-9p: connection ended, unmounting");
+        if (umount2(PODROID_DOWNLOADS_MOUNT, MNT_DETACH) < 0 && errno != EINVAL && errno != ENOENT)
+            LOG_W("downloads-9p: umount2 failed: %s", strerror(errno));
+        close(cfd);
+        // loop back to accept() - best-effort reconnect
+    }
+    close(s);
+}
+
 /* ── Main + config bootstrap ────────────────────────────────────────────── */
 
 static int ctl_vport = -1;
@@ -721,15 +815,22 @@ static void reap_children(int signum) {
 }
 
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
+    /* Ignore SIGPIPE in every mode - splice_loop's write() and the downloads
+     * 9p rendezvous both prefer EPIPE on a dead peer over the default
+     * SIGPIPE disposition. */
+    signal(SIGPIPE, SIG_IGN);
+
+    if (argc >= 2 && strcmp(argv[1], "downloads-9p") == 0) {
+        downloads_9p_serve();
+        return 0;
+    }
+
     /* Reap dead listener children; don't accumulate zombies. */
     struct sigaction sa = {0};
     sa.sa_handler = reap_children;
     sa.sa_flags = SA_NOCLDSTOP | SA_RESTART;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGCHLD, &sa, NULL);
-    /* Ignore SIGPIPE — splice_loop's write() will surface the error instead. */
-    signal(SIGPIPE, SIG_IGN);
 
     parse_config_and_bootstrap(CONFIG_PATH);
 

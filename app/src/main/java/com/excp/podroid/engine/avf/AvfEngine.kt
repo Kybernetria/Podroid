@@ -17,7 +17,6 @@ package com.excp.podroid.engine.avf
 
 import android.content.Context
 import android.os.Build
-import android.system.Os
 import android.util.Log
 import androidx.annotation.RequiresApi
 import com.excp.podroid.data.repository.PortForwardRule
@@ -179,6 +178,8 @@ class AvfEngine @Inject constructor(
     private val maxConsoleSize = 64 * 1024
     private var logOut: java.io.FileOutputStream? = null
     @Volatile private var control: VsockControlChannel? = null
+    /** Live AVF Downloads share (9p over vsock); started in bringUpControlChannel(), torn down in cleanup(). */
+    @Volatile private var downloadsShare: AvfDownloadsShare? = null
     /**
      * Initial rules captured from start()'s portForwards arg — includes the
      * auto-injected SSH/X11/audio rules that PodroidService adds in-memory
@@ -261,6 +262,18 @@ class AvfEngine @Inject constructor(
         // bound; addPortForward logs a one-time warning for that narrow window.
         control = ctl
         ctl.open()
+        if (lastConfig?.storageAccessEnabled == true) {
+            // Assign `downloadsShare` BEFORE calling start() (mirrors `control =
+            // ctl; ctl.open()` above): start() only launches a non-blocking
+            // connect+serve coroutine now, but a racing cleanup() must always
+            // see a non-null share to stop, even in the instant before that
+            // coroutine's connect attempt completes. The real outcome
+            // ("added"/"unavailable") is logged from inside the coroutine.
+            val share = AvfDownloadsShare(vm, scope)
+            downloadsShare = share
+            Log.i(TAG, "downloadsShare=starting")
+            share.start()
+        }
         scope.launch {
             // addPortForward now rethrows on failure (for EngineHolder's retry).
             // Guard each replay so one failing rule doesn't abort the rest;
@@ -807,6 +820,8 @@ class AvfEngine @Inject constructor(
         resizeDebounceJob = null
         runCatching { control?.close() }
         control = null
+        downloadsShare?.stop()
+        downloadsShare = null
         // Close fanout next — drains its coroutines AND closes the console
         // streams (it is their single owner). We hold the same references only
         // to hand them to the fanout; closing them here too would double-close
@@ -1004,47 +1019,10 @@ class AvfEngine @Inject constructor(
         }
         AvfReflect.addDisk(cb, storage.absolutePath, writable = true)
         AvfReflect.addDisk(cb, squashfs.absolutePath, writable = false)
-        var shareSummary = if (config.storageAccessEnabled) "enabled" else "off"
-        if (config.storageAccessEnabled) {
-            val downloads = android.os.Environment.getExternalStoragePublicDirectory(
-                android.os.Environment.DIRECTORY_DOWNLOADS
-            ).absolutePath
-            // External-storage paths (/storage/emulated/...) live outside the
-            // app's SELinux domain. AOSP TerminalApp's ConfigJson.SharedPathJson
-            // handles this by passing appDomain=false so crosvm spins up as a
-            // child of virtmgr (system domain) instead of inheriting our
-            // untrusted_app domain. Without that, crosvm gets EACCES on the
-            // first read and the VM dies with reason=4 at start.
-            //
-            // On AVF revisions that don't ship the 10-param ctor with
-            // appDomain, AvfReflect refuses the share (returns false) and we
-            // boot without it — better than crashing the VM. The toggle in
-            // Settings just becomes a no-op on those devices.
-            val ok = runCatching {
-                AvfReflect.addSharedPath(
-                    customBuilder = cb,
-                    sharedPath = downloads,
-                    tag = "downloads",
-                    hostUid = android.os.Process.myUid(),
-                    hostGid = Os.getgid(),
-                    guestUid = 1000,
-                    guestGid = 100,
-                    mask = 0x0007,
-                    socket = "downloads",
-                    socketPath = "",
-                    appDomain = false,
-                )
-            }.getOrElse { e ->
-                Log.w(TAG, "addSharedPath threw (continuing without share)", e); false
-            }
-            if (ok) {
-                shareSummary = "added"
-                Log.i(TAG, "downloads share added: $downloads")
-            } else {
-                shareSummary = "no-op (unsupported on this AVF revision)"
-                Log.i(TAG, "downloads share NOT added — Settings toggle is a no-op on this AVF revision")
-            }
-        }
+        // The actual share is a post-boot AvfDownloadsShare connecting over vsock
+        // (see bringUpControlChannel()); the real outcome ("added"/"unavailable")
+        // isn't known until then, so this summary just reflects the setting here.
+        val shareSummary = if (config.storageAccessEnabled) "pending" else "off"
         AvfReflect.setNetworkSupported(cb, true)
         // Declaring a (headless, display-less) GPU forces virtmgr onto the full
         // `crosvm` instead of `crosvm_minimal`, which on Pixel's APEX lacks the
