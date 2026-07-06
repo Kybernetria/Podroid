@@ -46,6 +46,12 @@ interface VmEngine {
      */
     val runningSinceMs: Long? get() = null
 
+    /** Resident set size of the emulator process (QEMU), in MB; null if unknown. */
+    fun emulatorRssMb(): Long? = null
+
+    /** Emulator process PID on the Android host; null when not tracked (e.g. AVF). */
+    fun emulatorPid(): Int? = null
+
     /** QEMU-specific. Null on backends that don't use QMP (e.g. AVF). */
     val qmpClient: QmpClient?
 
@@ -101,4 +107,5 @@ data class VmConfig(
     val verboseLogging: Boolean = false,
     val x11Dpi: Int = 96,
     val usbPassthroughEnabled: Boolean = false,
+    val bandwidthMbps: Int = 0,
 )

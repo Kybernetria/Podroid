@@ -994,6 +994,7 @@ class AvfEngine @Inject constructor(
         val resolvedCmdline = ("console=hvc0 $earlycon root=/dev/ram0 mitigations=off " +
             "elevator=mq-deadline podroid.tty=hvc0 podroid.backend=avf podroid.epoch=$epoch " +
             "podroid.x11.dpi=${config.x11Dpi}$verboseFlags$nrCpusFlag " +
+            (if (config.bandwidthMbps > 0) "podroid.bandwidth=${config.bandwidthMbps} " else "") +
             config.kernelExtraCmdline).trim()
         AvfReflect.addParams(cb, resolvedCmdline)
         if (config.verboseLogging) {

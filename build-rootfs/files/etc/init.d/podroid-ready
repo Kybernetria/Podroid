@@ -21,6 +21,9 @@ start() {
     done
 
     # Emit the boot stages PodroidQemu.detectBootStage() expects.
+    if [ -x /usr/local/bin/podroid-update-stats ]; then
+        /usr/local/bin/podroid-update-stats || true
+    fi
     echo "Starting SSH..." > /dev/console
     echo "Almost ready..." > /dev/console
     echo "Ready!" > /dev/console

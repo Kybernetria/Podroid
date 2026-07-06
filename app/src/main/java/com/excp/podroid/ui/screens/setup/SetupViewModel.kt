@@ -35,16 +35,24 @@ class SetupViewModel @Inject constructor(
      */
     fun completeSetup(
         storageSizeGb: Int,
+        vmRamMb: Int,
+        vmCpus: Int,
         sshEnabled: Boolean,
         storageAccessEnabled: Boolean,
         usbPassthroughEnabled: Boolean,
+        loadBalanceEnabled: Boolean,
+        bandwidthMbps: Int,
     ) {
         viewModelScope.launch {
             settingsRepository.completeSetup(
                 storageSizeGb = storageSizeGb,
+                vmRamMb = vmRamMb,
+                vmCpus = vmCpus,
                 sshEnabled = sshEnabled,
                 storageAccessEnabled = storageAccessEnabled,
                 usbPassthroughEnabled = usbPassthroughEnabled,
+                loadBalanceEnabled = loadBalanceEnabled,
+                bandwidthMbps = bandwidthMbps,
             )
             _setupComplete.value = true
         }

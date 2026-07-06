@@ -84,6 +84,9 @@ import com.excp.podroid.ui.components.PodroidDestructiveButton
 import com.excp.podroid.ui.components.PodroidGhostButton
 import com.excp.podroid.ui.components.PodroidInlineAction
 import com.excp.podroid.ui.components.PodroidListRow
+import com.excp.podroid.ui.components.VmBandwidthChips
+import com.excp.podroid.ui.components.VmCpuChips
+import com.excp.podroid.ui.components.VmRamChips
 import com.excp.podroid.ui.components.PodroidChipColors
 import com.excp.podroid.ui.components.PodroidSectionLabel
 import com.excp.podroid.ui.components.PodroidSwitch
@@ -108,6 +111,7 @@ fun SettingsScreen(
     onNavigateBack: () -> Unit,
     onThemeOrFontChanged: () -> Unit = {},
     onLanguageChanged: () -> Unit = {},
+    onNavigateToContainerBackup: () -> Unit = {},
     viewModel: SettingsViewModel = hiltViewModel(),
 ) {
     val ui by viewModel.uiState.collectAsStateWithLifecycle()
@@ -229,15 +233,30 @@ fun SettingsScreen(
                         modifier = Modifier.padding(top = PodroidTokens.Spacing.SM),
                     )
                 }
-                RamSection(
+                PodroidListRow(
+                    label = stringResource(R.string.load_balance),
+                    rightSlot = {
+                        PodroidSwitch(
+                            checked = ui.loadBalanceEnabled,
+                            onCheckedChange = { viewModel.setLoadBalanceEnabled(it) },
+                            enabled = vmNotRunning,
+                        )
+                    },
+                )
+                VmRamChips(
                     currentMb = ui.vmRamMb,
                     onChange = viewModel::setVmRamMb,
-                    enabled = vmNotRunning,
+                    enabled = vmNotRunning && !ui.loadBalanceEnabled,
                 )
-                CpusSection(
+                VmCpuChips(
                     currentCpus = ui.vmCpus,
                     onChange = viewModel::setVmCpus,
-                    enabled = vmNotRunning,
+                    enabled = vmNotRunning && !ui.loadBalanceEnabled,
+                )
+                VmBandwidthChips(
+                    currentMbps = ui.bandwidthMbps,
+                    onChange = viewModel::setBandwidthMbps,
+                    enabled = vmNotRunning && !ui.loadBalanceEnabled,
                 )
                 PodroidListRow(
                     label = stringResource(R.string.storage),
@@ -275,6 +294,12 @@ fun SettingsScreen(
                     available = isDownloadsShareAvailable,
                     activeBackendId = activeBackendId,
                     onToggle = { viewModel.setStorageAccessEnabled(it) },
+                )
+                PodroidListRow(
+                    label = stringResource(R.string.container_backup_title),
+                    value = stringResource(R.string.container_backup_settings_subtitle),
+                    trailing = "›",
+                    onClick = onNavigateToContainerBackup,
                 )
                 UsbPassthroughRow(
                     enabled = usbPassthrough,
@@ -492,80 +517,6 @@ fun SettingsScreen(
                     Text(stringResource(R.string.cancel))
                 }
             },
-        )
-    }
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun RamSection(currentMb: Int, onChange: (Int) -> Unit, enabled: Boolean) {
-    Column(modifier = Modifier.padding(bottom = PodroidTokens.Spacing.SM)) {
-        Text(
-            "${stringResource(R.string.ram_label)}  ·  ${if (currentMb >= 1024) "${currentMb / 1024} GB" else "$currentMb MB"}",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.padding(
-                top = PodroidTokens.Spacing.MD,
-                bottom = PodroidTokens.Spacing.SM,
-            ),
-        )
-        FlowRow(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(PodroidTokens.Spacing.SM),
-            verticalArrangement = Arrangement.spacedBy(PodroidTokens.Spacing.SM),
-        ) {
-            listOf(512, 1024, 2048, 4096).forEach { mb ->
-                FilterChip(
-                    selected = mb == currentMb,
-                    enabled = enabled,
-                    onClick = { onChange(mb) },
-                    label = { Text(if (mb >= 1024) "${mb / 1024} GB" else "$mb MB") },
-                    shape = RoundedCornerShape(PodroidTokens.Radius.Chip),
-                    colors = PodroidChipColors(),
-                )
-            }
-        }
-        HorizontalDivider(
-            color = MaterialTheme.colorScheme.outline,
-            thickness = 1.dp,
-            modifier = Modifier.padding(top = PodroidTokens.Spacing.MD),
-        )
-    }
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun CpusSection(currentCpus: Int, onChange: (Int) -> Unit, enabled: Boolean) {
-    Column(modifier = Modifier.padding(bottom = PodroidTokens.Spacing.SM)) {
-        Text(
-            "${stringResource(R.string.cpu_cores)}  ·  $currentCpus",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.padding(
-                top = PodroidTokens.Spacing.MD,
-                bottom = PodroidTokens.Spacing.SM,
-            ),
-        )
-        FlowRow(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(PodroidTokens.Spacing.SM),
-            verticalArrangement = Arrangement.spacedBy(PodroidTokens.Spacing.SM),
-        ) {
-            listOf(1, 2, 4, 6, 8).forEach { n ->
-                FilterChip(
-                    selected = n == currentCpus,
-                    enabled = enabled,
-                    onClick = { onChange(n) },
-                    label = { Text("$n") },
-                    shape = RoundedCornerShape(PodroidTokens.Radius.Chip),
-                    colors = PodroidChipColors(),
-                )
-            }
-        }
-        HorizontalDivider(
-            color = MaterialTheme.colorScheme.outline,
-            thickness = 1.dp,
-            modifier = Modifier.padding(top = PodroidTokens.Spacing.MD),
         )
     }
 }

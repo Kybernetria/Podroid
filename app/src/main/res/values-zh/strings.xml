@@ -53,6 +53,11 @@
     <string name="network_label">网络</string>
     <string name="ssh_access">SSH 访问</string>
     <string name="ssh_password_hint">ssh root@&lt;手机-ip&gt; -p 9922   (密码: podroid)</string>
+    <string name="load_balance">负载均衡</string>
+    <string name="load_balance_description">根据本机自动调整 CPU、内存、存储和带宽。</string>
+    <string name="load_balance_storage_hint">存储大小已自动设置。在下一步关闭负载均衡后可手动选择。</string>
+    <string name="bandwidth_limit">带宽限制</string>
+    <string name="bandwidth_unlimited">无限制</string>
 
     <!-- Storage Access -->
     <string name="downloads_sharing">下载文件夹共享</string>
@@ -116,6 +121,63 @@
     <string name="none">无</string>
     <string name="active">活动</string>
     <string name="off">关闭</string>
+    <string name="on">开启</string>
+
+    <!-- Status monitor -->
+    <string name="status_page_title">状态监控</string>
+    <string name="status_phone_section">手机</string>
+    <string name="status_vm_section">虚拟机</string>
+    <string name="status_load_average">平均负载（1 / 5 / 15 分钟）</string>
+    <string name="status_vm_ram_allocated">虚拟机内存（已分配）</string>
+    <string name="status_emulator_rss">模拟器占用 %1$s</string>
+    <string name="status_vm_disk">虚拟机磁盘镜像</string>
+    <string name="status_unavailable">—</string>
+    <string name="status_error">错误</string>
+    <string name="status_refresh_hint">此页面打开时每 2 秒自动刷新。</string>
+    <string name="status_vm_load_graph_title">虚拟机 CPU 负载</string>
+    <string name="status_vm_load_current">当前：%1$d%%</string>
+    <string name="status_vm_load_collecting">正在采集数据…</string>
+    <string name="status_vm_load_waiting">启动虚拟机后显示负载</string>
+    <string name="status_vm_load_stopped">虚拟机未运行</string>
+    <string name="status_vm_load_avf_only">负载图表仅在 QEMU 后端且虚拟机运行时可用</string>
+    <string name="status_vm_load_graph_hint">根据手机上模拟器进程的 CPU 占用计算，并按虚拟机分配的核心数归一化。</string>
+    <string name="status_vm_load_axis" formatted="false">最近约 2 分钟 · 0%（空闲）→ 100%（全部核心繁忙）</string>
+
+    <!-- Container backup -->
+    <string name="container_backup_title">容器备份</string>
+    <string name="container_backup_settings_subtitle">导出容器与镜像</string>
+    <string name="container_backup_description">将 Podman 容器导出或保存镜像为 tar 归档。在虚拟机内的终端中运行复制的命令。</string>
+    <string name="container_backup_location">备份位置</string>
+    <string name="container_backup_guest_path">虚拟机路径</string>
+    <string name="container_backup_phone_path">手机（下载目录）</string>
+    <string name="container_backup_phone_path_value">Download/Podroid/backups</string>
+    <string name="container_backup_downloads_hint">在设置中启用下载目录共享，备份文件会出现在手机上。</string>
+    <string name="container_backup_avf_hint">下载目录共享仅在 QEMU 后端可用。备份保留在虚拟机 /var/backups/podroid。</string>
+    <string name="container_backup_export">导出容器</string>
+    <string name="container_backup_vm_stopped">运行备份命令前请先启动虚拟机。</string>
+    <string name="container_backup_container_name">容器名称</string>
+    <string name="container_backup_copy_export">复制导出命令</string>
+    <string name="container_backup_save_image">保存镜像</string>
+    <string name="container_backup_image_ref">镜像引用</string>
+    <string name="container_backup_image_placeholder">docker.io/library/nginx:latest</string>
+    <string name="container_backup_copy_save">复制保存命令</string>
+    <string name="container_backup_tools">工具</string>
+    <string name="container_backup_copy_list">复制列表命令</string>
+    <string name="container_backup_copy_all">复制全部备份命令</string>
+    <string name="container_backup_terminal_hint">粘贴到 Podroid 终端。较新的客户机镜像包含 podroid-backup；旧镜像会自动回退到 podman export。</string>
+    <string name="container_backup_on_phone">手机上的备份</string>
+    <string name="container_backup_refresh">刷新列表</string>
+    <string name="container_backup_none">Downloads/Podroid/backups 中尚未找到备份归档。</string>
+    <string name="container_backup_copied">命令已复制</string>
+
+    <!-- Home -->
+    <string name="home_containers_created">已创建容器</string>
+    <string name="home_containers_count">%1$d</string>
+    <string name="home_containers_unknown">—</string>
+    <string name="home_action_backup">备份</string>
+    <string name="home_action_status">状态</string>
+    <string name="home_action_terminal">终端</string>
+
     <string name="up">运行中</string>
 
     <!-- AVF Hint -->

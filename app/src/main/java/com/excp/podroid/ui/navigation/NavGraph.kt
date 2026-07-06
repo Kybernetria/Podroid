@@ -16,6 +16,8 @@ import com.excp.podroid.ui.screens.settings.SettingsScreen
 import com.excp.podroid.ui.screens.setup.SetupScreen
 import com.excp.podroid.ui.screens.terminal.TerminalScreen
 import com.excp.podroid.ui.screens.terminal.TerminalViewModel
+import com.excp.podroid.ui.screens.backup.ContainerBackupScreen
+import com.excp.podroid.ui.screens.status.StatusScreen
 import com.excp.podroid.ui.screens.x11.X11Screen
 
 object Routes {
@@ -24,6 +26,8 @@ object Routes {
     const val TERMINAL      = "terminal"
     const val TERMINAL_X11  = "terminal/x11"
     const val SETTINGS      = "settings"
+    const val STATUS        = "status"
+    const val CONTAINER_BACKUP = "container_backup"
 }
 
 @Composable
@@ -70,6 +74,27 @@ fun PodroidNavGraph(
                 onNavigateToSettings = {
                     navController.navigate(Routes.SETTINGS) { launchSingleTop = true }
                 },
+                onNavigateToStatus = {
+                    navController.navigate(Routes.STATUS) { launchSingleTop = true }
+                },
+                onNavigateToContainerBackup = {
+                    navController.navigate(Routes.CONTAINER_BACKUP) { launchSingleTop = true }
+                },
+            )
+        }
+
+        composable(Routes.STATUS) {
+            StatusScreen(
+                windowSizeClass = windowSizeClass,
+                onNavigateBack = {
+                    if (navController.currentDestination?.route == Routes.STATUS) {
+                        navController.popBackStack()
+                    } else if (!navController.popBackStack(Routes.HOME, inclusive = false)) {
+                        navController.navigate(Routes.HOME) {
+                            popUpTo(0) { inclusive = true }
+                        }
+                    }
+                },
             )
         }
 
@@ -108,6 +133,21 @@ fun PodroidNavGraph(
             )
         }
 
+        composable(Routes.CONTAINER_BACKUP) {
+            ContainerBackupScreen(
+                windowSizeClass = windowSizeClass,
+                onNavigateBack = {
+                    if (navController.currentDestination?.route == Routes.CONTAINER_BACKUP) {
+                        navController.popBackStack()
+                    } else if (!navController.popBackStack(Routes.HOME, inclusive = false)) {
+                        navController.navigate(Routes.HOME) {
+                            popUpTo(0) { inclusive = true }
+                        }
+                    }
+                },
+            )
+        }
+
         composable(Routes.SETTINGS) {
             val activity = LocalActivity.current
             val onLanguageChanged = remember(activity) {
@@ -125,6 +165,9 @@ fun PodroidNavGraph(
                     }
                 },
                 onLanguageChanged = onLanguageChanged,
+                onNavigateToContainerBackup = {
+                    navController.navigate(Routes.CONTAINER_BACKUP) { launchSingleTop = true }
+                },
             )
         }
     }

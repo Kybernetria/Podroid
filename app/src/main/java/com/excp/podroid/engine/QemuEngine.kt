@@ -28,6 +28,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.util.Log
 import com.excp.podroid.data.repository.PortForwardRule
+import com.excp.podroid.util.HostMetrics
 import com.excp.podroid.util.LogProxy
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
@@ -80,6 +81,17 @@ class QemuEngine @Inject constructor(
     @Volatile
     private var _runningSinceMs: Long? = null
     override val runningSinceMs: Long? get() = _runningSinceMs
+
+    override fun emulatorRssMb(): Long? {
+        val proc = process?.takeIf { it.isAlive } ?: return null
+        val pid = HostMetrics.processPid(proc) ?: return null
+        return HostMetrics.processVmRssMb(pid)
+    }
+
+    override fun emulatorPid(): Int? {
+        val proc = process?.takeIf { it.isAlive } ?: return null
+        return HostMetrics.processPid(proc)
+    }
 
     @Volatile
     var process: Process? = null
@@ -558,6 +570,7 @@ class QemuEngine @Inject constructor(
                 append(" androidip=").append(config.androidIp)
                 if (config.sshEnabled) append(" ssh=1")
                 append(" podroid.x11.dpi=").append(config.x11Dpi)
+                if (config.bandwidthMbps > 0) append(" podroid.bandwidth=").append(config.bandwidthMbps)
             }
             args += "-append"; args += cmdline
         } else {

@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.MonitorHeart
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material3.AlertDialog
@@ -68,6 +69,8 @@ fun HomeScreen(
     windowSizeClass: WindowSizeClass,
     onNavigateToTerminal: () -> Unit,
     onNavigateToSettings: () -> Unit,
+    onNavigateToStatus: () -> Unit,
+    onNavigateToContainerBackup: () -> Unit,
     viewModel: HomeViewModel = hiltViewModel(),
 ) {
     val context = LocalContext.current
@@ -80,6 +83,7 @@ fun HomeScreen(
     val avfBootFailure by viewModel.avfBootFailure.collectAsStateWithLifecycle()
     val avfFailureAdvice by viewModel.avfFailureAdvice.collectAsStateWithLifecycle()
     val stopping by viewModel.stopping.collectAsStateWithLifecycle()
+    val containerCount by viewModel.containerCount.collectAsStateWithLifecycle()
 
     val isRunning  = vmState is VmState.Running
     val isStarting = vmState is VmState.Starting
@@ -97,7 +101,10 @@ fun HomeScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) phoneIp = viewModel.phoneIp()
+            if (event == Lifecycle.Event.ON_RESUME) {
+                phoneIp = viewModel.phoneIp()
+                viewModel.refreshContainerCount()
+            }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
@@ -137,6 +144,9 @@ fun HomeScreen(
             PodroidTopBar(
                 title = stringResource(R.string.app_name),
                 actions = {
+                    IconButton(onClick = onNavigateToStatus) {
+                        Icon(Icons.Default.MonitorHeart, contentDescription = stringResource(R.string.status_page_title))
+                    }
                     IconButton(onClick = onNavigateToSettings) {
                         Icon(Icons.Default.Settings, contentDescription = stringResource(R.string.settings))
                     }
@@ -172,13 +182,16 @@ fun HomeScreen(
                         }
                         HomeStatusBlock(
                             isStarting, isRunning, isStopping, vmState, bootStage, meta, uptimeLabel,
+                            containerCount = containerCount,
                             avfBootFailure = avfBootFailure,
                             avfFailureAdvice = avfFailureAdvice,
                             onUseOneCore = { viewModel.useOneCoreAndRetry() },
                             onSwitchToQemu = { viewModel.switchToQemuAndRetry() },
                             onRetry = { viewModel.restartVm() },
                         )
-                        HomeDataSection(isRunning, isStopping, vmState, meta, phoneIp)
+                        HomeDataSection(
+                            isRunning, isStopping, vmState, meta, phoneIp, containerCount,
+                        )
                     }
                     Column(
                         modifier = Modifier
@@ -195,6 +208,8 @@ fun HomeScreen(
                             onStop = { viewModel.stopVm() },
                             onRestart = { viewModel.restartVm() },
                             onOpenTerminal = onNavigateToTerminal,
+                            onBackup = onNavigateToContainerBackup,
+                            onStatus = onNavigateToStatus,
                         )
                     }
                 }
@@ -218,13 +233,14 @@ fun HomeScreen(
                         bootStage = bootStage,
                         meta = meta,
                         uptimeLabel = uptimeLabel,
+                        containerCount = containerCount,
                         avfBootFailure = avfBootFailure,
                         avfFailureAdvice = avfFailureAdvice,
                         onUseOneCore = { viewModel.useOneCoreAndRetry() },
                         onSwitchToQemu = { viewModel.switchToQemuAndRetry() },
                         onRetry = { viewModel.restartVm() },
                     )
-                    HomeDataSection(isRunning, isStopping, vmState, meta, phoneIp)
+                    HomeDataSection(isRunning, isStopping, vmState, meta, phoneIp, containerCount)
                     Spacer(Modifier.weight(1f))
                     HomeActionButtons(
                         isRunning = isRunning,
@@ -235,6 +251,8 @@ fun HomeScreen(
                         onStop = { viewModel.stopVm() },
                         onRestart = { viewModel.restartVm() },
                         onOpenTerminal = onNavigateToTerminal,
+                        onBackup = onNavigateToContainerBackup,
+                        onStatus = onNavigateToStatus,
                     )
                     Spacer(Modifier.height(PodroidTokens.Spacing.XL))
                 }
@@ -292,6 +310,7 @@ private fun HomeStatusBlock(
     bootStage: String,
     meta: HomeMeta,
     uptimeLabel: String?,
+    containerCount: Int? = null,
     avfBootFailure: Boolean = false,
     avfFailureAdvice: AvfFailureGuidance.Advice = AvfFailureGuidance.Advice.SWITCH_TO_QEMU,
     onUseOneCore: () -> Unit = {},
@@ -348,6 +367,16 @@ private fun HomeStatusBlock(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
+    if (!isRunning && !isStarting && !isStopping) {
+        Spacer(Modifier.height(PodroidTokens.Spacing.MD))
+        PodroidSectionLabel(stringResource(R.string.home_containers_created))
+        Text(
+            text = containerCount?.let { stringResource(R.string.home_containers_count, it) }
+                ?: stringResource(R.string.home_containers_unknown),
+            style = MaterialTheme.typography.displayMedium,
+            color = MaterialTheme.colorScheme.primary,
+        )
+    }
     if (vmState is VmState.Error) {
         Spacer(Modifier.height(PodroidTokens.Spacing.MD))
         PodroidSectionLabel(stringResource(R.string.error_title))
@@ -401,6 +430,7 @@ private fun HomeDataSection(
     vmState: VmState,
     meta: HomeMeta,
     phoneIp: String,
+    containerCount: Int?,
 ) {
     val showStarting = vmState is VmState.Starting
     val showError = vmState is VmState.Error
@@ -408,6 +438,11 @@ private fun HomeDataSection(
     Spacer(Modifier.height(PodroidTokens.Spacing.MD))
     if (isRunning) {
         PodroidSectionLabel(stringResource(R.string.network))
+        PodroidListRow(
+            label = stringResource(R.string.home_containers_created),
+            value = containerCount?.toString() ?: stringResource(R.string.home_containers_unknown),
+            mono = true,
+        )
         PodroidListRow(label = stringResource(R.string.phone_ip), value = phoneIp, mono = true)
         PodroidListRow(
             label = stringResource(R.string.ssh),
@@ -457,6 +492,8 @@ private fun HomeActionButtons(
     onStop: () -> Unit,
     onRestart: () -> Unit,
     onOpenTerminal: () -> Unit,
+    onBackup: () -> Unit,
+    onStatus: () -> Unit,
 ) {
     if (isStopping) {
         // Teardown in progress: one disabled affordance so the user can't
@@ -470,6 +507,8 @@ private fun HomeActionButtons(
     } else if (isRunning) {
         PodroidPrimaryButton(text = stringResource(R.string.open_terminal), onClick = onOpenTerminal)
         Spacer(Modifier.height(PodroidTokens.Spacing.SM))
+        HomeQuickActions(onBackup = onBackup, onStatus = onStatus, onTerminal = onOpenTerminal)
+        Spacer(Modifier.height(PodroidTokens.Spacing.SM))
         Row(horizontalArrangement = Arrangement.spacedBy(PodroidTokens.Spacing.SM)) {
             PodroidGhostButton(text = stringResource(R.string.restart), onClick = onRestart, modifier = Modifier.weight(1f))
             PodroidDestructiveButton(text = stringResource(R.string.stop), onClick = onStop, modifier = Modifier.weight(1f))
@@ -478,7 +517,39 @@ private fun HomeActionButtons(
         PodroidDestructiveButton(text = stringResource(R.string.stop), onClick = onStop)
     } else if (vmState is VmState.Error) {
         PodroidPrimaryButton(text = stringResource(R.string.try_again), onClick = onStart)
+        Spacer(Modifier.height(PodroidTokens.Spacing.SM))
+        HomeQuickActions(onBackup = onBackup, onStatus = onStatus, onTerminal = onOpenTerminal)
     } else {
         PodroidPrimaryButton(text = stringResource(R.string.start_vm), onClick = onStart)
+        Spacer(Modifier.height(PodroidTokens.Spacing.SM))
+        HomeQuickActions(onBackup = onBackup, onStatus = onStatus, onTerminal = onOpenTerminal)
+    }
+}
+
+@Composable
+private fun HomeQuickActions(
+    onBackup: () -> Unit,
+    onStatus: () -> Unit,
+    onTerminal: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(PodroidTokens.Spacing.SM),
+    ) {
+        PodroidGhostButton(
+            text = stringResource(R.string.home_action_backup),
+            onClick = onBackup,
+            modifier = Modifier.weight(1f),
+        )
+        PodroidGhostButton(
+            text = stringResource(R.string.home_action_status),
+            onClick = onStatus,
+            modifier = Modifier.weight(1f),
+        )
+        PodroidGhostButton(
+            text = stringResource(R.string.home_action_terminal),
+            onClick = onTerminal,
+            modifier = Modifier.weight(1f),
+        )
     }
 }

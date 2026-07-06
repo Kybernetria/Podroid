@@ -23,6 +23,7 @@ import com.excp.podroid.di.ApplicationScope
 import com.excp.podroid.engine.EngineSelection
 import com.excp.podroid.engine.VmEngine
 import com.excp.podroid.engine.VmState
+import com.excp.podroid.util.DeviceResourcePolicy
 import com.excp.podroid.util.NetworkUtils
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -62,6 +63,8 @@ data class SettingsUiState(
     val engineSelection: EngineSelection = EngineSelection.AUTO,
     val language: String = "auto",
     val systemDefaultLanguage: String = "auto",
+    val loadBalanceEnabled: Boolean = false,
+    val bandwidthMbps: Int = 0,
 )
 
 @HiltViewModel
@@ -99,8 +102,9 @@ class SettingsViewModel @Inject constructor(
             settingsRepository.vmCpus,
             settingsRepository.storageSizeGb,
             settingsRepository.sshEnabled,
-        ) { ram, cpus, storage, ssh ->
-            arrayOf(ram, cpus, storage, ssh)
+            settingsRepository.loadBalanceEnabled,
+        ) { ram, cpus, storage, ssh, loadBal ->
+            arrayOf(ram, cpus, storage, ssh, loadBal)
         },
         combine(
             settingsRepository.storageAccessEnabled,
@@ -111,10 +115,15 @@ class SettingsViewModel @Inject constructor(
         ) { storageAccess, qemu, kernel, dark, dyn ->
             arrayOf(storageAccess, qemu, kernel, dark, dyn)
         },
-        settingsRepository.engineSelection,
-        settingsRepository.language,
-        languageManager.language,
-    ) { a, b, engineSel, lang, sysLang ->
+        combine(
+            settingsRepository.bandwidthMbps,
+            settingsRepository.engineSelection,
+            settingsRepository.language,
+            languageManager.language,
+        ) { bandwidth, engineSel, lang, sysLang ->
+            arrayOf(bandwidth, engineSel, lang, sysLang)
+        },
+    ) { a, b, c ->
         SettingsUiState(
             vmRamMb = a[0] as Int,
             vmCpus = a[1] as Int,
@@ -125,9 +134,11 @@ class SettingsViewModel @Inject constructor(
             kernelExtraCmdline = b[2] as String,
             darkTheme = b[3] as Boolean,
             dynamicColorEnabled = b[4] as Boolean,
-            engineSelection = engineSel,
-            language = lang,
-            systemDefaultLanguage = sysLang,
+            engineSelection = c[1] as EngineSelection,
+            language = c[2] as String,
+            systemDefaultLanguage = c[3] as String,
+            loadBalanceEnabled = a[4] as Boolean,
+            bandwidthMbps = c[0] as Int,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SettingsUiState())
 
@@ -206,11 +217,36 @@ class SettingsViewModel @Inject constructor(
     }
 
     fun setVmRamMb(value: Int) {
-        viewModelScope.launch { settingsRepository.setVmRamMb(value) }
+        viewModelScope.launch {
+            settingsRepository.setLoadBalanceEnabled(false)
+            settingsRepository.setVmRamMb(value)
+        }
     }
 
     fun setVmCpus(value: Int) {
-        viewModelScope.launch { settingsRepository.setVmCpus(value) }
+        viewModelScope.launch {
+            settingsRepository.setLoadBalanceEnabled(false)
+            settingsRepository.setVmCpus(value)
+        }
+    }
+
+    fun setBandwidthMbps(value: Int) {
+        viewModelScope.launch {
+            settingsRepository.setLoadBalanceEnabled(false)
+            settingsRepository.setBandwidthMbps(value)
+        }
+    }
+
+    fun setLoadBalanceEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            settingsRepository.setLoadBalanceEnabled(enabled)
+            if (enabled) {
+                val profile = DeviceResourcePolicy.balancedProfile(context)
+                settingsRepository.setVmRamMb(profile.ramMb)
+                settingsRepository.setVmCpus(profile.cpus)
+                settingsRepository.setBandwidthMbps(profile.bandwidthMbps)
+            }
+        }
     }
 
     fun setTerminalFontSize(value: Int) {

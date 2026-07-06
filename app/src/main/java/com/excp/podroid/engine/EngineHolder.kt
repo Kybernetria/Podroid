@@ -310,6 +310,8 @@ class EngineHolder @Inject constructor(
     }
 
     override val runningSinceMs: Long? get() = current.runningSinceMs
+    override fun emulatorRssMb(): Long? = current.emulatorRssMb()
+    override fun emulatorPid(): Int? = current.emulatorPid()
 
     // ── VmEngine: flows that follow the currently-selected engine ──────────
     // A freshly (re)selected engine that hasn't been started this cycle has its

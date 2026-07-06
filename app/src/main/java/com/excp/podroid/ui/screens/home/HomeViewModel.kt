@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.excp.podroid.BuildConfig
+import com.excp.podroid.data.repository.ContainerStatsRepository
 import com.excp.podroid.data.repository.PortForwardRepository
 import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.data.repository.UpdateInfo
@@ -56,6 +57,7 @@ class HomeViewModel @Inject constructor(
     private val engine: VmEngine,
     private val settingsRepository: SettingsRepository,
     private val portForwardRepository: PortForwardRepository,
+    private val containerStatsRepository: ContainerStatsRepository,
     private val updateRepository: UpdateRepository,
 ) : ViewModel() {
 
@@ -68,6 +70,9 @@ class HomeViewModel @Inject constructor(
 
     val bootStage: StateFlow<String> = engine.bootStage
         .stateIn(viewModelScope, SharingStarted.Eagerly, "")
+
+    private val _containerCount = MutableStateFlow<Int?>(null)
+    val containerCount: StateFlow<Int?> = _containerCount.asStateFlow()
 
     /** Aggregated metadata for the Home data sections. */
     val meta: StateFlow<HomeMeta> = combine(
@@ -172,6 +177,24 @@ class HomeViewModel @Inject constructor(
 
     init {
         checkForUpdate()
+        viewModelScope.launch {
+            val cached = settingsRepository.getLastContainerCount()
+            if (cached != null) _containerCount.value = cached
+        }
+        viewModelScope.launch {
+            var lastRunning = false
+            engine.state.collect { state ->
+                val running = state is VmState.Running
+                if (running && !lastRunning) refreshContainerCount()
+                lastRunning = running
+            }
+        }
+        viewModelScope.launch {
+            while (true) {
+                if (engine.state.value is VmState.Running) refreshContainerCount()
+                delay(5_000)
+            }
+        }
         // Maintain fallbackRunningSinceMs for engines that don't override runningSinceMs.
         viewModelScope.launch {
             var lastWasRunning = false
@@ -224,6 +247,12 @@ class HomeViewModel @Inject constructor(
 
     fun dismissAvfHint() {
         viewModelScope.launch { settingsRepository.setAvfHintDismissed(true) }
+    }
+
+    fun refreshContainerCount() {
+        viewModelScope.launch {
+            _containerCount.value = containerStatsRepository.readContainerCount()
+        }
     }
 
     fun startPodroid() = PodroidService.start(context)

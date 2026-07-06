@@ -67,7 +67,11 @@ import com.excp.podroid.ui.components.PodroidPrimaryButton
 import com.excp.podroid.ui.components.PodroidSectionLabel
 import com.excp.podroid.ui.components.PodroidSwitch
 import com.excp.podroid.ui.components.PodroidChipColors
+import com.excp.podroid.ui.components.VmBandwidthChips
+import com.excp.podroid.ui.components.VmCpuChips
+import com.excp.podroid.ui.components.VmRamChips
 import com.excp.podroid.ui.theme.PodroidTokens
+import com.excp.podroid.util.DeviceResourcePolicy
 import kotlinx.coroutines.launch
 
 private val storageSizes = listOf(2, 4, 8, 16, 32, 64)
@@ -83,6 +87,10 @@ fun SetupScreen(
     // rememberSaveable preserves wizard choices through config changes (rotation, font-scale, etc.)
     // so a mid-wizard rotation doesn't silently reset storage to 8 GB (not resizable later).
     var selectedGb by rememberSaveable { mutableIntStateOf(DEFAULT_STORAGE_GB) }
+    var selectedRamMb by rememberSaveable { mutableIntStateOf(512) }
+    var selectedCpus by rememberSaveable { mutableIntStateOf(2) }
+    var selectedBandwidthMbps by rememberSaveable { mutableIntStateOf(0) }
+    var loadBalanceEnabled by rememberSaveable { mutableStateOf(true) }
     var sshEnabled by rememberSaveable { mutableStateOf(true) }
     var storageAccessEnabled by rememberSaveable { mutableStateOf(false) }
     var usbPassthroughEnabled by rememberSaveable { mutableStateOf(false) }
@@ -90,6 +98,18 @@ fun SetupScreen(
     val setupComplete by viewModel.setupComplete.collectAsStateWithLifecycle()
     val pagerState = rememberPagerState(pageCount = { 4 })
     val scope = rememberCoroutineScope()
+
+    fun applyLoadBalance() {
+        val profile = DeviceResourcePolicy.balancedProfile(context)
+        selectedRamMb = profile.ramMb
+        selectedCpus = profile.cpus
+        selectedGb = profile.storageGb
+        selectedBandwidthMbps = profile.bandwidthMbps
+    }
+
+    LaunchedEffect(Unit) {
+        if (loadBalanceEnabled) applyLoadBalance()
+    }
 
     // Request the notification permission BEFORE navigating away; using
     // rememberLauncherForActivityResult registers it while the composable is still
@@ -158,11 +178,24 @@ fun SetupScreen(
                     0 -> StoragePage(
                         windowSizeClass = windowSizeClass,
                         selectedGb = selectedGb,
+                        loadBalanceEnabled = loadBalanceEnabled,
                         onSelect = { selectedGb = it },
                         onNext = { scope.launch { pagerState.animateScrollToPage(1) } },
                     )
                     1 -> VmConfigPage(
                         windowSizeClass = windowSizeClass,
+                        storageGb = selectedGb,
+                        ramMb = selectedRamMb,
+                        cpus = selectedCpus,
+                        bandwidthMbps = selectedBandwidthMbps,
+                        loadBalanceEnabled = loadBalanceEnabled,
+                        onLoadBalanceToggle = { enabled ->
+                            loadBalanceEnabled = enabled
+                            if (enabled) applyLoadBalance()
+                        },
+                        onRamChange = { selectedRamMb = it },
+                        onCpusChange = { selectedCpus = it },
+                        onBandwidthChange = { selectedBandwidthMbps = it },
                         sshEnabled = sshEnabled,
                         onSshToggle = { sshEnabled = it },
                         onBack = { scope.launch { pagerState.animateScrollToPage(0) } },
@@ -207,9 +240,13 @@ fun SetupScreen(
                         onGetStarted = {
                             viewModel.completeSetup(
                                 storageSizeGb = selectedGb,
+                                vmRamMb = selectedRamMb,
+                                vmCpus = selectedCpus,
                                 sshEnabled = sshEnabled,
                                 storageAccessEnabled = storageAccessEnabled,
                                 usbPassthroughEnabled = usbPassthroughEnabled && usbPassthroughAvailable,
+                                loadBalanceEnabled = loadBalanceEnabled,
+                                bandwidthMbps = selectedBandwidthMbps,
                             )
                         },
                     )
@@ -340,6 +377,7 @@ private fun SetupPageLayout(
 private fun StoragePage(
     windowSizeClass: WindowSizeClass,
     selectedGb: Int,
+    loadBalanceEnabled: Boolean,
     onSelect: (Int) -> Unit,
     onNext: () -> Unit,
 ) {
@@ -356,7 +394,19 @@ private fun StoragePage(
             color = MaterialTheme.colorScheme.primary,
         )
         Spacer(Modifier.height(PodroidTokens.Spacing.MD))
-        StorageSizeChips(selectedGb, onSelect)
+        StorageSizeChips(
+            selectedGb = selectedGb,
+            onSelect = onSelect,
+            enabled = !loadBalanceEnabled,
+        )
+        if (loadBalanceEnabled) {
+            Spacer(Modifier.height(PodroidTokens.Spacing.SM))
+            Text(
+                text = stringResource(R.string.load_balance_storage_hint),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 
@@ -365,6 +415,15 @@ private fun StoragePage(
 @Composable
 private fun VmConfigPage(
     windowSizeClass: WindowSizeClass,
+    storageGb: Int,
+    ramMb: Int,
+    cpus: Int,
+    bandwidthMbps: Int,
+    loadBalanceEnabled: Boolean,
+    onLoadBalanceToggle: (Boolean) -> Unit,
+    onRamChange: (Int) -> Unit,
+    onCpusChange: (Int) -> Unit,
+    onBandwidthChange: (Int) -> Unit,
     sshEnabled: Boolean,
     onSshToggle: (Boolean) -> Unit,
     onBack: () -> Unit,
@@ -377,9 +436,41 @@ private fun VmConfigPage(
         description = stringResource(R.string.vm_config_description),
         bottomBar  = { SetupNavBar(onBack = onBack, onNext = onNext, nextLabel = stringResource(R.string.continue_label)) },
     ) {
+        PodroidListRow(
+            label = stringResource(R.string.load_balance),
+            rightSlot = {
+                PodroidSwitch(checked = loadBalanceEnabled, onCheckedChange = onLoadBalanceToggle)
+            },
+        )
+        if (loadBalanceEnabled) {
+            Text(
+                text = stringResource(R.string.load_balance_description),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = PodroidTokens.Spacing.SM),
+            )
+        }
+
         PodroidSectionLabel(stringResource(R.string.resources))
-        PodroidListRow(label = stringResource(R.string.cpu_cores), value = "2")
-        PodroidListRow(label = stringResource(R.string.ram_label),       value = "512 MB")
+        PodroidListRow(label = stringResource(R.string.storage), value = "$storageGb GB")
+        VmRamChips(
+            currentMb = ramMb,
+            onChange = onRamChange,
+            enabled = !loadBalanceEnabled,
+            showDivider = false,
+        )
+        VmCpuChips(
+            currentCpus = cpus,
+            onChange = onCpusChange,
+            enabled = !loadBalanceEnabled,
+            showDivider = false,
+        )
+        VmBandwidthChips(
+            currentMbps = bandwidthMbps,
+            onChange = onBandwidthChange,
+            enabled = !loadBalanceEnabled,
+            showDivider = true,
+        )
 
         PodroidSectionLabel(stringResource(R.string.network_label))
         PodroidListRow(
@@ -536,7 +627,7 @@ private fun SetupNavBar(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun StorageSizeChips(selectedGb: Int, onSelect: (Int) -> Unit) {
+private fun StorageSizeChips(selectedGb: Int, onSelect: (Int) -> Unit, enabled: Boolean = true) {
     FlowRow(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
@@ -546,6 +637,7 @@ private fun StorageSizeChips(selectedGb: Int, onSelect: (Int) -> Unit) {
         storageSizes.forEach { gb ->
             FilterChip(
                 selected = gb == selectedGb,
+                enabled = enabled,
                 onClick = { onSelect(gb) },
                 label = {
                     Text(

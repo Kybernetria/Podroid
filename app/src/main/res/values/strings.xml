@@ -53,6 +53,11 @@
     <string name="network_label">Network</string>
     <string name="ssh_access">SSH access</string>
     <string name="ssh_password_hint">ssh root@&lt;phone-ip&gt; -p 9922   (password: podroid)</string>
+    <string name="load_balance">Load balance</string>
+    <string name="load_balance_description">Automatically tune CPU, RAM, storage, and bandwidth for this device.</string>
+    <string name="load_balance_storage_hint">Storage size is set automatically. Turn off load balance on the next step to pick manually.</string>
+    <string name="bandwidth_limit">Bandwidth limit</string>
+    <string name="bandwidth_unlimited">Unlimited</string>
 
     <!-- Storage Access -->
     <string name="downloads_sharing">Downloads Sharing</string>
@@ -116,6 +121,63 @@
     <string name="none">None</string>
     <string name="active">active</string>
     <string name="off">Off</string>
+    <string name="on">On</string>
+
+    <!-- Status monitor -->
+    <string name="status_page_title">Status</string>
+    <string name="status_phone_section">Phone</string>
+    <string name="status_vm_section">Virtual machine</string>
+    <string name="status_load_average">Load average (1 / 5 / 15 min)</string>
+    <string name="status_vm_ram_allocated">VM RAM (allocated)</string>
+    <string name="status_emulator_rss">Emulator using %1$s</string>
+    <string name="status_vm_disk">VM disk image</string>
+    <string name="status_unavailable">—</string>
+    <string name="status_error">Error</string>
+    <string name="status_refresh_hint">Refreshes every 2 seconds while this screen is open.</string>
+    <string name="status_vm_load_graph_title">VM CPU load</string>
+    <string name="status_vm_load_current">Current: %1$d%%</string>
+    <string name="status_vm_load_collecting">Collecting samples…</string>
+    <string name="status_vm_load_waiting">Start the VM to see load</string>
+    <string name="status_vm_load_stopped">VM is not running</string>
+    <string name="status_vm_load_avf_only">Load graph is available on the QEMU backend while the VM is running</string>
+    <string name="status_vm_load_graph_hint">Tracks the emulator process CPU use on your phone, normalized to the VM\'s allocated cores.</string>
+    <string name="status_vm_load_axis" formatted="false">Last ~2 min · 0% (idle) → 100% (all VM cores busy)</string>
+
+    <!-- Container backup -->
+    <string name="container_backup_title">Container backup</string>
+    <string name="container_backup_settings_subtitle">Export containers &amp; images</string>
+    <string name="container_backup_description">Export Podman containers or save images to tar archives. Run the copied commands in the terminal inside the VM.</string>
+    <string name="container_backup_location">Backup location</string>
+    <string name="container_backup_guest_path">Guest path</string>
+    <string name="container_backup_phone_path">On phone (Downloads)</string>
+    <string name="container_backup_phone_path_value">Download/Podroid/backups</string>
+    <string name="container_backup_downloads_hint">Enable Downloads sharing in Settings so backups appear on your phone.</string>
+    <string name="container_backup_avf_hint">Downloads sharing is only available on the QEMU backend. Backups stay inside the VM at /var/backups/podroid.</string>
+    <string name="container_backup_export">Export container</string>
+    <string name="container_backup_vm_stopped">Start the VM before running backup commands.</string>
+    <string name="container_backup_container_name">Container name</string>
+    <string name="container_backup_copy_export">Copy export command</string>
+    <string name="container_backup_save_image">Save image</string>
+    <string name="container_backup_image_ref">Image reference</string>
+    <string name="container_backup_image_placeholder">docker.io/library/nginx:latest</string>
+    <string name="container_backup_copy_save">Copy save command</string>
+    <string name="container_backup_tools">Tools</string>
+    <string name="container_backup_copy_list">Copy list command</string>
+    <string name="container_backup_copy_all">Copy backup-all command</string>
+    <string name="container_backup_terminal_hint">Paste into the Podroid terminal. podroid-backup is included in newer guest images; older images fall back to podman export automatically.</string>
+    <string name="container_backup_on_phone">Backups on phone</string>
+    <string name="container_backup_refresh">Refresh list</string>
+    <string name="container_backup_none">No backup archives found in Downloads/Podroid/backups yet.</string>
+    <string name="container_backup_copied">Command copied</string>
+
+    <!-- Home -->
+    <string name="home_containers_created">Containers created</string>
+    <string name="home_containers_count">%1$d</string>
+    <string name="home_containers_unknown">—</string>
+    <string name="home_action_backup">Backup</string>
+    <string name="home_action_status">Status</string>
+    <string name="home_action_terminal">Terminal</string>
+
     <string name="up">Up</string>
 
     <!-- AVF Hint -->

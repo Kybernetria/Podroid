@@ -60,6 +60,7 @@ class SettingsRepository @Inject constructor(
         val KEY_HAPTICS_ENABLED        = booleanPreferencesKey("haptics_enabled")
         val KEY_DYNAMIC_COLOR_ENABLED  = booleanPreferencesKey("dynamic_color_enabled")
         val KEY_LAST_BOOT_DURATION_MS  = longPreferencesKey("last_boot_duration_ms")
+        val KEY_LAST_CONTAINER_COUNT   = intPreferencesKey("last_container_count")
         val KEY_ENGINE_SELECTION       = stringPreferencesKey("engine_selection")
         val KEY_AVF_HINT_DISMISSED      = booleanPreferencesKey("avf_hint_dismissed")
         val KEY_AVF_VERBOSE_LOGGING     = booleanPreferencesKey("avf_verbose_logging")
@@ -71,6 +72,9 @@ class SettingsRepository @Inject constructor(
         // changes the CPU-count setting so the new value is re-probed.
         val KEY_AVF_CPU_CAP             = intPreferencesKey("avf_cpu_cap")
         val KEY_USB_PASSTHROUGH_ENABLED = booleanPreferencesKey("usb_passthrough_enabled")
+        val KEY_LOAD_BALANCE_ENABLED    = booleanPreferencesKey("load_balance_enabled")
+        /** Guest egress cap via `podroid.bandwidth=` cmdline + tc. 0 = unlimited. */
+        val KEY_BANDWIDTH_MBPS          = intPreferencesKey("bandwidth_mbps")
 
         val KEY_X11_RES_MODE        = stringPreferencesKey("x11_resolution_mode")
         val KEY_X11_RES_PRESET      = stringPreferencesKey("x11_resolution_preset")
@@ -143,12 +147,15 @@ class SettingsRepository @Inject constructor(
     val hapticsEnabled       = pref(KEY_HAPTICS_ENABLED, true)
     val dynamicColorEnabled  = pref(KEY_DYNAMIC_COLOR_ENABLED, false)
     val lastBootDurationMs   = pref(KEY_LAST_BOOT_DURATION_MS, 0L)
+    val lastContainerCount   = pref(KEY_LAST_CONTAINER_COUNT, -1)
     // Routed through pref() so a corrupted store emits the "auto" default instead
     // of throwing into LanguageManager's locale collector.
     val language: Flow<String> = pref(KEY_LANGUAGE, "auto")
     val avfHintDismissed     = pref(KEY_AVF_HINT_DISMISSED, false)
     val avfCpuCap            = pref(KEY_AVF_CPU_CAP, 0)
     val usbPassthroughEnabled = pref(KEY_USB_PASSTHROUGH_ENABLED, false)
+    val loadBalanceEnabled    = pref(KEY_LOAD_BALANCE_ENABLED, false)
+    val bandwidthMbps         = pref(KEY_BANDWIDTH_MBPS, 0)
     val avfVerboseLogging: Flow<Boolean> = context.dataStore.data
         .catch { e -> if (e is IOException) emit(androidx.datastore.preferences.core.emptyPreferences()) else throw e }
         .map { prefs -> prefs[KEY_AVF_VERBOSE_LOGGING] ?: false }
@@ -185,12 +192,19 @@ class SettingsRepository @Inject constructor(
     suspend fun setHapticsEnabled(value: Boolean)        = set(KEY_HAPTICS_ENABLED, value)
     suspend fun setDynamicColorEnabled(value: Boolean)   = set(KEY_DYNAMIC_COLOR_ENABLED, value)
     suspend fun setLastBootDurationMs(value: Long)       = set(KEY_LAST_BOOT_DURATION_MS, value)
+    suspend fun setLastContainerCount(value: Int)        = set(KEY_LAST_CONTAINER_COUNT, value)
+    suspend fun getLastContainerCount(): Int? {
+        val v = context.dataStore.data.first()[KEY_LAST_CONTAINER_COUNT] ?: -1
+        return if (v < 0) null else v
+    }
     suspend fun setLanguage(value: String)               = set(KEY_LANGUAGE, value)
     suspend fun setEngineSelection(value: EngineSelection) = set(KEY_ENGINE_SELECTION, value.name)
     suspend fun setAvfHintDismissed(value: Boolean)      = set(KEY_AVF_HINT_DISMISSED, value)
     suspend fun setAvfVerboseLogging(value: Boolean)     = set(KEY_AVF_VERBOSE_LOGGING, value)
     suspend fun setAvfCpuCap(value: Int)                 = set(KEY_AVF_CPU_CAP, value)
     suspend fun setUsbPassthroughEnabled(value: Boolean) = set(KEY_USB_PASSTHROUGH_ENABLED, value)
+    suspend fun setLoadBalanceEnabled(value: Boolean)    = set(KEY_LOAD_BALANCE_ENABLED, value)
+    suspend fun setBandwidthMbps(value: Int)             = set(KEY_BANDWIDTH_MBPS, value.coerceAtLeast(0))
 
     /**
      * Persists all first-run setup choices in a single transaction so a process
@@ -200,15 +214,23 @@ class SettingsRepository @Inject constructor(
      */
     suspend fun completeSetup(
         storageSizeGb: Int,
+        vmRamMb: Int,
+        vmCpus: Int,
         sshEnabled: Boolean,
         storageAccessEnabled: Boolean,
         usbPassthroughEnabled: Boolean,
+        loadBalanceEnabled: Boolean,
+        bandwidthMbps: Int,
     ) {
         context.dataStore.edit {
             it[KEY_STORAGE_GB] = storageSizeGb.coerceAtLeast(1)
+            it[KEY_VM_RAM] = vmRamMb.coerceAtLeast(512)
+            it[KEY_VM_CPUS] = vmCpus.coerceAtLeast(1)
             it[KEY_SSH_ENABLED] = sshEnabled
             it[KEY_STORAGE_ACCESS_ENABLED] = storageAccessEnabled
             it[KEY_USB_PASSTHROUGH_ENABLED] = usbPassthroughEnabled
+            it[KEY_LOAD_BALANCE_ENABLED] = loadBalanceEnabled
+            it[KEY_BANDWIDTH_MBPS] = bandwidthMbps.coerceAtLeast(0)
             it[KEY_SETUP_DONE] = true
         }
     }
@@ -261,4 +283,6 @@ class SettingsRepository @Inject constructor(
     suspend fun getAvfVerboseLoggingSnapshot()    = avfVerboseLogging.first()
     suspend fun getAvfCpuCapSnapshot()            = avfCpuCap.first()
     suspend fun getUsbPassthroughEnabledSnapshot() = usbPassthroughEnabled.first()
+    suspend fun getLoadBalanceEnabledSnapshot()    = loadBalanceEnabled.first()
+    suspend fun getBandwidthMbpsSnapshot()         = bandwidthMbps.first()
 }

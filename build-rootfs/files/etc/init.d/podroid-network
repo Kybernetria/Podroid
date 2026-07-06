@@ -62,6 +62,10 @@ start() {
             return 1
         fi
     fi
+    BW_MBIT=$(sed -n 's/.*podroid\.bandwidth=\([0-9]*\).*/\1/p' /proc/cmdline 2>/dev/null)
+    if [ -n "$BW_MBIT" ] && [ "$BW_MBIT" -gt 0 ]; then
+        tc qdisc replace dev "$NETIF" root tbf rate "${BW_MBIT}mbit" burst 32kbit latency 400ms 2>/dev/null || true
+    fi
     echo "Network found" > /dev/console
     eend 0
 }

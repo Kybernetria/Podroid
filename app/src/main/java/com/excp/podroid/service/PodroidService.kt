@@ -355,6 +355,7 @@ class PodroidService : Service() {
                         verboseLogging = settingsRepository.getAvfVerboseLoggingSnapshot(),
                         x11Dpi = settingsRepository.getX11DpiSnapshot(),
                         usbPassthroughEnabled = settingsRepository.getUsbPassthroughEnabledSnapshot(),
+                        bandwidthMbps = settingsRepository.getBandwidthMbpsSnapshot(),
                     )
                     serviceScope.launch { observeStateForHostBridge() }
                     if (config.usbPassthroughEnabled) {
