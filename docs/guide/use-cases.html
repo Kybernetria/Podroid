@@ -85,6 +85,16 @@
         <p>Services backed by a JVM - Gitea's built-in runner, Jenkins, Gradle builds inside code-server, and anything running on Java or Kotlin - are noticeably slow on the QEMU TCG backend. JVM startup alone can take 10-30 seconds. If you rely on these services heavily, enabling the <a href="backends.html">AVF backend</a> on a Pixel device makes a large practical difference.</p>
       </div>
 
+      <h2>Backing up containers</h2>
+      <p>The <strong>Backup</strong> screen (the home screen's <strong>Backup</strong> button, or Settings) builds shell commands for exporting a container, saving an image, listing existing backups, or backing up everything at once. It doesn't run anything itself - it builds the command and you copy it into the terminal.</p>
+      <pre><code><span class="c"># The screen builds a command like this one, which you paste into the terminal</span>
+<span class="p">$</span> podman export pihole -o /mnt/downloads/Podroid/backups/pihole.tar</code></pre>
+      <p>It uses a <code>podroid-backup</code> helper when one is present in the guest, and falls back to plain <code>podman save</code> / <code>podman export</code> otherwise. Backups are written inside the guest to <code>/mnt/downloads/Podroid/backups</code>. With <a href="settings.html">Downloads folder sharing</a> enabled, that path appears on the phone under <code>Download/Podroid/backups</code>; with sharing off, backups stay inside the VM at <code>/var/backups/podroid</code>.</p>
+
+      <h2>Checking VM and phone status</h2>
+      <p>The <strong>Status</strong> screen (the home screen's <strong>Status</strong> button, or the monitor icon in the header) gives a single view of both sides of the system: phone RAM, storage, CPU cores, and load average (when readable) alongside the VM's status, uptime, active backend (QEMU or AVF), and the phone's IP.</p>
+      <p>It also shows a VM CPU-load graph, available on the QEMU backend only - on AVF the screen shows a note that the graph is QEMU-only - plus the VM's allocated RAM, CPU cores, disk-image usage, and bandwidth limit.</p>
+
       <h2>Local Linux development environment</h2>
       <p>The Alpine guest is a full persistent Linux system. Install your toolchain once and it survives every reboot on the ext4 overlay.</p>
       <pre><code><span class="c"># Install a development toolchain</span>

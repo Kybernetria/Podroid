@@ -108,9 +108,9 @@
             <td>Android 12 and later aggressively kill processes that are not direct children of an app's own process. QEMU is a subprocess of the foreground service; if Android classifies it as a phantom process, it sends SIGKILL (exit code 137). See the troubleshooting section below for the ADB command that disables this limit permanently.</td>
           </tr>
           <tr>
-            <td>Downloads sharing (AVF)</td>
-            <td>May silently do nothing, or crash QEMU's 9p worker on some ARMv9.2 devices</td>
-            <td>The virtio-9p driver used to expose the host Downloads folder is unstable on some hardware. On shipping Pixel AVF builds the share may be a silent no-op. On some ARMv9.2 devices (including the Pixel 10) the 9p worker in QEMU can crash and bring down the VM. If your VM crashes shortly after boot, disable Downloads sharing in Settings as the first diagnostic step.</td>
+            <td>Downloads sharing (QEMU)</td>
+            <td>Can crash QEMU's 9p worker on some ARMv9.2 devices</td>
+            <td>The virtio-9p driver used to expose the host Downloads folder on the QEMU backend is unstable on some hardware. On some ARMv9.2 devices (including the Pixel 10) the 9p worker in QEMU can crash and bring down the VM. If your VM crashes shortly after boot, disable Downloads sharing in Settings as the first diagnostic step. The AVF backend uses a separate 9p2000.L server over vsock and is not affected.</td>
           </tr>
           <tr>
             <td>X11 viewer: Wayland desktops</td>

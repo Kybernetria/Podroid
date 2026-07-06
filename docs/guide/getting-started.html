@@ -79,11 +79,11 @@
       <p>Set the number of virtual CPU cores and the RAM allocation (default 512 MB). You can also toggle SSH here - when enabled, Dropbear starts automatically and the VM is reachable at port 9922 over your local network. These settings can be changed later in Settings.</p>
 
       <h3>Step 3: Downloads sharing (optional)</h3>
-      <p>Grants access to your phone's Downloads folder so you can move files between Android and the VM. Useful, but skip it if you don't need it.</p>
+      <p>Grants access to your phone's Downloads folder so you can move files between Android and the VM. Works on both the QEMU and AVF backends. Useful, but skip it if you don't need it.</p>
 
       <div class="callout warn">
         <span class="label">Instability warning</span>
-        <p>Downloads sharing can be unstable on some devices. If the VM behaves oddly after enabling it, try disabling it in Settings.</p>
+        <p>On the QEMU backend, Downloads sharing can be unstable on some devices. If the VM behaves oddly after enabling it, try disabling it in Settings. The AVF path is stable.</p>
       </div>
 
       <h2>First boot</h2>
@@ -97,9 +97,11 @@
       <h2>Home screen at a glance</h2>
       <p>Once the VM is running the home screen shows:</p>
       <ul>
-        <li><strong>VM status</strong> and uptime</li>
+        <li><strong>VM status</strong> and uptime, with a shutting-down indicator while the VM stops</li>
         <li><strong>Network info</strong> - your phone's IP address, SSH endpoint, and how many port-forward rules are active</li>
+        <li><strong>Containers created</strong> - a running count of containers you've created</li>
         <li><strong>Start / Stop</strong> button</li>
+        <li><strong>Backup</strong> and <strong>Status</strong> buttons - see <a href="use-cases.html">Use cases</a> for what each does</li>
       </ul>
 
       <h2>Terminal and X11 viewer</h2>

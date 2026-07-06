@@ -108,6 +108,11 @@
         </thead>
         <tbody>
           <tr>
+            <td>Load balance</td>
+            <td>Toggle</td>
+            <td>When on, Podroid automatically tunes CPU, RAM, storage, and bandwidth for the device, and the manual controls below are managed for you. Turn it off to set CPU, RAM, and storage manually.</td>
+          </tr>
+          <tr>
             <td>RAM</td>
             <td>512 MB / 1 GB / 2 GB / 4 GB</td>
             <td>Memory allocated to the VM. Requires a VM restart. Locked while running.</td>
@@ -146,9 +151,14 @@
             <td>Add TCP, UDP, or both forwarding rules. Changes apply live via QMP without a VM restart. Can also be managed from inside the VM with <code>podroid-forward</code> (see <a href="networking.html">Networking</a>).</td>
           </tr>
           <tr>
+            <td>Bandwidth limit</td>
+            <td>Mbps value / Unlimited</td>
+            <td>Caps the VM's network throughput. Managed automatically when Load balance is on.</td>
+          </tr>
+          <tr>
             <td>Downloads sharing</td>
             <td>Toggle</td>
-            <td>Shares the Android Downloads folder into the VM as a virtio-fs mount. May be a no-op on some AVF devices. Can be unstable on some QEMU configurations; disable it if the VM crashes on boot.</td>
+            <td>Shares the Android Downloads folder into the VM at <code>/mnt/downloads</code>: virtio-9p on QEMU, an in-process 9p2000.L server over vsock on AVF. Can be unstable on some QEMU configurations; disable it if the VM crashes on boot. The AVF path is stable.</td>
           </tr>
           <tr>
             <td>USB passthrough</td>

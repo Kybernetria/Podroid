@@ -784,7 +784,7 @@
           </tr>
           <tr>
             <td class="row-label">Downloads folder sharing</td>
-            <td class="col-podroid"><span class="check">✓ virtio-9p</span></td>
+            <td class="col-podroid"><span class="check">✓ virtio-9p (QEMU) + vsock (AVF)</span></td>
             <td><span class="check">✓</span></td>
             <td><span class="cross">✗</span></td>
           </tr>
@@ -991,7 +991,7 @@ qmp.sock               →  runtime port-forward control</div>
       <details>
         <summary>Can I access my Android files from the VM?</summary>
         <div class="faq-answer">
-          Yes. Toggle <strong>Downloads folder sharing</strong> in Settings and the Android Downloads folder is exposed to the VM via <code>virtio-9p</code>, mounted inside the guest at <code>/mnt/downloads</code>. Files you drop in Downloads on the phone show up there immediately, and anything the VM writes to <code>/mnt/downloads</code> appears back in Downloads.
+          Yes. Toggle <strong>Downloads folder sharing</strong> in Settings and the Android Downloads folder is exposed to the VM on both backends - via <code>virtio-9p</code> on QEMU, and via an in-process 9p2000.L server over vsock on AVF - mounted inside the guest at <code>/mnt/downloads</code>. It's bidirectional: files you drop in Downloads on the phone show up there immediately, and anything the VM writes to <code>/mnt/downloads</code> appears back in Downloads.
         </div>
       </details>
 
