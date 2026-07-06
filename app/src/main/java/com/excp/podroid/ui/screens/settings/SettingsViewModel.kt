@@ -245,6 +245,11 @@ class SettingsViewModel @Inject constructor(
                 settingsRepository.setVmRamMb(profile.ramMb)
                 settingsRepository.setVmCpus(profile.cpus)
                 settingsRepository.setBandwidthMbps(profile.bandwidthMbps)
+                // The overlay image is grown to this setting and never shrunk, so a
+                // balanced size below the current one would only misreport the real
+                // image. Floor the balanced storage at the current size.
+                val current = settingsRepository.getStorageSizeGbSnapshot()
+                settingsRepository.setStorageSizeGb(maxOf(profile.storageGb, current))
             }
         }
     }
