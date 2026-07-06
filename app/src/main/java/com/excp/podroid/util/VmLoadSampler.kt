@@ -15,6 +15,9 @@ import java.io.File
  */
 class VmLoadSampler(
     private val clockHz: Long = 100L,
+    // Injected for tests; production reads the real monotonic clock and /proc.
+    private val nowMs: () -> Long = { SystemClock.elapsedRealtime() },
+    private val ticksReader: (Int) -> Long? = { readProcessCpuTicks(it) },
 ) {
     private var lastTicks: Long? = null
     private var lastTimeMs: Long? = null
@@ -28,8 +31,8 @@ class VmLoadSampler(
      * CPU load as 0–100% of the VM's allocated vCPU count (QEMU process on Android).
      */
     fun sampleCpuPercent(pid: Int, vmCpus: Int): Float? {
-        val ticks = readProcessCpuTicks(pid) ?: return null
-        val now = SystemClock.elapsedRealtime()
+        val ticks = ticksReader(pid) ?: return null
+        val now = nowMs()
         val prevTicks = lastTicks
         val prevTime = lastTimeMs
         lastTicks = ticks
