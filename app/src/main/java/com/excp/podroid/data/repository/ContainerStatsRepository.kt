@@ -8,6 +8,8 @@
 package com.excp.podroid.data.repository
 
 import android.os.Environment
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -23,8 +25,10 @@ class ContainerStatsRepository @Inject constructor(
 
     suspend fun readContainerCount(): Int? {
         val file = statsFile()
-        if (!file.isFile) return settingsRepository.getLastContainerCount()
-        val parsed = file.readText().trim().toIntOrNull() ?: return null
+        val text = withContext(Dispatchers.IO) {
+            if (file.isFile) file.readText() else null
+        } ?: return settingsRepository.getLastContainerCount()
+        val parsed = text.trim().toIntOrNull() ?: return null
         settingsRepository.setLastContainerCount(parsed)
         return parsed
     }
