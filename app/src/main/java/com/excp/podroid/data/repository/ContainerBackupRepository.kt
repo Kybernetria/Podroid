@@ -40,7 +40,13 @@ class ContainerBackupRepository @Inject constructor() {
 
     fun isDownloadsReachable(): Boolean {
         val dir = backupDirectory()
-        return dir.exists() || dir.parentFile?.exists() == true
+        // Create Downloads/Podroid/backups if absent: the app holds All-files
+        // access whenever Downloads sharing is on, so a successful mkdirs both
+        // confirms reachability and gives the guest an existing target under the
+        // 9p/virtio-9p mount. Nothing else creates this dir, so without it every
+        // backup would fall back to the guest-internal path and never surface in
+        // Downloads.
+        return runCatching { dir.exists() || dir.mkdirs() }.getOrDefault(false)
     }
 
     fun listBackupFiles(): List<ContainerBackupFile> {
