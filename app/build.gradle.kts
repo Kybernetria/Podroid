@@ -25,7 +25,7 @@ android {
         applicationId = "com.excp.podroid"
         minSdk = 26
         targetSdk = 36
-        versionCode = 29
+        versionCode = 30
         versionName = "1.2.6"
         buildConfigField("String", "QEMU_VERSION", "\"$podroidQemuVersion\"")
 
