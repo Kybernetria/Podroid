@@ -132,7 +132,6 @@ fun SettingsScreen(
 
     // Memoize: both values are constant for the process lifetime / until a backend
     // swap, so there's no point re-running reflection on every recomposition.
-    val isDownloadsShareAvailable = remember { viewModel.isDownloadsShareAvailable() }
     val isUsbPassthroughAvailable = remember { viewModel.isUsbPassthroughAvailable() }
     val activeBackendId = remember { viewModel.activeBackendId() }
 
@@ -291,8 +290,6 @@ fun SettingsScreen(
                 DownloadsSharingRow(
                     enabled = ui.storageAccessEnabled,
                     vmNotRunning = vmNotRunning,
-                    available = isDownloadsShareAvailable,
-                    activeBackendId = activeBackendId,
                     onToggle = { viewModel.setStorageAccessEnabled(it) },
                 )
                 PodroidListRow(
@@ -567,19 +564,15 @@ private fun PortForwardSection(
  * Mirrors the setup wizard's storage-access toggle: turn it on and, if needed,
  * jump straight to the system MANAGE_EXTERNAL_STORAGE grant screen.
  *
- * Disabled when the active backend can't actually share Downloads — on AVF
- * that's any pKVM device whose framework jar ships only the 9-param
- * SharedPath ctor (no `appDomain` parameter). Google's TerminalApp escapes
- * this because it's installed as a privileged system app under
- * /apex/com.android.virt/priv-app/; third-party APKs can't get the SELinux
- * promotion needed to cross-domain-share external storage.
+ * Works on both backends: QEMU shares Downloads via in-process virtio-9p, AVF
+ * via an in-process 9p2000.L server the guest mounts over vsock
+ * (AvfDownloadsShare) — no SharedPath, no privileged system-app install needed.
+ * Only gated on the VM being stopped, since the share is wired up at boot.
  */
 @Composable
 private fun DownloadsSharingRow(
     enabled: Boolean,
     vmNotRunning: Boolean,
-    available: Boolean,
-    activeBackendId: String,
     onToggle: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
@@ -600,7 +593,7 @@ private fun DownloadsSharingRow(
         label = stringResource(R.string.downloads_sharing),
         rightSlot = {
             PodroidSwitch(
-                checked = enabled && available,
+                checked = enabled,
                 onCheckedChange = { checked ->
                     onToggle(checked)
                     if (checked) {
@@ -615,22 +608,10 @@ private fun DownloadsSharingRow(
                         }
                     }
                 },
-                enabled = vmNotRunning && available,
+                enabled = vmNotRunning,
             )
         },
     )
-    if (!available) {
-        Text(
-            text = stringResource(R.string.downloads_sharing_unavailable, activeBackendId),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(
-                start = PodroidTokens.Spacing.MD,
-                end = PodroidTokens.Spacing.MD,
-                bottom = PodroidTokens.Spacing.SM,
-            ),
-        )
-    }
 }
 
 /**

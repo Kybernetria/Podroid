@@ -85,7 +85,7 @@ fun ContainerBackupScreen(
                     value = ui.guestPath,
                     mono = true,
                 )
-                if (ui.storageAccessEnabled && ui.downloadsShareAvailable) {
+                if (ui.storageAccessEnabled) {
                     PodroidListRow(
                         label = stringResource(R.string.container_backup_phone_path),
                         value = stringResource(R.string.container_backup_phone_path_value),
@@ -93,10 +93,7 @@ fun ContainerBackupScreen(
                     )
                 } else {
                     Text(
-                        text = stringResource(
-                            if (!ui.downloadsShareAvailable) R.string.container_backup_avf_hint
-                            else R.string.container_backup_downloads_hint,
-                        ),
+                        text = stringResource(R.string.container_backup_downloads_hint),
                         style = MaterialTheme.typography.bodySmall,
                         color = PodroidTokens.Amber,
                     )

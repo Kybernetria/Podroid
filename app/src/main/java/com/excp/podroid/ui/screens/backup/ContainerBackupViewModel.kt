@@ -22,7 +22,6 @@ import javax.inject.Inject
 data class ContainerBackupUiState(
     val vmRunning: Boolean = false,
     val storageAccessEnabled: Boolean = false,
-    val downloadsShareAvailable: Boolean = true,
     val guestPath: String = "/var/backups/podroid",
     val backupFiles: List<ContainerBackupFile> = emptyList(),
     val containerName: String = "",
@@ -51,7 +50,6 @@ class ContainerBackupViewModel @Inject constructor(
         ContainerBackupUiState(
             vmRunning = vmState is VmState.Running,
             storageAccessEnabled = storageAccess,
-            downloadsShareAvailable = engine.backendId == "qemu",
             guestPath = repository.guestBackupPathLabel(),
             backupFiles = files,
             containerName = container,

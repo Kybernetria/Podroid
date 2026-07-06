@@ -291,20 +291,6 @@ class SettingsViewModel @Inject constructor(
     fun activeBackendId(): String = engine.backendId
 
     /**
-     * True if Downloads sharing actually works on the currently-active backend.
-     * QEMU's virtio-9p path always works (it runs as part of our process and
-     * doesn't cross SELinux domains). AVF requires the 10-param `SharedPath`
-     * ctor with `appDomain=false` so crosvm can spin up in virtmgr's system
-     * domain and read /storage/emulated/... — without it the VM crashes at
-     * start. Shipping Pixel mustang beta has the 9-param ctor only, so AVF
-     * Downloads sharing is effectively unavailable to third-party apps there.
-     */
-    fun isDownloadsShareAvailable(): Boolean = when (engine.backendId) {
-        "avf" -> com.excp.podroid.engine.avf.AvfDiagnostics.externalStorageShareSupported()
-        else  -> true
-    }
-
-    /**
      * USB passthrough rides the QEMU QMP control socket (add-fd + device_add
      * usb-host); the AVF backend has no QMP channel, so it can never pass a
      * device through. QEMU-only.

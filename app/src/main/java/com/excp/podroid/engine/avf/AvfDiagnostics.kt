@@ -81,32 +81,6 @@ object AvfDiagnostics {
     private const val CLS_CUSTOM_CFG = "android.system.virtualmachine.VirtualMachineCustomImageConfig"
 
     /**
-     * Probe whether this AVF revision can share external storage paths
-     * (e.g. /storage/emulated/.../Download). The 10-param SharedPath ctor
-     * that takes a `boolean appDomain` is the prerequisite — without it,
-     * crosvm inherits our untrusted_app SELinux domain and the kernel
-     * refuses to read external storage (VM dies at start with reason=4).
-     *
-     * On shipping Pixel mustang beta, only the 9-param ctor ships and this
-     * returns false. Google's TerminalApp gets around it by being signed
-     * with the platform key and installed under /apex/com.android.virt/
-     * priv-app/ — a path no third-party APK can take.
-     */
-    fun externalStorageShareSupported(): Boolean {
-        val spCls = runCatching {
-            Class.forName("android.system.virtualmachine.VirtualMachineCustomImageConfig\$SharedPath")
-        }.getOrNull() ?: return false
-        val intT = Int::class.javaPrimitiveType!!
-        val boolT = Boolean::class.javaPrimitiveType!!
-        val strT = String::class.java
-        return runCatching {
-            spCls.getDeclaredConstructor(
-                strT, intT, intT, intT, intT, intT, strT, strT, boolT, strT
-            )
-        }.isSuccess
-    }
-
-    /**
      * True only if this device's AVF build exposes the custom-VM builder API
      * Podroid drives (raw kernel + initrd). A vendor build that ships AVF for
      * system use but omits the custom-image config will return false, so
