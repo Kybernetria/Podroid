@@ -131,7 +131,6 @@
     <string name="status_vm_ram_allocated">VM RAM (allocated)</string>
     <string name="status_emulator_rss">Emulator using %1$s</string>
     <string name="status_vm_disk">VM disk image</string>
-    <string name="status_unavailable">—</string>
     <string name="status_error">Error</string>
     <string name="status_refresh_hint">Refreshes every 2 seconds while this screen is open.</string>
     <string name="status_vm_load_graph_title">VM CPU load</string>
@@ -152,7 +151,6 @@
     <string name="container_backup_phone_path">On phone (Downloads)</string>
     <string name="container_backup_phone_path_value">Download/Podroid/backups</string>
     <string name="container_backup_downloads_hint">Enable Downloads sharing in Settings so backups appear on your phone.</string>
-    <string name="container_backup_avf_hint">Downloads sharing is only available on the QEMU backend. Backups stay inside the VM at /var/backups/podroid.</string>
     <string name="container_backup_export">Export container</string>
     <string name="container_backup_vm_stopped">Start the VM before running backup commands.</string>
     <string name="container_backup_container_name">Container name</string>
@@ -176,7 +174,6 @@
     <string name="home_containers_unknown">—</string>
     <string name="home_action_backup">Backup</string>
     <string name="home_action_status">Status</string>
-    <string name="home_action_terminal">Terminal</string>
 
     <string name="up">Up</string>
 
@@ -289,7 +286,6 @@
     <string name="usb_passthrough_settings_label">USB passthrough</string>
     <string name="usb_passthrough_settings_description_available">Hot-plugs external USB devices (Wi-Fi, storage, serial, etc.) into the VM. Each device asks for permission when attached. Adds a USB controller at boot, so restart the VM to apply.</string>
     <string name="usb_passthrough_settings_description_unavailable">Not available on the %1$s backend: USB passthrough rides QEMU\'s QMP control socket, which the AVF backend doesn\'t provide.</string>
-    <string name="downloads_sharing_unavailable">Not available on this %1$s build — AVF requires a privileged system-app install (Google\'s Terminal app cheats this way); third-party APKs can\'t cross SELinux domains to read /storage/emulated/Download.</string>
     <string name="server_mode">Server mode</string>
     <string name="server_mode_desc">Keeps the VM running with the screen blacked out to save power. The app stays in the foreground so the VM is never stopped. To exit, press and hold anywhere for 3 seconds.</string>
     <string name="server_mode_enable">Enable server mode</string>

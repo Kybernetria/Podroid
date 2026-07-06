@@ -131,7 +131,6 @@
     <string name="status_vm_ram_allocated">虚拟机内存（已分配）</string>
     <string name="status_emulator_rss">模拟器占用 %1$s</string>
     <string name="status_vm_disk">虚拟机磁盘镜像</string>
-    <string name="status_unavailable">—</string>
     <string name="status_error">错误</string>
     <string name="status_refresh_hint">此页面打开时每 2 秒自动刷新。</string>
     <string name="status_vm_load_graph_title">虚拟机 CPU 负载</string>
@@ -152,7 +151,6 @@
     <string name="container_backup_phone_path">手机（下载目录）</string>
     <string name="container_backup_phone_path_value">Download/Podroid/backups</string>
     <string name="container_backup_downloads_hint">在设置中启用下载目录共享，备份文件会出现在手机上。</string>
-    <string name="container_backup_avf_hint">下载目录共享仅在 QEMU 后端可用。备份保留在虚拟机 /var/backups/podroid。</string>
     <string name="container_backup_export">导出容器</string>
     <string name="container_backup_vm_stopped">运行备份命令前请先启动虚拟机。</string>
     <string name="container_backup_container_name">容器名称</string>
@@ -176,7 +174,6 @@
     <string name="home_containers_unknown">—</string>
     <string name="home_action_backup">备份</string>
     <string name="home_action_status">状态</string>
-    <string name="home_action_terminal">终端</string>
 
     <string name="up">运行中</string>
 
@@ -290,7 +287,6 @@
     <string name="usb_passthrough_settings_label">USB 设备直通</string>
     <string name="usb_passthrough_settings_description_available">在虚拟机中热插拔外部 USB 设备（Wi-Fi、存储、串口等）。设备连接时会询问许可。启动时添加 USB 控制器，因此需要重启虚拟机以应用更改。</string>
     <string name="usb_passthrough_settings_description_unavailable">%1$s 后端不可用：USB 设备直通需要 QEMU 的 QMP 控制套接字，而 AVF 后端不提供此功能。</string>
-    <string name="downloads_sharing_unavailable">此 %1$s 构建不可用 - AVF 要求特权系统应用安装（Google 的终端应用通过这种方式绕过）；第三方 APK 无法跨越 SELinux 域读取 /storage/emulated/Download。</string>
     <string name="server_mode">服务器模式</string>
     <string name="server_mode_desc">在屏幕变黑的情况下保持虚拟机运行以省电。应用会保持在前台，因此虚拟机不会被停止。要退出，请在任意位置长按 3 秒。</string>
     <string name="server_mode_enable">启用服务器模式</string>

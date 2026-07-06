@@ -9,6 +9,7 @@ package com.excp.podroid.util
 import android.app.ActivityManager
 import android.content.Context
 import android.os.StatFs
+import android.system.Os
 import java.io.File
 import kotlin.math.roundToInt
 
@@ -47,7 +48,7 @@ object HostMetrics {
             loadAvg15 = load?.third,
             phoneStorageTotalGb = stat.totalBytes / (1024.0 * 1024 * 1024),
             phoneStorageAvailGb = stat.availableBytes / (1024.0 * 1024 * 1024),
-            vmDiskImageBytes = if (storageImg.isFile) storageImg.length() else 0L,
+            vmDiskImageBytes = if (storageImg.isFile) diskFootprintBytes(storageImg) else 0L,
             emulatorRssMb = emulatorRssMb,
         )
     }
@@ -58,6 +59,19 @@ object HostMetrics {
         else Triple(parts[0].toFloat(), parts[1].toFloat(), parts[2].toFloat())
     } catch (_: Exception) {
         null
+    }
+
+    /**
+     * Real on-disk footprint of a possibly sparse file: st_blocks * 512.
+     * storage.img is created sparse via RandomAccessFile.setLength(), so
+     * File.length() reports the full apparent capacity (a permanently 100%-full
+     * bar); the allocated block count reflects how much the VM disk actually
+     * occupies on the phone. Falls back to the apparent length if stat fails.
+     */
+    fun diskFootprintBytes(file: File): Long = try {
+        Os.stat(file.absolutePath).st_blocks * 512L
+    } catch (_: Exception) {
+        file.length()
     }
 
     fun processPid(process: Process): Int? = try {

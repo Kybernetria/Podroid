@@ -93,21 +93,21 @@ fun StatusScreen(
                     label = stringResource(R.string.cpu_cores),
                     value = "${metrics.phoneCpuCores}",
                 )
-                val loadLabel = if (metrics.loadAvg1 != null) {
-                    String.format(
-                        "%.2f · %.2f · %.2f",
-                        metrics.loadAvg1,
-                        metrics.loadAvg5,
-                        metrics.loadAvg15,
+                // /proc/loadavg is SELinux-blocked for third-party apps on modern
+                // Android, so this is usually absent; hide the row rather than
+                // show a permanent placeholder.
+                if (metrics.loadAvg1 != null) {
+                    PodroidListRow(
+                        label = stringResource(R.string.status_load_average),
+                        value = String.format(
+                            "%.2f · %.2f · %.2f",
+                            metrics.loadAvg1,
+                            metrics.loadAvg5,
+                            metrics.loadAvg15,
+                        ),
+                        mono = true,
                     )
-                } else {
-                    stringResource(R.string.status_unavailable)
                 }
-                PodroidListRow(
-                    label = stringResource(R.string.status_load_average),
-                    value = loadLabel,
-                    mono = true,
-                )
 
                 Spacer(Modifier.height(PodroidTokens.Spacing.SM))
                 PodroidSectionLabel(stringResource(R.string.status_vm_section))

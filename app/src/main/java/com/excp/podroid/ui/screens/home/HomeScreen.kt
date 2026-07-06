@@ -507,7 +507,7 @@ private fun HomeActionButtons(
     } else if (isRunning) {
         PodroidPrimaryButton(text = stringResource(R.string.open_terminal), onClick = onOpenTerminal)
         Spacer(Modifier.height(PodroidTokens.Spacing.SM))
-        HomeQuickActions(onBackup = onBackup, onStatus = onStatus, onTerminal = onOpenTerminal)
+        HomeQuickActions(onBackup = onBackup, onStatus = onStatus)
         Spacer(Modifier.height(PodroidTokens.Spacing.SM))
         Row(horizontalArrangement = Arrangement.spacedBy(PodroidTokens.Spacing.SM)) {
             PodroidGhostButton(text = stringResource(R.string.restart), onClick = onRestart, modifier = Modifier.weight(1f))
@@ -518,11 +518,11 @@ private fun HomeActionButtons(
     } else if (vmState is VmState.Error) {
         PodroidPrimaryButton(text = stringResource(R.string.try_again), onClick = onStart)
         Spacer(Modifier.height(PodroidTokens.Spacing.SM))
-        HomeQuickActions(onBackup = onBackup, onStatus = onStatus, onTerminal = onOpenTerminal)
+        HomeQuickActions(onBackup = onBackup, onStatus = onStatus)
     } else {
         PodroidPrimaryButton(text = stringResource(R.string.start_vm), onClick = onStart)
         Spacer(Modifier.height(PodroidTokens.Spacing.SM))
-        HomeQuickActions(onBackup = onBackup, onStatus = onStatus, onTerminal = onOpenTerminal)
+        HomeQuickActions(onBackup = onBackup, onStatus = onStatus)
     }
 }
 
@@ -530,7 +530,6 @@ private fun HomeActionButtons(
 private fun HomeQuickActions(
     onBackup: () -> Unit,
     onStatus: () -> Unit,
-    onTerminal: () -> Unit,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -544,11 +543,6 @@ private fun HomeQuickActions(
         PodroidGhostButton(
             text = stringResource(R.string.home_action_status),
             onClick = onStatus,
-            modifier = Modifier.weight(1f),
-        )
-        PodroidGhostButton(
-            text = stringResource(R.string.home_action_terminal),
-            onClick = onTerminal,
             modifier = Modifier.weight(1f),
         )
     }
