@@ -35,6 +35,7 @@ A real Alpine Linux VM with its own kernel - not a chroot or proot trick - so **
 - **In-app terminal** - full xterm-256color, 122 color themes, 13 fonts, live resize
 - **X11 desktop** - run GUI Linux apps in a built-in viewer with touch, keyboard, mouse and audio
 - **USB passthrough**, **SSH**, **port forwarding** and a **guest-to-Android bridge**
+- **Container backup**, a **live VM/device status view** and **Downloads-folder sharing** with the guest
 - **English and 中文**, no root, any arm64 device on Android 8+
 
 ## Quick start
