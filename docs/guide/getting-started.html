@@ -107,16 +107,21 @@
       <h2>Terminal and X11 viewer</h2>
       <p>Tap the terminal icon from the home screen to open a full VT100 terminal connected to the VM shell. Inside the terminal, tap the monitor icon in the top bar to open the X11 viewer - needed for GUI Linux apps and desktop environments.</p>
 
-      <h2>Default credentials</h2>
-      <p>The default login is <code>root</code> with password <code>podroid</code>. The terminal banner reminds you of this on every boot. To create a regular user with sudo-equivalent access:</p>
-      <pre><code><span class="p">$</span> adduser -G wheel &lt;username&gt;</code></pre>
-      <p>Members of <code>wheel</code> can use <code>doas</code> (and <code>sudo</code> if installed).</p>
+      <h2>Local guest console</h2>
+      <p>The in-app terminal is an app-owned console connected directly to the Linux guest over QEMU virtio-console or the AVF console transport. Its dedicated getty automatically opens a guest-root session. This is not remote authentication and it is not an Android shell.</p>
+      <p>To create a regular user with sudo-equivalent access:</p>
+      <pre><code><span class="p">~#</span> adduser -G wheel &lt;username&gt;</code></pre>
+      <p>Members of <code>wheel</code> can use <code>doas</code> and <code>sudo</code>.</p>
 
       <h2>SSH from another device</h2>
-      <p>With SSH enabled and both devices on the same Wi-Fi, connect from a laptop or desktop:</p>
-      <pre><code><span class="p">$</span> ssh root@&lt;phone-ip&gt; -p 9922
-<span class="c"># password: podroid</span></code></pre>
-      <p>Port 9922 is the default; see the <a href="networking.html">Networking &amp; ports</a> page for how SLIRP forwarding works and how to add more port rules.</p>
+      <p>Dropbear accepts public keys only; password authentication is disabled and Podroid bundles no authorized key. Before connecting, use the in-app guest console to install your laptop or desktop's public key:</p>
+      <pre><code><span class="p">~#</span> install -d -m 700 /root/.ssh
+<span class="p">~#</span> cat &gt;&gt; /root/.ssh/authorized_keys
+<span class="c"># Paste one complete public-key line, then press Ctrl-D.</span>
+<span class="p">~#</span> chmod 600 /root/.ssh/authorized_keys</code></pre>
+      <p>With SSH enabled and both devices on the same Wi-Fi, connect from the device whose public key you added:</p>
+      <pre><code><span class="p">$</span> ssh root@&lt;phone-ip&gt; -p 9922</code></pre>
+      <p>Port 9922 is the default; see the <a href="networking.html">Networking &amp; ports</a> page for how forwarding works and how to add more port rules.</p>
 
       <div class="callout warn">
         <span class="label">VM killed when you switch apps?</span>

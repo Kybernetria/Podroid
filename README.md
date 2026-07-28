@@ -52,8 +52,10 @@ docker run -d -p 8080:80 nginx
 podroid-forward add 8080 8080 tcp     # TCP or UDP, on both the QEMU and AVF backends
 curl http://<phone-ip>:8080
 
-# SSH in from your laptop (enable SSH in the setup wizard or Settings)
-ssh root@<phone-ip> -p 9922        # password: podroid
+# SSH in from your laptop (enable SSH in the setup wizard or Settings).
+# First paste your laptop's public key into /root/.ssh/authorized_keys
+# from Podroid's in-app terminal; SSH password authentication is disabled.
+ssh root@<phone-ip> -p 9922
 ```
 
 Setup, the two backends, networking, the X11 viewer and troubleshooting all live in the **[documentation](https://extv.github.io/Podroid/guide/)**.

@@ -13,6 +13,25 @@ plugins {
 
 val podroidQemuVersion = providers.gradleProperty("podroidQemuVersion").get()
 
+val verifyGuestCredentials by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Checks that the guest ships no known credentials and uses public-key-only SSH."
+    workingDir(rootProject.projectDir)
+    commandLine("sh", rootProject.file("tests/verify-guest-credentials.sh"))
+    inputs.files(
+        rootProject.fileTree("build-rootfs"),
+        rootProject.fileTree("app/src/main/assets") { include("alpine-rootfs.squashfs") },
+        rootProject.file("README.md"),
+        rootProject.file("CLAUDE.md"),
+        rootProject.fileTree("docs/guide") { include("*.html") },
+        rootProject.fileTree("app/src/main/res") { include("values*/strings.xml") }
+    )
+}
+
+tasks.named("preBuild") {
+    dependsOn(verifyGuestCredentials)
+}
+
 android {
     namespace = "com.excp.podroid"
     compileSdk {

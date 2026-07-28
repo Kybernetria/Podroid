@@ -1,0 +1,3 @@
+# Remote SSH accepts public keys only. The app-owned guest console is a
+# separate local transport and does not pass through Dropbear.
+DROPBEAR_OPTS="-s"

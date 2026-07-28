@@ -177,15 +177,16 @@ podroid-server status</code></pre>
       <h2>LAN reachability</h2>
       <p>All port forward listeners bind <code>0.0.0.0</code>, not <code>127.0.0.1</code>. This means any device on the same Wi-Fi network can reach the phone by its local IP address. The phone's current IP is shown in <strong>Settings</strong>.</p>
 
-      <pre><code><span class="c"># SSH from a laptop on the same Wi-Fi</span>
+      <pre><code><span class="c"># SSH from a laptop on the same Wi-Fi, after provisioning its public key</span>
 <span class="p">$</span> ssh root@&lt;phone-ip&gt; -p 9922
-<span class="c"># password: podroid</span>
 
 <span class="c"># VNC from any viewer</span>
 <span class="p">$</span> vncviewer &lt;phone-ip&gt;:5900
 
 <span class="c"># HTTP service forwarded to host port 8080</span>
 <span class="p">$</span> curl http://&lt;phone-ip&gt;:8080</code></pre>
+
+      <p>SSH password authentication is disabled. Podroid bundles no authorized key; add your own public key to <code>/root/.ssh/authorized_keys</code> from the app-owned guest console before connecting. See <a href="getting-started.html">Getting started</a> for the provisioning commands.</p>
 
       <h2>The privileged-port limit</h2>
       <p>Android apps run as unprivileged Linux users and do not hold <code>CAP_NET_BIND_SERVICE</code>. The Linux kernel refuses to bind a TCP or UDP socket to any port below 1024 for a process without that capability. This is a kernel-level rule, not a Podroid restriction, and there is no in-app workaround without root.</p>

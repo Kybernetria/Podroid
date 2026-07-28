@@ -1,7 +1,9 @@
 #!/bin/sh
-# Replacement login shell for getty. Restores the terminal size from
-# /run/term_size (written by podroid-resize on QEMU) before exec'ing the
-# real login binary — virtio-console + PL011 serial both reset winsize
+# Login wrapper used only by Podroid's dedicated guest getty. That getty is
+# reached through the Android app-owned QEMU virtio-console or AVF console
+# transport; it is not Dropbear authentication and is not an Android shell.
+# Restore the terminal size from /run/term_size (written by podroid-resize on
+# QEMU) before auto-login. Virtio-console + PL011 serial both reset winsize
 # to 0x0 on every getty respawn, so without this TUI apps (btop, htop,
 # vim, less) bail with "Failed to get size of terminal".
 #
@@ -20,4 +22,4 @@ fi
 case "$_r" in ''|*[!0-9]*|0) _r=24;; esac
 case "$_c" in ''|*[!0-9]*|0) _c=80;; esac
 stty rows "$_r" cols "$_c" 2>/dev/null
-exec /bin/login "$@"
+exec /bin/login -f root

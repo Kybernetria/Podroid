@@ -72,12 +72,20 @@ mkdir -p "$ROOTFS/etc/sudoers.d"
 echo "%wheel ALL=(ALL) ALL" > "$ROOTFS/etc/sudoers.d/wheel"
 chmod 0440 "$ROOTFS/etc/sudoers.d/wheel"
 
-# Set root password to "podroid" (pre-hashed with openssl).
-# We can't run chpasswd inside the aarch64 rootfs from an x86_64 host,
-# so write the SHA-512 hash directly into /etc/shadow.
-# No fixed -salt: openssl generates a random salt so the stored hash differs
-# per build (the password stays the documented default "podroid").
-ROOT_HASH=$(openssl passwd -6 podroid)
+# Keep root usable for public-key SSH without shipping a known password.
+# The high-entropy plaintext exists only in this command-substitution subshell;
+# only its salted SHA-512 hash leaves the subshell and enters the rootfs.
+ROOT_HASH=$(
+    ROOT_PASSWORD=$(openssl rand -hex 48)
+    [ "${#ROOT_PASSWORD}" -eq 96 ]
+    GENERATED_HASH=$(printf '%s\n' "$ROOT_PASSWORD" | openssl passwd -6 -stdin)
+    unset ROOT_PASSWORD
+    printf '%s\n' "$GENERATED_HASH"
+)
+case "$ROOT_HASH" in
+    '$6$'*) ;;
+    *) echo "ERROR: failed to generate a SHA-512 root password hash" >&2; exit 1 ;;
+esac
 sed -i "s|^root:[^:]*:|root:${ROOT_HASH}:|" "$ROOTFS/etc/shadow"
 
 # Strip docs/man/locale to shrink squashfs
@@ -132,7 +140,8 @@ ln -sf podroid-hostd "$ROOTFS/usr/local/bin/podroid-headless"
 ln -sf podroid-hostd "$ROOTFS/usr/local/bin/podroid-server"
 chmod +x "$ROOTFS/usr/local/bin/podroid-"*
 mkdir -p "$ROOTFS/etc/conf.d"
-cp /work/files/etc/conf.d/podroid "$ROOTFS/etc/conf.d/"
+cp /work/files/etc/conf.d/podroid  "$ROOTFS/etc/conf.d/"
+cp /work/files/etc/conf.d/dropbear "$ROOTFS/etc/conf.d/"
 # vsock agent's initial forward table (read at podroid-vsock startup).
 mkdir -p "$ROOTFS/etc/podroid"
 cp /work/files/etc/podroid/forwards.conf "$ROOTFS/etc/podroid/forwards.conf"
@@ -175,8 +184,9 @@ cat > "$ROOTFS/etc/issue" <<'EOF'
 Welcome to Podroid (Alpine \S)
 Kernel \r on \m (\l)
 
-  Default login:  root  /  podroid
-  Change root password:    passwd
+  App-owned guest console: automatic local root session
+  SSH: public-key authentication only
+  Provision SSH keys at:   /root/.ssh/authorized_keys
   Create a regular user:   adduser -G wheel <name>
                            (wheel group → can run doas/sudo)
 

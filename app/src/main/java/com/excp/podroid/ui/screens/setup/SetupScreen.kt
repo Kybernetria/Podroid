@@ -481,7 +481,7 @@ private fun VmConfigPage(
         if (sshEnabled) {
             Spacer(Modifier.height(PodroidTokens.Spacing.XS))
             Text(
-                text = stringResource(R.string.ssh_password_hint),
+                text = stringResource(R.string.ssh_public_key_hint),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontFamily = PodroidTokens.mono(),

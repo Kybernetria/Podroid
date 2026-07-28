@@ -85,7 +85,7 @@ HostRequestServer     <->  host.sock/hvc2 (QEMU) | vsock:9101 (AVF)    <- podroi
 
 QEMU exposes these Unix sockets under `context.filesDir`, each with one role:
 
-- **`terminal.sock`** ↔ virtio-console `/dev/hvc0` - primary terminal I/O. getty runs on hvc0; `libpodroid-bridge.so` relays it to a Termux PTY.
+- **`terminal.sock`** ↔ virtio-console `/dev/hvc0` - primary terminal I/O. A dedicated getty runs on hvc0 and auto-logs in as guest root; `libpodroid-bridge.so` relays it to a Termux PTY. This is an app-owned guest-console transport, not remote authentication and not an Android shell. Remote Dropbear access remains public-key-only.
 - **`ctrl.sock`** ↔ virtio-console `/dev/hvc1` - resize channel. The bridge debounces SIGWINCH bursts and writes one `RESIZE rows cols\n`; a guest resize daemon `stty`s hvc0.
 - **`serial.sock`** ↔ PL011 `/dev/ttyAMA0` - boot-log sink only. The boot monitor streams kernel + init output into `console.log` and the boot-stage detector.
 - **`qmp.sock`** - QEMU Machine Protocol for runtime port forwarding and USB hot-plug.
@@ -104,7 +104,7 @@ On **AVF** there is no QMP and no PL011: the console is captured via `ConsoleFan
    - `podroid-resize` - reads `RESIZE rows cols` from `/dev/hvc1`, `stty`s `/dev/hvc0`.
    - `podroid-hostd` - the host-bridge daemon (both backends).
    - `podroid-vsock` - the AVF control/forward agent (AVF boots only).
-   - `dropbear` - SSH, when enabled.
+   - `dropbear` - public-key-only SSH (`DROPBEAR_OPTS="-s"` disables password authentication), when enabled; users provision `/root/.ssh/authorized_keys` from the app-owned guest console.
    - `podroid-ready` - emits `Starting SSH...` / `Almost ready...` / `Ready!`, the markers `BootStageDetector` matches; `Ready!` flips state to `Running` and auto-starts the terminal bridge.
 
 **Why `switch_root`, not `chroot`:** an earlier version `chroot`ed into the overlay, which broke `podman exec -it` - `setns(MNT)` in `crun exec` resets `fs->root`, so the exec'd process saw raw kernel paths (`/mnt/overlay/proc`) instead of `/proc`. `switch_root` reorganizes the kernel mount tree itself, so namespace forks see a clean `/`.
@@ -201,7 +201,7 @@ The terminal emulator JNI is built from the vendored `terminal-emulator` module 
 ## Build pipelines
 
 - **`Dockerfile`** - custom Linux kernel (arm64 defconfig + `podroid_kernel.config` modules + `forced_builtin.config` forcing overlayfs / netfilter / bridge / veth / tun / FUSE / IPv6 etc. to `=y`) and QEMU cross-compiled against the NDK. A build-time check greps the resolved `.config` and **fails the build** if any critical option isn't `=y` (guards against silent Kconfig demotion from unmet tristate deps). QEMU needs `--enable-libusb` (for passthrough) and a few Android/Bionic patches; `build-all.sh qemu` may need `docker build --network=host`.
-- **`build-rootfs/Dockerfile.rootfs`** - fetches the Alpine minirootfs, runs `build-rootfs.sh` (apk-installs alpine-base + openrc + podman + crun + fuse-overlayfs + docker + lxc + dropbear + iptables/nftables + bridge-utils, sets root password `podroid`, seals file caps on `newuidmap`/`newgidmap`, copies the OpenRC services and the cross-compiled `podroid-vsock-agent` + `podroid-hostd`, wires runlevels via direct symlinks), then `mksquashfs -comp zstd` (kernel ships `CONFIG_SQUASHFS_ZSTD=y`).
+- **`build-rootfs/Dockerfile.rootfs`** - fetches the Alpine minirootfs, runs `build-rootfs.sh` (apk-installs alpine-base + openrc + podman + crun + fuse-overlayfs + docker + lxc + dropbear + iptables/nftables + bridge-utils, gives root an unknown random build-time password hash so public-key SSH remains usable, disables Dropbear password authentication, seals file caps on `newuidmap`/`newgidmap`, copies the OpenRC services and the cross-compiled `podroid-vsock-agent` + `podroid-hostd`, wires runlevels via direct symlinks), then `mksquashfs -comp zstd` (kernel ships `CONFIG_SQUASHFS_ZSTD=y`). No password or authorized key is bundled; provision `/root/.ssh/authorized_keys` through the in-app guest console before connecting over SSH.
 
 ## Performance tuning (TCG path; KVM is impossible without root)
 

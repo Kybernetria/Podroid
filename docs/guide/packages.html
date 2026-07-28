@@ -178,7 +178,7 @@
           </tr>
           <tr>
             <td><code>dropbear</code></td>
-            <td>SSH server on guest port 22, started at boot. It is reachable from the host and LAN only when the SSH toggle is on (which adds the <code>9922&rarr;22</code> forward). Default credentials: <code>root</code> / <code>podroid</code>.</td>
+            <td>SSH server on guest port 22, started at boot with password authentication disabled. It is reachable from the host and LAN only when the SSH toggle is on (which adds the <code>9922&rarr;22</code> forward). Public-key authentication remains enabled; Podroid bundles no authorized key, so provision <code>/root/.ssh/authorized_keys</code> from the app-owned guest console first.</td>
           </tr>
           <tr>
             <td><code>docker</code></td>

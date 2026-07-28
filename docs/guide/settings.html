@@ -143,7 +143,7 @@
           <tr>
             <td>SSH</td>
             <td>Toggle</td>
-            <td>Exposes dropbear on host port 9922 (forwarded to guest port 22). Default credentials: username <code>root</code>, password <code>podroid</code>. Injects and removes the 9922 forward live via QMP.</td>
+            <td>Exposes Dropbear on host port 9922 (forwarded to guest port 22). Authentication is public-key-only; provision <code>/root/.ssh/authorized_keys</code> from the app-owned guest console first. The toggle injects and removes the 9922 forward live via QMP on QEMU and the equivalent vsock forward on AVF.</td>
           </tr>
           <tr>
             <td>Port forwards</td>

@@ -129,6 +129,7 @@ build_rootfs() {
         --build-arg "SYSTEM_VERSION=${sysver:-0}" \
         --output type=local,dest="${ASSETS}" \
         "${SCRIPT_DIR}/build-rootfs/"
+    "${SCRIPT_DIR}/tests/verify-guest-credentials.sh" "${ASSETS}/alpine-rootfs.squashfs"
     success "Built ${ASSETS}/alpine-rootfs.squashfs ($(du -h "${ASSETS}/alpine-rootfs.squashfs" | cut -f1)), system-version ${sysver:-0}"
 }
 
