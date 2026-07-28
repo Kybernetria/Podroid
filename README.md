@@ -66,7 +66,7 @@ cd Podroid
 ./build-all.sh all     # kernel, rootfs, QEMU and APK (needs Docker + Android SDK/NDK)
 ```
 
-Per-component builds and toolchain details: [CONTRIBUTING.md](CONTRIBUTING.md).
+Per-component builds and toolchain details: [CONTRIBUTING.md](CONTRIBUTING.md). Repository architecture and accepted decisions start at [docs/README.md](docs/README.md).
 
 ## Contributing
 
