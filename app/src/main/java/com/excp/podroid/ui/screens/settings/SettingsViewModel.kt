@@ -14,7 +14,6 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.excp.podroid.BuildConfig
-import com.excp.podroid.PodroidApplication
 import com.excp.podroid.R
 import com.excp.podroid.data.repository.LanguageManager
 import com.excp.podroid.data.repository.PortForwardRepository
@@ -308,13 +307,8 @@ class SettingsViewModel @Inject constructor(
     fun clearExportError() { _exportError.value = null }
 
     suspend fun runAvfSmokeTest(): String = withContext(Dispatchers.IO) {
-        val app = context.applicationContext as? PodroidApplication
-            ?: return@withContext "FAILED: Podroid application readiness gate unavailable"
-        val readiness = runCatching { app.awaitAssetsReady() }
-        if (readiness.isFailure) {
-            return@withContext "FAILED: default VM migration/assets unavailable: " +
-                (readiness.exceptionOrNull()?.message ?: "unknown error")
-        }
+        // AvfDiagnostics owns the mandatory readiness and physical-path gates so
+        // every caller, not only this UI entry point, is fail closed.
         com.excp.podroid.engine.avf.AvfDiagnostics.runSmokeTest(context, vmPaths)
     }
 

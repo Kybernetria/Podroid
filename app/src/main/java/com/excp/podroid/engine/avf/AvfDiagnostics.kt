@@ -20,6 +20,9 @@ package com.excp.podroid.engine.avf
 
 import android.content.Context
 import android.content.pm.PackageManager
+import com.excp.podroid.PodroidApplication
+import com.excp.podroid.vm.VmAtomicFile
+import com.excp.podroid.vm.VmPathSecurity
 import com.excp.podroid.vm.VmPaths
 import java.io.File
 
@@ -140,7 +143,22 @@ object AvfDiagnostics {
      * framework — it does not stream the console or wait for guest boot.
      * The VM is stopped/deleted immediately.
      */
-    fun runSmokeTest(context: Context, vmPaths: VmPaths): String {
+    suspend fun runSmokeTest(context: Context, vmPaths: VmPaths): String {
+        val application = context.applicationContext as? PodroidApplication
+            ?: return "FAILED: Podroid application readiness gate unavailable"
+        try {
+            application.awaitAssetsReady()
+        } catch (failure: Throwable) {
+            return "FAILED: default VM migration/assets unavailable: " +
+                (failure.message ?: failure.javaClass.simpleName)
+        }
+        val pathSecurity = VmPathSecurity(vmPaths)
+        try {
+            pathSecurity.validateForLaunch()
+        } catch (failure: Throwable) {
+            return "FAILED: unsafe default VM paths: ${failure.message ?: failure.javaClass.simpleName}"
+        }
+
         val pre = probe(context)
         if (!pre.featureSupported)   return "skipped: feature flag not present (device does not ship AVF)"
         if (!pre.managePermissionGranted) return "skipped: MANAGE_VIRTUAL_MACHINE not granted (run: adb shell pm grant ${context.packageName} $PERM_MANAGE)"
@@ -167,7 +185,7 @@ object AvfDiagnostics {
             // exactly like AvfEngine.ensureRawKernel (and reuse its cached .raw).
             // Without this, crosvm fails to load the kernel ("invalid magic
             // number") the moment it gets past arg parsing.
-            val kernel = ensureRawKernel(kernelSrc, vmPaths.rawKernel)
+            val kernel = ensureRawKernel(kernelSrc, vmPaths.rawKernel, pathSecurity)
             val customCfg = buildCustomImageConfig(kernel.absolutePath, initrd.absolutePath)
             val config = buildVirtualMachineConfig(vmm, context, customCfg)
 
@@ -177,6 +195,7 @@ object AvfDiagnostics {
             // Start + immediately stop. We're proving the framework accepts us,
             // not running a workload.
             runCatching {
+                pathSecurity.validateForLaunch()
                 vm.javaClass.getMethod("run").invoke(vm)
             }.onFailure { e ->
                 deleteSafely(vmm, name)
@@ -221,15 +240,20 @@ object AvfDiagnostics {
      * the same sibling `.raw` file so the cache is shared with the real VM path.
      * Returns the source untouched if it isn't gzip.
      */
-    private fun ensureRawKernel(source: File, raw: File): File {
+    private fun ensureRawKernel(
+        source: File,
+        raw: File,
+        pathSecurity: VmPathSecurity,
+    ): File {
         val magic = ByteArray(4)
         source.inputStream().use { it.read(magic) }
         if (magic[0] != 0x1f.toByte() || magic[1] != 0x8b.toByte()) return source
         if (raw.exists() && raw.lastModified() >= source.lastModified()) return raw
-        java.util.zip.GZIPInputStream(source.inputStream().buffered()).use { gz ->
-            raw.outputStream().buffered().use { out -> gz.copyTo(out) }
+        VmAtomicFile.write(raw, pathSecurity) { output ->
+            java.util.zip.GZIPInputStream(source.inputStream().buffered()).use { gz ->
+                gz.copyTo(output)
+            }
         }
-        raw.setLastModified(System.currentTimeMillis())
         return raw
     }
 

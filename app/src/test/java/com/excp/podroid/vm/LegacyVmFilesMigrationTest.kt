@@ -88,6 +88,25 @@ class LegacyVmFilesMigrationTest {
     }
 
     @Test
+    fun `destination created after preflight is never overwritten`() {
+        val filesDir = temporaryFolder.newFolder("files")
+        val paths = VmPaths.default(filesDir)
+        filesDir.resolve("storage.img").writeText("legacy")
+        var injected = false
+        val migration = LegacyVmFilesMigration(filesDir, paths) { _, destination ->
+            if (!injected) {
+                Files.write(destination, "racing destination".toByteArray())
+                injected = true
+            }
+        }
+
+        expectIOException { migration.migrate() }
+
+        assertEquals("legacy", filesDir.resolve("storage.img").readText())
+        assertEquals("racing destination", paths.storageImage.readText())
+    }
+
+    @Test
     fun `rejects a legacy source symlink without moving other files`() {
         val filesDir = temporaryFolder.newFolder("files")
         val outside = temporaryFolder.newFile("outside").apply { writeText("secret") }

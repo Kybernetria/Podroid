@@ -11,6 +11,9 @@ import android.app.Application
 import android.os.Build
 import android.util.Log
 import com.excp.podroid.vm.LegacyVmFilesMigration
+import com.excp.podroid.vm.StaleTmpFileCleaner
+import com.excp.podroid.vm.VmAtomicFile
+import com.excp.podroid.vm.VmPathSecurity
 import com.excp.podroid.vm.VmPaths
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.CompletableDeferred
@@ -47,9 +50,11 @@ class PodroidApplication : Application() {
             try {
                 extractAssets()
                 assetsReady.complete(Unit)
-            } catch (e: Exception) {
-                Log.e(TAG, "VM path migration or asset extraction failed", e)
-                assetsReady.completeExceptionally(e)
+            } catch (failure: Throwable) {
+                Log.e(TAG, "VM path migration or asset extraction failed", failure)
+                // Catch Throwable, not only Exception: an Error must release every
+                // readiness waiter exceptionally rather than strand launch forever.
+                assetsReady.completeExceptionally(failure)
             }
         }
     }
@@ -89,6 +94,14 @@ class PodroidApplication : Application() {
         // renames; a collision or symlink fails the readiness gate closed.
         LegacyVmFilesMigration(filesDir, vmPaths).migrate()
         val instanceDir = vmPaths.instanceDirectory
+        val pathSecurity = VmPathSecurity(vmPaths)
+        pathSecurity.prepareExtractionLayout()
+        // Runtime sockets are the only legitimate special files in this tree.
+        // They are stale before initial extraction, so remove their exact names
+        // before the strict cleaner rejects every remaining special file.
+        pathSecurity.removeStaleRuntimeEndpoints()
+        StaleTmpFileCleaner().clean(instanceDir)
+        pathSecurity.validateForExtraction()
 
         // Asset extraction has a self-healing version stamp: on every install
         // or upgrade `packageInfo.lastUpdateTime` changes, so we record it in
@@ -107,9 +120,8 @@ class PodroidApplication : Application() {
             Log.i(TAG, "asset stamp drift ($previousStamp → $currentStamp) — forcing re-extract")
         }
 
-        // Drop any .tmp files left by a process killed mid-copy so they
-        // can't accumulate or shadow a fresh atomic write.
-        deleteStaleTmpFiles(instanceDir)
+        // Stale .tmp files were removed by the bounded NOFOLLOW traversal
+        // above. Every new temporary is then created exclusively.
 
         // Fan out the four top-level extractions across a small thread pool.
         // Disk-write throughput is the bottleneck for the squashfs (~225 MB),
@@ -117,10 +129,10 @@ class PodroidApplication : Application() {
         // overlap usefully across threads. Runs on a background coroutine
         // (not the main thread); the VM launch path awaits awaitAssetsReady.
         val tasks: List<() -> Unit> = listOf(
-            { copyAssetDir("qemu", instanceDir, forceCopy) },
-            { copyAssetIfNeeded("vmlinuz-virt", instanceDir, forceCopy) },
-            { copyAssetIfNeeded("initrd.img", instanceDir, forceCopy) },
-            { copyAssetIfNeeded("alpine-rootfs.squashfs", instanceDir, forceCopy) },
+            { copyAssetDir("qemu", instanceDir, forceCopy, pathSecurity) },
+            { copyAssetIfNeeded("vmlinuz-virt", instanceDir, forceCopy, pathSecurity) },
+            { copyAssetIfNeeded("initrd.img", instanceDir, forceCopy, pathSecurity) },
+            { copyAssetIfNeeded("alpine-rootfs.squashfs", instanceDir, forceCopy, pathSecurity) },
         )
         val pool = Executors.newFixedThreadPool(tasks.size.coerceAtMost(4))
         var allSucceeded = true
@@ -153,25 +165,14 @@ class PodroidApplication : Application() {
         // current — and because mksquashfs is deterministic the size check
         // can't catch it either, so a stale rootfs would boot forever. On
         // failure we leave the stamp stale so the next launch re-extracts.
-        if (allSucceeded) {
-            runCatching { stampFile.writeText(currentStamp) }
-                .onFailure { Log.w(TAG, "Failed to write assets stamp", it) }
-        } else {
+        if (!allSucceeded) {
             Log.w(TAG, "asset extraction incomplete — leaving stamp stale to force re-extract next launch")
             throw java.io.IOException("One or more VM asset extraction tasks failed")
         }
-    }
-
-    /** Recursively removes leftover `<name>.tmp` files under [dir]. */
-    private fun deleteStaleTmpFiles(dir: File) {
-        val children = dir.listFiles() ?: return
-        for (child in children) {
-            if (child.isDirectory) {
-                deleteStaleTmpFiles(child)
-            } else if (child.name.endsWith(TMP_SUFFIX)) {
-                runCatching { child.delete() }
-            }
+        VmAtomicFile.write(stampFile, pathSecurity) { output ->
+            output.write(currentStamp.toByteArray(Charsets.UTF_8))
         }
+        pathSecurity.validateForExtraction()
     }
 
     /**
@@ -181,14 +182,20 @@ class PodroidApplication : Application() {
      * different content (e.g. an init.d script edited) — size-only checks
      * would silently keep the stale copy and the VM boots the old rootfs.
      */
-    private fun copyAssetIfNeeded(assetName: String, destDir: File, forceCopy: Boolean) {
+    private fun copyAssetIfNeeded(
+        assetName: String,
+        destDir: File,
+        forceCopy: Boolean,
+        pathSecurity: VmPathSecurity,
+    ) {
         val destFile = File(destDir, assetName)
         try {
+            pathSecurity.validateRegularFileDestination(destFile)
             val assetSize = try { assets.openFd(assetName).use { it.length } } catch (_: Exception) { -1L }
             if (!forceCopy && assetSize >= 0 && destFile.exists() && destFile.length() == assetSize) return
 
-            destFile.parentFile?.mkdirs()
-            copyAssetAtomically(assetName, destFile)
+            destFile.parentFile?.let { pathSecurity.createExtractionDirectory(it) }
+            copyAssetAtomically(assetName, destFile, pathSecurity)
         } catch (e: Exception) {
             Log.w(TAG, "Failed to extract $assetName", e)
             throw e
@@ -200,27 +207,39 @@ class PodroidApplication : Application() {
      * Each file is copied if missing OR if its size differs OR if forceCopy
      * is true (install-stamp drift).
      */
-    private fun copyAssetDir(assetPath: String, destDir: File, forceCopy: Boolean) {
+    private fun copyAssetDir(
+        assetPath: String,
+        destDir: File,
+        forceCopy: Boolean,
+        pathSecurity: VmPathSecurity,
+    ) {
+        pathSecurity.createExtractionDirectory(destDir)
         val entries = assets.list(assetPath) ?: return
         for (entry in entries) {
             val src = "$assetPath/$entry"
             val dest = File(destDir, entry)
             val subEntries = assets.list(src)
             if (subEntries != null && subEntries.isNotEmpty()) {
-                dest.mkdirs()
-                copyAssetDir(src, dest, forceCopy)
+                pathSecurity.createExtractionDirectory(dest)
+                copyAssetDir(src, dest, forceCopy, pathSecurity)
             } else {
-                copyAssetFileIfNeeded(src, dest, forceCopy)
+                copyAssetFileIfNeeded(src, dest, forceCopy, pathSecurity)
             }
         }
     }
 
-    private fun copyAssetFileIfNeeded(assetPath: String, destFile: File, forceCopy: Boolean) {
+    private fun copyAssetFileIfNeeded(
+        assetPath: String,
+        destFile: File,
+        forceCopy: Boolean,
+        pathSecurity: VmPathSecurity,
+    ) {
         try {
+            pathSecurity.validateRegularFileDestination(destFile)
             val assetSize = try { assets.openFd(assetPath).use { it.length } } catch (_: Exception) { -1L }
             if (!forceCopy && assetSize >= 0 && destFile.exists() && destFile.length() == assetSize) return
 
-            copyAssetAtomically(assetPath, destFile)
+            copyAssetAtomically(assetPath, destFile, pathSecurity)
         } catch (e: Exception) {
             Log.w(TAG, "Failed to extract $assetPath", e)
             throw e
@@ -234,27 +253,17 @@ class PodroidApplication : Application() {
      * never sees a half-written squashfs/kernel. Throws on any failure so the
      * caller logs it and the stale/missing file is caught by the next size-check.
      */
-    private fun copyAssetAtomically(assetPath: String, destFile: File) {
-        val tmpFile = File(destFile.parentFile, destFile.name + TMP_SUFFIX)
-        try {
-            assets.open(assetPath).use { input ->
-                java.io.FileOutputStream(tmpFile).use { output ->
-                    input.copyTo(output)
-                    output.flush()
-                    output.fd.sync()
-                }
-            }
-            if (!tmpFile.renameTo(destFile)) {
-                throw java.io.IOException("atomic rename ${tmpFile.name} -> ${destFile.name} failed")
-            }
-        } catch (e: Exception) {
-            runCatching { tmpFile.delete() }
-            throw e
+    private fun copyAssetAtomically(
+        assetPath: String,
+        destFile: File,
+        pathSecurity: VmPathSecurity,
+    ) {
+        VmAtomicFile.write(destFile, pathSecurity) { output ->
+            assets.open(assetPath).use { input -> input.copyTo(output) }
         }
     }
 
     companion object {
         private const val TAG = "PodroidApp"
-        private const val TMP_SUFFIX = ".tmp"
     }
 }

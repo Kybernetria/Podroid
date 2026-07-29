@@ -31,6 +31,7 @@ import com.excp.podroid.data.repository.PortForwardRule
 import com.excp.podroid.util.HostMetrics
 import com.excp.podroid.util.LogProxy
 import com.excp.podroid.vm.VmId
+import com.excp.podroid.vm.VmPathSecurity
 import com.excp.podroid.vm.VmPaths
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
@@ -303,7 +304,9 @@ class QemuEngine @Inject constructor(
             return
         }
 
+        val pathSecurity = VmPathSecurity(vmPaths)
         try {
+            pathSecurity.validateForLaunch()
             ensureStorageImage(config.storageSizeGb)
         } catch (e: java.io.IOException) {
             // Restore the "cleanedUp=false ⟺ VM lifetime in progress" invariant
@@ -348,6 +351,9 @@ class QemuEngine @Inject constructor(
             }.asCoroutineDispatcher()
             qemuDispatcher = dispatcher
 
+            // Recheck after disk preparation/socket cleanup and directly before
+            // the irreversible process launch.
+            pathSecurity.validateForLaunch()
             val proc = withContext(dispatcher) { pb.start() }
             process = proc
             _bootStage.value = "Booting kernel..."

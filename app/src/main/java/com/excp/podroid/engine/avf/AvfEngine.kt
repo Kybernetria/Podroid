@@ -27,7 +27,9 @@ import com.excp.podroid.engine.VmConfig
 import com.excp.podroid.engine.VmEngine
 import com.excp.podroid.engine.VmState
 import com.excp.podroid.util.LogProxy
+import com.excp.podroid.vm.VmAtomicFile
 import com.excp.podroid.vm.VmId
+import com.excp.podroid.vm.VmPathSecurity
 import com.excp.podroid.vm.VmPaths
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
@@ -340,9 +342,11 @@ class AvfEngine @Inject constructor(
         // boot's state (see the field comment).
         detector = newDetector()
 
+        val pathSecurity = VmPathSecurity(vmPaths)
         try {
+            pathSecurity.validateForLaunch()
             val mgr = AvfReflect.manager(context)
-            val vmConfigObj = buildConfig(mgr, config)
+            val vmConfigObj = buildConfig(mgr, config, pathSecurity)
 
             // AOSP canonical pattern: get-or-create, then attempt to update the
             // config on the existing VM. If AVF rejects the new config as
@@ -492,6 +496,9 @@ class AvfEngine @Inject constructor(
                 return
             }
 
+            // Console setup and image preparation can change the tree; validate
+            // again at the final boundary immediately before vm.run().
+            pathSecurity.validateForLaunch()
             AvfReflect.run(vm)
             val status = runCatching { AvfReflect.getStatus(vm) }.getOrDefault(-1)
             Log.i(TAG, "vm.run() returned — VM booting (status=$status)")
@@ -913,7 +920,7 @@ class AvfEngine @Inject constructor(
      * Skips decompression if the .raw file's mtime is newer than the source.
      * Returns the decompressed file (or the source if already raw).
      */
-    private fun ensureRawKernel(source: File): File {
+    private fun ensureRawKernel(source: File, pathSecurity: VmPathSecurity): File {
         val magic = ByteArray(4)
         source.inputStream().use { it.read(magic) }
         val isGzip = magic[0] == 0x1f.toByte() && magic[1] == 0x8b.toByte()
@@ -923,10 +930,11 @@ class AvfEngine @Inject constructor(
         if (raw.exists() && raw.lastModified() >= source.lastModified()) return raw
 
         Log.d(TAG, "Decompressing ${source.name} → ${raw.name}")
-        java.util.zip.GZIPInputStream(source.inputStream().buffered()).use { gz ->
-            raw.outputStream().buffered().use { out -> gz.copyTo(out) }
+        VmAtomicFile.write(raw, pathSecurity) { output ->
+            java.util.zip.GZIPInputStream(source.inputStream().buffered()).use { gz ->
+                gz.copyTo(output)
+            }
         }
-        raw.setLastModified(System.currentTimeMillis())
         return raw
     }
 
@@ -935,7 +943,11 @@ class AvfEngine @Inject constructor(
         appendLine("last VM lifecycle callback: $lastLifecycleEvent")
     }
 
-    private suspend fun buildConfig(mgr: Any, config: VmConfig): Any {
+    private suspend fun buildConfig(
+        mgr: Any,
+        config: VmConfig,
+        pathSecurity: VmPathSecurity,
+    ): Any {
         // Resolve the effective vCPU count: the user's request, clamped by any
         // per-device cap discovered by a prior early-boot reset (issue #29).
         // attemptedCpus feeds the onStopped fallback ladder.
@@ -960,7 +972,7 @@ class AvfEngine @Inject constructor(
         val kernelSrc = vmPaths.kernel.also {
             require(it.exists()) { "kernel missing at ${it.absolutePath}" }
         }
-        val kernel = ensureRawKernel(kernelSrc)
+        val kernel = ensureRawKernel(kernelSrc, pathSecurity)
         val initrd = vmPaths.initrd.also {
             require(it.exists()) { "initrd missing at ${it.absolutePath}" }
         }
