@@ -3,11 +3,15 @@ package com.excp.podroid.vm
 import com.excp.podroid.engine.ExactValueStateFlow
 import com.excp.podroid.engine.VmConfig
 import com.excp.podroid.engine.VmState
+import com.excp.podroid.service.ServiceLaunchCoordinator
 import java.io.IOException
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
@@ -17,6 +21,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -654,6 +659,70 @@ class VmManagerTest {
     }
 
     @Test
+    fun `delayed guest STOP superseded by force stop and queued start has zero coordinator effects`() =
+        runBlocking {
+            assertDelayedGuestDispatchIsFenced(LifecycleOperation.STOP)
+        }
+
+    @Test
+    fun `delayed guest RESTART superseded by force stop and queued start has zero coordinator effects`() =
+        runBlocking {
+            assertDelayedGuestDispatchIsFenced(LifecycleOperation.RESTART)
+        }
+
+    @Test
+    fun `service dispatch authority is held through synchronous coordinator admission`() = runBlocking {
+        val supervisor = FakeSupervisor()
+        val manager = manager(supervisor = supervisor)
+        val stop = manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.STOP, 1L)
+        assertTrue(manager.acceptPrepared(VmId.DEFAULT, stop))
+        val callbackEntered = CountDownLatch(1)
+        val releaseCallback = CountDownLatch(1)
+        val events = mutableListOf<String>()
+
+        val authorization = async(Dispatchers.Default) {
+            manager.authorizeServiceDispatch(VmId.DEFAULT, stop) {
+                events += "callback:start"
+                callbackEntered.countDown()
+                check(releaseCallback.await(1, TimeUnit.SECONDS))
+                events += "callback:end"
+            }
+        }
+        assertTrue(callbackEntered.await(1, TimeUnit.SECONDS))
+        val newerPreparation = async(
+            context = Dispatchers.Default,
+            start = CoroutineStart.UNDISPATCHED,
+        ) {
+            manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.START, 2L).also {
+                events += "prepare:newer"
+            }
+        }
+
+        assertFalse(newerPreparation.isCompleted)
+        releaseCallback.countDown()
+        assertTrue(authorization.await())
+        newerPreparation.await()
+
+        assertEquals(listOf("callback:start", "callback:end", "prepare:newer"), events)
+    }
+
+    @Test
+    fun `accepted execution starts only after service dispatch authority is released`() = runBlocking {
+        val manager = manager()
+        val start = manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.START, 1L)
+        assertTrue(manager.acceptPrepared(VmId.DEFAULT, start))
+        var coordinatorAdmitted = false
+
+        assertTrue(manager.authorizeServiceDispatch(VmId.DEFAULT, start) {
+            coordinatorAdmitted = true
+        })
+        assertTrue(coordinatorAdmitted)
+        assertTrue(withTimeout(1_000L) {
+            manager.executeAccepted(VmId.DEFAULT, start)
+        })
+    }
+
+    @Test
     fun `stop token is pending before backend stop effect`() = runBlocking {
         val supervisor = FakeSupervisor()
         val runtime = FakeRuntime().apply {
@@ -1139,6 +1208,83 @@ class VmManagerTest {
         paths.initrd.writeText("initrd")
         paths.rootfs.writeText("rootfs")
         return paths
+    }
+
+    private suspend fun assertDelayedGuestDispatchIsFenced(
+        delayedOperation: LifecycleOperation,
+    ) {
+        val supervisor = FakeSupervisor()
+        val manager = manager(supervisor = supervisor)
+        val coordinator = ServiceLaunchCoordinator<String>()
+        coordinator.beginLaunch("existing-launch")
+
+        val delayedGuest = manager.prepareLifecycleCommand(
+            VmId.DEFAULT,
+            delayedOperation,
+            1L,
+        )
+        assertTrue(manager.acceptPrepared(VmId.DEFAULT, delayedGuest))
+
+        val forceStop = manager.prepareLifecycleCommand(
+            VmId.DEFAULT,
+            LifecycleOperation.FORCE_STOP,
+            2L,
+        )
+        assertTrue(manager.acceptPrepared(VmId.DEFAULT, forceStop))
+        lateinit var admittedForceStop: ServiceLaunchCoordinator.Stop<String>
+        val cancelledLaunches = mutableListOf<String>()
+        assertTrue(manager.authorizeServiceDispatch(VmId.DEFAULT, forceStop) {
+            admittedForceStop = coordinator.beginStop()
+            admittedForceStop.launchOwner?.let(cancelledLaunches::add)
+        })
+
+        val newerStart = manager.prepareLifecycleCommand(
+            VmId.DEFAULT,
+            LifecycleOperation.START,
+            3L,
+        )
+        assertTrue(manager.acceptPrepared(VmId.DEFAULT, newerStart))
+        var queuedCommand: LifecycleTransactionToken? = null
+        assertTrue(manager.authorizeServiceDispatch(VmId.DEFAULT, newerStart) {
+            queuedCommand = newerStart
+            assertTrue(coordinator.queueStartDuringStop())
+        })
+
+        var staleCoordinatorEffects = 0
+        assertFalse(manager.authorizeServiceDispatch(VmId.DEFAULT, delayedGuest) {
+            staleCoordinatorEffects++
+            when (delayedOperation) {
+                LifecycleOperation.STOP -> {
+                    queuedCommand = null
+                    coordinator.beginStop()
+                }
+                LifecycleOperation.RESTART -> {
+                    val staleStop = coordinator.beginStop()
+                    if (!staleStop.shouldExecute) {
+                        queuedCommand = delayedGuest
+                        coordinator.queueStartDuringStop()
+                    }
+                }
+                else -> error("unexpected delayed operation")
+            }
+        })
+
+        assertEquals(0, staleCoordinatorEffects)
+        assertEquals(listOf("existing-launch"), cancelledLaunches)
+        assertEquals(newerStart, queuedCommand)
+        var replacement: ServiceLaunchCoordinator.Launch<String>? = null
+        assertTrue(manager.authorizeServiceDispatch(VmId.DEFAULT, newerStart) {
+            replacement = requireNotNull(
+                coordinator.completeStop(admittedForceStop.generation, "newer-start"),
+            ).launch
+        })
+        assertEquals("newer-start", requireNotNull(replacement).owner)
+
+        val state = manager.supervisorState(VmId.DEFAULT)
+        assertEquals(newerStart.id, state.latestTransaction?.id)
+        assertEquals(LifecycleOperation.START, state.latestTransaction?.operation)
+        assertEquals(LifecycleOutcome.PENDING, state.latestTransaction?.outcome)
+        assertEquals(VmDesiredState.RUNNING, state.desiredState)
     }
 
     private fun manager(

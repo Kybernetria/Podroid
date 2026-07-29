@@ -479,6 +479,14 @@ class VmServiceContractTest {
             vmId: VmId,
             command: LifecycleTransactionToken,
         ): Boolean = true.also { called("accept:${command.operation}", vmId) }
+        override suspend fun authorizeServiceDispatch(
+            vmId: VmId,
+            command: LifecycleTransactionToken,
+            admission: () -> Unit,
+        ): Boolean = true.also {
+            called("authorizeServiceDispatch:${command.operation}", vmId)
+            admission()
+        }
         override suspend fun executeAccepted(
             vmId: VmId,
             command: LifecycleTransactionToken,

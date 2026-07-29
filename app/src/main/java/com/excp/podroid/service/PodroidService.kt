@@ -42,6 +42,8 @@ import com.excp.podroid.vm.VmPaths
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -70,6 +72,7 @@ class PodroidService : Service() {
     )
 
     private val launchCoordinator = ServiceLaunchCoordinator<ServiceLaunchOwner>()
+    private val serviceDispatchMutex = Mutex()
     @Volatile private var queuedLaunchCommand: LifecycleTransactionToken? = null
 
     private var notificationBuilder: NotificationCompat.Builder? = null
@@ -233,37 +236,56 @@ class PodroidService : Service() {
         }
     }
 
-    private fun executeStartCommand(command: LifecycleTransactionToken) {
-        // The durable RUNNING/PENDING command is authoritative. This queue only
-        // coordinates execution; process death intentionally leaves it pending
-        // for ticket #11 reconciliation.
-        val queuedDuringStop = launchCoordinator.queueStartDuringStop()
-        if (queuedDuringStop) queuedLaunchCommand = command
-        val startDecision = VmServiceStartPolicy.decide(
-            managerBusy = vmManager.busy(VmId.DEFAULT).value,
-            pendingStartOwned = launchCoordinator.ownershipActive.value,
-        )
-        val launch = if (!queuedDuringStop && startDecision.launchNewGeneration) {
-            prepareLaunch(command)
-        } else {
-            null
-        }
-        if (startDecision.acquireWakeLock) acquireWakeLock()
-        if (startDecision.armSupervision) startSupervision()
-        if (!queuedDuringStop && launch == null) {
-            serviceScope.launch(Dispatchers.IO) {
-                runCatching { vmManager.executeAccepted(VmId.DEFAULT, command) }
-                    .onFailure { Log.e(TAG, "VM start command failed", it) }
+    private suspend fun executeStartCommand(command: LifecycleTransactionToken) =
+        serviceDispatchMutex.withLock {
+            var dispatchAfterAuthorization: (() -> Unit)? = null
+            val authorized = vmManager.authorizeServiceDispatch(VmId.DEFAULT, command) {
+                // The durable RUNNING/PENDING command is authoritative. This queue
+                // only coordinates execution; process death intentionally leaves it
+                // pending for ticket #11 reconciliation.
+                val queuedDuringStop = launchCoordinator.queueStartDuringStop()
+                if (queuedDuringStop) queuedLaunchCommand = command
+                val startDecision = VmServiceStartPolicy.decide(
+                    managerBusy = vmManager.busy(VmId.DEFAULT).value,
+                    pendingStartOwned = launchCoordinator.ownershipActive.value,
+                )
+                val launch = if (!queuedDuringStop && startDecision.launchNewGeneration) {
+                    prepareLaunch(command)
+                } else {
+                    null
+                }
+                dispatchAfterAuthorization = {
+                    if (startDecision.acquireWakeLock) acquireWakeLock()
+                    if (startDecision.armSupervision) startSupervision()
+                    if (!queuedDuringStop && launch == null) {
+                        serviceScope.launch(Dispatchers.IO) {
+                            runCatching { vmManager.executeAccepted(VmId.DEFAULT, command) }
+                                .onFailure { Log.e(TAG, "VM start command failed", it) }
+                        }
+                    }
+                    launch?.owner?.job?.start()
+                }
             }
+            if (!authorized) {
+                logStaleServiceDispatch(command)
+                return@withLock
+            }
+            checkNotNull(dispatchAfterAuthorization).invoke()
         }
-        launch?.owner?.job?.start()
-    }
 
     private fun logStaleCommand(source: String, delivery: ServiceCommandOrder.Delivery) {
         Log.i(
             TAG,
             "Ignoring stale service command source=$source generation=${delivery.generation} " +
                 "newest=${delivery.newestGeneration}",
+        )
+    }
+
+    private fun logStaleServiceDispatch(command: LifecycleTransactionToken) {
+        Log.i(
+            TAG,
+            "Ignoring stale prepared service dispatch generation=${command.id} " +
+                "operation=${command.operation}",
         )
     }
 
@@ -291,7 +313,7 @@ class PodroidService : Service() {
     private suspend fun admitAndDispatch(
         operation: LifecycleOperation,
         claimBeforeDispatch: Boolean = true,
-        dispatch: (LifecycleTransactionToken) -> Unit,
+        dispatch: suspend (LifecycleTransactionToken) -> Unit,
     ): LifecycleTransactionToken = commandOrder.admitAndDispatch(
         latestDurableGeneration = {
             vmManager.supervisorState(VmId.DEFAULT).latestTransaction?.id ?: 0L
@@ -387,40 +409,67 @@ class PodroidService : Service() {
         }
     }
 
-    private fun requestServiceStop(
+    private suspend fun requestServiceStop(
         command: LifecycleTransactionToken,
         failureLog: String,
         force: Boolean,
-    ) {
-        queuedLaunchCommand = null
-        val wasBusy = vmManager.busy(VmId.DEFAULT).value || launchCoordinator.ownershipActive.value
-        val stop = launchCoordinator.beginStop()
-        if (!stop.shouldExecute) {
-            // The current teardown remains the in-memory owner. This newer
-            // durable command may share/escalate the manager-owned stop task.
-            serviceScope.launch(Dispatchers.IO) {
-                runCatching { vmManager.executeAccepted(VmId.DEFAULT, command) }
-                    .onFailure { Log.e(TAG, failureLog, it) }
+    ) = serviceDispatchMutex.withLock {
+        var dispatchAfterAuthorization: (() -> Unit)? = null
+        val authorized = vmManager.authorizeServiceDispatch(VmId.DEFAULT, command) {
+            queuedLaunchCommand = null
+            val wasBusy = vmManager.busy(VmId.DEFAULT).value ||
+                launchCoordinator.ownershipActive.value
+            val stop = launchCoordinator.beginStop()
+            stop.launchOwner?.job?.cancel()
+            dispatchAfterAuthorization = if (!stop.shouldExecute) {
+                {
+                    // The current teardown remains the in-memory owner. This
+                    // newer command may share/escalate the manager stop task.
+                    serviceScope.launch(Dispatchers.IO) {
+                        runCatching { vmManager.executeAccepted(VmId.DEFAULT, command) }
+                            .onFailure { Log.e(TAG, failureLog, it) }
+                    }
+                }
+            } else {
+                { dispatchServiceStop(stop, command, failureLog, wasBusy) }
             }
-            return
         }
-        dispatchServiceStop(stop, command, failureLog, wasBusy)
+        if (!authorized) {
+            logStaleServiceDispatch(command)
+            return@withLock
+        }
+        checkNotNull(dispatchAfterAuthorization).invoke()
     }
 
-    private fun requestServiceRestart(
+    private suspend fun requestServiceRestart(
         command: LifecycleTransactionToken,
         failureLog: String,
-    ) {
-        val wasBusy = vmManager.busy(VmId.DEFAULT).value || launchCoordinator.ownershipActive.value
-        val stop = launchCoordinator.beginStop()
-        if (!stop.shouldExecute) {
-            queuedLaunchCommand = command
-            launchCoordinator.queueStartDuringStop()
-            return
+    ) = serviceDispatchMutex.withLock {
+        var dispatchAfterAuthorization: (() -> Unit)? = null
+        val authorized = vmManager.authorizeServiceDispatch(VmId.DEFAULT, command) {
+            val wasBusy = vmManager.busy(VmId.DEFAULT).value ||
+                launchCoordinator.ownershipActive.value
+            val stop = launchCoordinator.beginStop()
+            stop.launchOwner?.job?.cancel()
+            if (!stop.shouldExecute) {
+                // The retained replacement is a coordinator-only effect;
+                // ticket #11 will reconcile it after process death.
+                queuedLaunchCommand = command
+                launchCoordinator.queueStartDuringStop()
+                dispatchAfterAuthorization = {}
+            } else {
+                dispatchAfterAuthorization = {
+                    // Restart remains one manager transaction, PENDING until
+                    // replacement acceptance finishes.
+                    dispatchServiceStop(stop, command, failureLog, wasBusy)
+                }
+            }
         }
-        // Restart executes as one manager transaction. It remains PENDING while
-        // shutdown is in flight and completes only after replacement acceptance.
-        dispatchServiceStop(stop, command, failureLog, wasBusy)
+        if (!authorized) {
+            logStaleServiceDispatch(command)
+            return@withLock
+        }
+        checkNotNull(dispatchAfterAuthorization).invoke()
     }
 
     private fun dispatchServiceStop(
@@ -431,8 +480,8 @@ class PodroidService : Service() {
     ) {
         if (!stop.shouldExecute) return
 
-        // Command preparation is already durable before this cancellation.
-        stop.launchOwner?.job?.cancel()
+        // Launch invalidation/cancellation was admitted under manager authority;
+        // backend and persistence work starts only after that gate was released.
         val stopScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         stopScope.launch {
             try {
@@ -466,39 +515,64 @@ class PodroidService : Service() {
         }
         stopResult.onFailure { Log.e(TAG, failureLog, it) }
         withContext(NonCancellable + Dispatchers.Main.immediate) {
-            if (stopResult.isFailure) {
-                queuedLaunchCommand?.let { queued ->
-                    val failed = withContext(Dispatchers.IO) {
-                        runCatching {
-                            vmManager.failAccepted(
-                                VmId.DEFAULT,
-                                queued,
-                                LifecycleErrorCode.INVALID_STATE,
-                            )
+            serviceDispatchMutex.withLock {
+                if (stopResult.isFailure) {
+                    queuedLaunchCommand?.let { queued ->
+                        val failed = withContext(Dispatchers.IO) {
+                            runCatching {
+                                vmManager.failAccepted(
+                                    VmId.DEFAULT,
+                                    queued,
+                                    LifecycleErrorCode.INVALID_STATE,
+                                )
+                            }
+                        }
+                        failed.onFailure { Log.e(TAG, "Queued launch failure persistence failed", it) }
+                    }
+                    launchCoordinator.beginStop()
+                    queuedLaunchCommand = null
+                }
+                val queuedCommand = queuedLaunchCommand
+                var queuedOwner: ServiceLaunchOwner? = null
+                var launch: ServiceLaunchCoordinator.Launch<ServiceLaunchOwner>? = null
+                if (queuedCommand != null) {
+                    val authorized = vmManager.authorizeServiceDispatch(VmId.DEFAULT, queuedCommand) {
+                        // Re-fence the stop-to-start handoff: the command may have
+                        // been superseded while backend shutdown was in flight.
+                        if (queuedLaunchCommand == queuedCommand) {
+                            queuedLaunchCommand = null
+                            queuedOwner = createLaunchOwner(queuedCommand)
+                            launch = launchCoordinator.completeStop(
+                                stop.generation,
+                                checkNotNull(queuedOwner),
+                            )?.launch
+                            queuedOwner?.generation = launch?.generation ?: 0L
                         }
                     }
-                    failed.onFailure { Log.e(TAG, "Queued launch failure persistence failed", it) }
+                    if (!authorized) {
+                        logStaleServiceDispatch(queuedCommand)
+                        if (queuedLaunchCommand == queuedCommand) {
+                            queuedLaunchCommand = null
+                            launchCoordinator.beginStop()
+                        }
+                    }
                 }
-                launchCoordinator.beginStop()
-                queuedLaunchCommand = null
-            }
-            val queuedCommand = queuedLaunchCommand
-            queuedLaunchCommand = null
-            val queuedOwner = queuedCommand?.let(::createLaunchOwner)
-            val unusedOwner = queuedOwner ?: createLaunchOwner(command).also { it.job.cancel() }
-            val completion = launchCoordinator.completeStop(stop.generation, unusedOwner)
-            val launch = completion?.launch
-            if (launch != null && queuedOwner != null) {
-                queuedOwner.generation = launch.generation
-                acquireWakeLock()
-                startSupervision()
-                launch.owner.job.start()
-            } else {
-                queuedOwner?.job?.cancel()
-                val decision = currentLifecycleDecision()
-                if (decision.teardown) teardown()
-                else if (decision.notification == VmServiceNotification.CLEANUP_INCOMPLETE) {
-                    updateNotification("VM error — cleanup incomplete; Stop retries cleanup")
+                if (queuedOwner == null) {
+                    val unusedOwner = createLaunchOwner(command).also { it.job.cancel() }
+                    launch = launchCoordinator.completeStop(stop.generation, unusedOwner)?.launch
+                }
+                val admittedOwner = queuedOwner
+                if (launch != null && admittedOwner != null) {
+                    acquireWakeLock()
+                    startSupervision()
+                    launch?.owner?.job?.start()
+                } else {
+                    admittedOwner?.job?.cancel()
+                    val decision = currentLifecycleDecision()
+                    if (decision.teardown) teardown()
+                    else if (decision.notification == VmServiceNotification.CLEANUP_INCOMPLETE) {
+                        updateNotification("VM error — cleanup incomplete; Stop retries cleanup")
+                    }
                 }
             }
         }

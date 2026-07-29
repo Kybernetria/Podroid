@@ -32,7 +32,7 @@ internal class ServiceCommandOrder {
     suspend fun <T : Any> admitAndDispatch(
         latestDurableGeneration: suspend () -> Long,
         prepare: suspend (generation: Long) -> T,
-        dispatch: (Admission<T>) -> Unit,
+        dispatch: suspend (Admission<T>) -> Unit,
     ): Admission<T> = mutex.withLock {
         val durableGeneration = latestDurableGeneration()
         adoptLocked(durableGeneration)
@@ -55,7 +55,7 @@ internal class ServiceCommandOrder {
     suspend fun deliverAndExecute(
         reservedGeneration: Long,
         validatePrepared: suspend () -> Boolean,
-        command: () -> Unit,
+        command: suspend () -> Unit,
     ): Delivery = mutex.withLock {
         val delivery = deliverLocked(reservedGeneration, validatePrepared)
         if (delivery.execute) command()

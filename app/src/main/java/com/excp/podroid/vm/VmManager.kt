@@ -148,6 +148,15 @@ interface VmManager {
         vmId: VmId,
         command: LifecycleTransactionToken,
     ): Boolean
+    /**
+     * Fences a fast service-coordinator admission against newer durable commands.
+     * [admission] must not perform backend or persistence work.
+     */
+    suspend fun authorizeServiceDispatch(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+        admission: () -> Unit,
+    ): Boolean
     /** Executes a command successfully claimed by [acceptPrepared]. */
     suspend fun executeAccepted(
         vmId: VmId,
@@ -253,7 +262,7 @@ class DefaultVmManager internal constructor(
     /** Serializes durable command authority with just-in-time irreversible effects. */
     private val commandAuthorityMutex = Mutex()
     private val commandClaimMutex = Mutex()
-    private val claimedCommands = mutableMapOf<Long, CommandClaimState>()
+    private val claimedCommands = mutableMapOf<LifecycleTransactionToken, CommandClaimState>()
     @Volatile private var stopTask: Deferred<Unit>? = null
     @Volatile private var stopForceSignal: CompletableDeferred<Unit>? = null
     @Volatile private var startTask: Deferred<Unit>? = null
@@ -364,8 +373,8 @@ class DefaultVmManager internal constructor(
         }
         return prepareCommand(operation, expectedCommandGeneration).also { prepared ->
             commandClaimMutex.withLock {
-                claimedCommands.entries.removeAll { (id, state) ->
-                    id < prepared.id && state == CommandClaimState.READY
+                claimedCommands.entries.removeAll { (token, state) ->
+                    token.id < prepared.id && state == CommandClaimState.READY
                 }
             }
         }
@@ -376,12 +385,28 @@ class DefaultVmManager internal constructor(
         command: LifecycleTransactionToken,
     ): Boolean = commandClaimMutex.withLock {
         requireDefault(vmId)
-        if (command.id in claimedCommands || claimedCommands.size >= MAX_CLAIMED_COMMANDS) {
+        if (claimedCommands.keys.any { it.id == command.id } ||
+            claimedCommands.size >= MAX_CLAIMED_COMMANDS
+        ) {
             return@withLock false
         }
         if (!supervisor.claim(command)) return@withLock false
-        claimedCommands[command.id] = CommandClaimState.READY
+        claimedCommands[command] = CommandClaimState.READY
         true
+    }
+
+    override suspend fun authorizeServiceDispatch(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+        admission: () -> Unit,
+    ): Boolean = commandAuthorityMutex.withLock {
+        requireDefault(vmId)
+        commandClaimMutex.withLock claim@{
+            if (claimedCommands[command] != CommandClaimState.READY) return@claim false
+            if (!supervisor.isCurrent(command)) return@claim false
+            admission()
+            true
+        }
     }
 
     override suspend fun executeAccepted(
@@ -393,8 +418,8 @@ class DefaultVmManager internal constructor(
             "Prepared service commands cannot execute removal without its policy"
         }
         val mayExecute = commandClaimMutex.withLock {
-            if (claimedCommands[command.id] != CommandClaimState.READY) return@withLock false
-            claimedCommands[command.id] = CommandClaimState.EXECUTING
+            if (claimedCommands[command] != CommandClaimState.READY) return@withLock false
+            claimedCommands[command] = CommandClaimState.EXECUTING
             true
         }
         if (!mayExecute) return false
@@ -435,9 +460,9 @@ class DefaultVmManager internal constructor(
                 .getOrDefault(true)
             commandClaimMutex.withLock {
                 if (completionUncertain) {
-                    claimedCommands[command.id] = CommandClaimState.COMPLETION_UNCERTAIN
+                    claimedCommands[command] = CommandClaimState.COMPLETION_UNCERTAIN
                 } else {
-                    claimedCommands.remove(command.id)
+                    claimedCommands.remove(command)
                 }
             }
         }
@@ -450,8 +475,8 @@ class DefaultVmManager internal constructor(
     ): Boolean {
         requireDefault(vmId)
         val mayFail = commandClaimMutex.withLock {
-            if (claimedCommands[command.id] != CommandClaimState.READY) return@withLock false
-            claimedCommands[command.id] = CommandClaimState.EXECUTING
+            if (claimedCommands[command] != CommandClaimState.READY) return@withLock false
+            claimedCommands[command] = CommandClaimState.EXECUTING
             true
         }
         if (!mayFail) return false
@@ -462,9 +487,9 @@ class DefaultVmManager internal constructor(
                 .getOrDefault(true)
             commandClaimMutex.withLock {
                 if (completionUncertain) {
-                    claimedCommands[command.id] = CommandClaimState.COMPLETION_UNCERTAIN
+                    claimedCommands[command] = CommandClaimState.COMPLETION_UNCERTAIN
                 } else {
-                    claimedCommands.remove(command.id)
+                    claimedCommands.remove(command)
                 }
             }
         }
