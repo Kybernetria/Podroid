@@ -163,8 +163,8 @@ internal object HostSupervisorRecordCodec {
             LifecycleOperation.STOP,
             LifecycleOperation.FORCE_STOP,
             -> transaction.outcome != LifecycleOutcome.SUCCEEDED
+            LifecycleOperation.REMOVE -> true
             LifecycleOperation.SETUP,
-            LifecycleOperation.REMOVE,
             null,
             -> false
         }
@@ -360,7 +360,11 @@ class HostSupervisorRepository internal constructor(
                 latestTransaction = LifecycleTransaction(
                     nextId, operation, LifecycleOutcome.PENDING, now(), null, null,
                 ),
-            )
+            ).let { prepared ->
+                if (operation == LifecycleOperation.REMOVE) {
+                    prepared.withRuntimeEvidence(true)
+                } else prepared
+            }
         }
         return token
     }
@@ -417,6 +421,7 @@ class HostSupervisorRepository internal constructor(
                         LifecycleOperation.RESTART,
                         LifecycleOperation.STOP,
                         LifecycleOperation.FORCE_STOP,
+                        LifecycleOperation.REMOVE,
                     )
                 val completedState = current.copy(
                     runtimeGeneration = if (runtimeStarted) Math.addExact(current.runtimeGeneration, 1L)
@@ -443,6 +448,7 @@ class HostSupervisorRepository internal constructor(
                     outcome == LifecycleOutcome.FAILED && token.operation in setOf(
                         LifecycleOperation.STOP,
                         LifecycleOperation.FORCE_STOP,
+                        LifecycleOperation.REMOVE,
                     ) -> completedState.withRuntimeEvidence(true)
                     else -> completedState
                 }
@@ -480,6 +486,7 @@ class HostSupervisorRepository internal constructor(
                             pending.operation in setOf(
                                 LifecycleOperation.STOP,
                                 LifecycleOperation.FORCE_STOP,
+                                LifecycleOperation.REMOVE,
                             )
                         )
                     if ((interruptedAttempt && !latestProvesStopped) || pendingCouldLeaveRuntimeLive) {

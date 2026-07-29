@@ -268,7 +268,7 @@ class DefaultVmManager internal constructor(
     private val backendStopTimeoutMs: Long = 15_000L,
     private val forceStopTimeoutMs: Long = 7_000L,
     private val qmpTimeoutMs: Long = 5_000L,
-    private val runtimePreflight: RuntimePreflightCoordinator? = null,
+    private val runtimePreflight: RuntimePreflightCoordinator,
     /** Deterministic test seams around command admission and backend task dispatch. */
     private val beforeFinalLaunchAuthorization: suspend (LifecycleTransactionToken) -> Unit = {},
     private val beforeFinalStopAuthorization: suspend (LifecycleTransactionToken) -> Unit = {},
@@ -400,8 +400,7 @@ class DefaultVmManager internal constructor(
             check(runtime.quiescent.value) {
                 "In-process runtime must be quiescent before fixed-runtime cleanup"
             }
-            runtimePreflight?.ensureAllFixedRuntimesStopped()
-                ?: throw IllegalStateException("Fixed-runtime preflight is unavailable")
+            runtimePreflight.ensureAllFixedRuntimesStopped()
         }
     }
 
@@ -586,6 +585,10 @@ class DefaultVmManager internal constructor(
             check(runtime.quiescent.value) { "Cannot remove VM while backend cleanup is incomplete" }
             installer.withExclusiveTree(vmId) {
                 withCurrentCommand(command) {
+                    // Removal may destroy the authenticated control endpoints,
+                    // so prove both fixed backend identities absent first while
+                    // the lifecycle, asset tree, and durable command are fenced.
+                    runtimePreflight.ensureAllFixedRuntimesStopped()
                     files.remove(vmId, policy)
                     installationEnsured = false
                 }
@@ -703,8 +706,8 @@ class DefaultVmManager internal constructor(
             check(!busyFlow.value) { "Cannot start while previous VM work or cleanup is incomplete" }
             // Probe both fixed backend identities under the manager's one-VM
             // lifecycle authority before touching launch files or accepting a
-            // new generation. Production always supplies this seam.
-            runtimePreflight?.prepareForLaunch()
+            // new generation.
+            runtimePreflight.prepareForLaunch()
             installer.withExclusiveTree(vmId) { lease ->
                 if (!withCurrentCommand(command) { ensureInstalledLocked(vmId, lease) }) {
                     return@withExclusiveTree false
@@ -748,7 +751,7 @@ class DefaultVmManager internal constructor(
         if (!stopEffect(vmId, command, force = false)) return false
         lifecycleMutex.withLock {
             check(runtime.quiescent.value) { "Cannot restart while VM cleanup is incomplete" }
-            runtimePreflight?.prepareForLaunch()
+            runtimePreflight.prepareForLaunch()
             return installer.withExclusiveTree(vmId) { lease ->
                 // Shutdown is deliberately outside the authority gate. Fence
                 // installation and launch separately so a newer STOP can become
@@ -894,7 +897,7 @@ class DefaultVmManager internal constructor(
                 check(runtime.quiescent.value) { "In-process runtime is not quiescent after stop" }
                 // Explicit STOP/FORCE_STOP owns all fixed runtime identities, not
                 // only the backend object reconstructed in this process.
-                runtimePreflight?.ensureAllFixedRuntimesStopped()
+                runtimePreflight.ensureAllFixedRuntimesStopped()
                 Unit
             }
         }

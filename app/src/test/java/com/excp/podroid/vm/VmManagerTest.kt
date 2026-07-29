@@ -1,5 +1,7 @@
 package com.excp.podroid.vm
 
+import com.excp.podroid.data.repository.AtomicHostSupervisorRecordStore
+import com.excp.podroid.data.repository.HostSupervisorRepository
 import com.excp.podroid.engine.ExactValueStateFlow
 import com.excp.podroid.engine.VmConfig
 import com.excp.podroid.engine.VmState
@@ -865,6 +867,84 @@ class VmManagerTest {
     }
 
     @Test
+    fun `remove proves both fixed runtimes absent before deleting`() = runBlocking {
+        val events = mutableListOf<String>()
+        val qemu = CountingProbe(RuntimeBackend.QEMU, RuntimeProbeResult.Absent) {
+            events += "qemu-probe"
+        }
+        val avf = CountingProbe(RuntimeBackend.AVF, RuntimeProbeResult.Absent) {
+            events += "avf-probe"
+        }
+        val files = FakeFiles(onRemove = { events += "remove" })
+        val supervisor = hostSupervisor()
+        val manager = manager(
+            files = files,
+            supervisor = supervisor,
+            runtimePreflight = RuntimePreflightCoordinator(qemu, avf) {},
+        )
+
+        manager.remove(VmId.DEFAULT, VmRemovePolicy.DELETE_DATA)
+
+        assertEquals(listOf("qemu-probe", "avf-probe", "remove"), events)
+        val removed = manager.supervisorState(VmId.DEFAULT)
+        assertEquals(LifecycleOutcome.SUCCEEDED, removed.latestTransaction?.outcome)
+        assertFalse(removed.runtimeMayBeLive)
+        assertEquals(2L, removed.runtimeEvidenceVersion)
+    }
+
+    @Test
+    fun `remove uncertainty fails closed and retains failed transaction for cleanup`() = runBlocking {
+        val qemu = CountingProbe(
+            RuntimeBackend.QEMU,
+            RuntimeProbeResult.Uncertain(
+                LifecycleErrorCode.RUNTIME_OWNERSHIP,
+                runtimeMayBeLive = true,
+            ),
+        )
+        val avf = CountingProbe(RuntimeBackend.AVF, RuntimeProbeResult.Absent)
+        val files = FakeFiles()
+        val supervisor = hostSupervisor()
+        val manager = manager(
+            files = files,
+            supervisor = supervisor,
+            runtimePreflight = RuntimePreflightCoordinator(qemu, avf) {},
+        )
+
+        val failure = runCatching {
+            manager.remove(VmId.DEFAULT, VmRemovePolicy.DELETE_DATA)
+        }.exceptionOrNull()
+
+        assertTrue(failure is RuntimeProbeException)
+        assertTrue(files.removePolicies.isEmpty())
+        assertEquals(1, qemu.probeCalls)
+        assertEquals(0, avf.probeCalls)
+        val failed = manager.supervisorState(VmId.DEFAULT)
+        assertEquals(LifecycleOutcome.FAILED, failed.latestTransaction?.outcome)
+        assertEquals(VmDesiredState.STOPPED, failed.desiredState)
+        assertTrue(failed.runtimeMayBeLive)
+        assertEquals(1L, failed.runtimeEvidenceVersion)
+        assertTrue(supervisor.begin(ReconciliationTrigger.PROCESS_RESTART) is ReconciliationAdmission.Execute)
+    }
+
+    @Test
+    fun `remove deletion failure retains evidence and admits cleanup retry`() = runBlocking {
+        val files = FakeFiles(onRemove = { throw IOException("delete failed") })
+        val supervisor = hostSupervisor()
+        val manager = manager(files = files, supervisor = supervisor)
+
+        val failure = runCatching {
+            manager.remove(VmId.DEFAULT, VmRemovePolicy.DELETE_DATA)
+        }.exceptionOrNull()
+
+        assertTrue(failure is IOException)
+        val failed = manager.supervisorState(VmId.DEFAULT)
+        assertEquals(LifecycleOutcome.FAILED, failed.latestTransaction?.outcome)
+        assertTrue(failed.runtimeMayBeLive)
+        assertEquals(1L, failed.runtimeEvidenceVersion)
+        assertTrue(supervisor.begin(ReconciliationTrigger.PROCESS_RESTART) is ReconciliationAdmission.Execute)
+    }
+
+    @Test
     fun `remove fails while active and forwards only explicit data policy`() = runBlocking {
         val runtime = FakeRuntime().apply {
             state.value = VmState.Running
@@ -1320,6 +1400,11 @@ class VmManagerTest {
         assertEquals(VmDesiredState.RUNNING, state.desiredState)
     }
 
+    private fun hostSupervisor() = HostSupervisorRepository(
+        InMemoryHostSupervisorStore(),
+        currentTimeMillis = { 1_000L },
+    )
+
     private fun manager(
         runtime: ManagedVmRuntime = FakeRuntime(),
         files: FakeFiles = FakeFiles(),
@@ -1347,11 +1432,23 @@ class VmManagerTest {
             backendStopTimeoutMs = 100,
             forceStopTimeoutMs = 100,
             qmpTimeoutMs = 100,
-            runtimePreflight = runtimePreflight,
+            runtimePreflight = runtimePreflight ?: RuntimePreflightCoordinator(
+                CountingProbe(RuntimeBackend.QEMU, RuntimeProbeResult.Absent),
+                CountingProbe(RuntimeBackend.AVF, RuntimeProbeResult.Absent),
+            ) {},
             beforeFinalLaunchAuthorization = beforeFinalLaunchAuthorization,
             beforeFinalStopAuthorization = beforeFinalStopAuthorization,
             beforeCoordinatedStop = beforeCoordinatedStop,
         )
+    }
+
+    private class InMemoryHostSupervisorStore : AtomicHostSupervisorRecordStore {
+        private val mutex = kotlinx.coroutines.sync.Mutex()
+        private var raw: String? = null
+        override suspend fun read(): String? = mutex.withLock { raw }
+        override suspend fun update(transform: (String?) -> String): String = mutex.withLock {
+            transform(raw).also { raw = it }
+        }
     }
 
     private abstract class TestInstaller : VmInstaller {
@@ -1464,11 +1561,13 @@ class VmManagerTest {
     private class CountingProbe(
         override val backend: RuntimeBackend,
         var result: RuntimeProbeResult,
+        private val onProbe: () -> Unit = {},
     ) : NamedRuntimeProbe {
         var probeCalls = 0
         var stopCalls = 0
         override suspend fun probe(): RuntimeProbeResult {
             probeCalls++
+            onProbe()
             return result
         }
         override suspend fun stopLiveRuntime(): Boolean { stopCalls++; return true }
@@ -1535,10 +1634,16 @@ class VmManagerTest {
         }
     }
 
-    private class FakeFiles(var installed: Boolean = true) : VmFiles {
+    private class FakeFiles(
+        var installed: Boolean = true,
+        private val onRemove: (VmRemovePolicy) -> Unit = {},
+    ) : VmFiles {
         val removePolicies = mutableListOf<VmRemovePolicy>()
         override fun isInstalled(vmId: VmId) = installed
-        override fun remove(vmId: VmId, policy: VmRemovePolicy) { removePolicies.add(policy) }
+        override fun remove(vmId: VmId, policy: VmRemovePolicy) {
+            onRemove(policy)
+            removePolicies.add(policy)
+        }
         override fun readConsole(vmId: VmId, request: ConsoleLogRequest) = ConsoleLog("", 0, 0, false)
         override fun storageAllocatedBytes(vmId: VmId): Long = 0L
         override fun redactPrivatePaths(text: String): String = text

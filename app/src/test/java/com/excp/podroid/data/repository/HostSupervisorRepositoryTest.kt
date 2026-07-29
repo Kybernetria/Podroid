@@ -140,9 +140,24 @@ class HostSupervisorRepositoryTest {
                 false,
             ),
             MigrationCase(
-                "successful remove",
+                "unclaimed pending remove",
+                transaction(LifecycleOperation.REMOVE, LifecycleOutcome.PENDING),
+                true,
+            ),
+            MigrationCase(
+                "claimed pending remove",
+                transaction(LifecycleOperation.REMOVE, LifecycleOutcome.PENDING, effectStarted = true),
+                true,
+            ),
+            MigrationCase(
+                "failed remove",
+                transaction(LifecycleOperation.REMOVE, LifecycleOutcome.FAILED),
+                true,
+            ),
+            MigrationCase(
+                "successful remove without fixed-runtime proof",
                 transaction(LifecycleOperation.REMOVE, LifecycleOutcome.SUCCEEDED),
-                false,
+                true,
             ),
         )
         val decoders = listOf<Pair<String, (HostSupervisorState) -> HostSupervisorState>>(
@@ -501,6 +516,64 @@ class HostSupervisorRepositoryTest {
         val exhausted = repository.begin(ReconciliationTrigger.PROCESS_RESTART) as ReconciliationAdmission.Skip
         assertEquals(ReconciliationOutcome.EXHAUSTED, exhausted.outcome)
         assertEquals(ReconciliationMetadata.MAX_ATTEMPTS, repository.snapshot().reconciliation.consecutiveAttempts)
+    }
+
+    @Test
+    fun `current remove prepare claim and failure keep evidence and admit stopped cleanup`() = runBlocking {
+        val repository = repository(FakeAtomicStore(), AtomicLong(1_000))
+
+        val remove = repository.prepare(LifecycleOperation.REMOVE)
+        val pending = repository.snapshot()
+        assertEquals(VmDesiredState.STOPPED, pending.desiredState)
+        assertEquals(LifecycleOutcome.PENDING, pending.latestTransaction?.outcome)
+        assertFalse(pending.latestTransaction!!.effectStarted)
+        assertTrue(pending.runtimeMayBeLive)
+        assertEquals(1L, pending.runtimeEvidenceVersion)
+
+        assertTrue(repository.claim(remove))
+        val claimed = repository.snapshot()
+        assertTrue(claimed.latestTransaction!!.effectStarted)
+        assertTrue(claimed.runtimeMayBeLive)
+        assertEquals(1L, claimed.runtimeEvidenceVersion)
+
+        assertTrue(repository.fail(remove, LifecycleErrorCode.IO))
+        val failed = repository.snapshot()
+        assertEquals(LifecycleOutcome.FAILED, failed.latestTransaction?.outcome)
+        assertTrue(failed.runtimeMayBeLive)
+        assertEquals(1L, failed.runtimeEvidenceVersion)
+
+        assertTrue(repository.begin(ReconciliationTrigger.PROCESS_RESTART) is ReconciliationAdmission.Execute)
+    }
+
+    @Test
+    fun `process interrupted current remove keeps evidence and admits cleanup retry`() = runBlocking {
+        val repository = repository(FakeAtomicStore(), AtomicLong(1_000))
+        val remove = repository.prepare(LifecycleOperation.REMOVE)
+        assertTrue(repository.claim(remove))
+
+        val admission = repository.begin(ReconciliationTrigger.PROCESS_RESTART)
+        val interrupted = repository.snapshot()
+
+        assertTrue(admission is ReconciliationAdmission.Execute)
+        assertEquals(LifecycleOutcome.FAILED, interrupted.latestTransaction?.outcome)
+        assertEquals(LifecycleErrorCode.PROCESS_DIED, interrupted.latestTransaction?.errorCode)
+        assertTrue(interrupted.runtimeMayBeLive)
+        assertEquals(1L, interrupted.runtimeEvidenceVersion)
+        assertEquals(ReconciliationOutcome.ATTEMPTING, interrupted.reconciliation.lastOutcome)
+    }
+
+    @Test
+    fun `successful current remove definitively clears evidence with a new version`() = runBlocking {
+        val repository = repository(FakeAtomicStore(), AtomicLong(1_000))
+        val remove = repository.prepare(LifecycleOperation.REMOVE)
+        assertTrue(repository.claim(remove))
+
+        assertTrue(repository.succeed(remove))
+        val removed = repository.snapshot()
+
+        assertEquals(LifecycleOutcome.SUCCEEDED, removed.latestTransaction?.outcome)
+        assertFalse(removed.runtimeMayBeLive)
+        assertEquals(2L, removed.runtimeEvidenceVersion)
     }
 
     @Test
