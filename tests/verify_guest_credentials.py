@@ -27,6 +27,20 @@ TOOL_TIMEOUT_SECONDS = 60.0
 CAT_TIMEOUT_SECONDS = 20.0
 
 SHA512_CRYPT = re.compile(rb"^\$6\$[./0-9A-Za-z]{1,16}\$[./0-9A-Za-z]{86}$")
+SHA512_CRYPT_FRAGMENT = re.compile(rb"\$6\$[./0-9A-Za-z]{1,16}\$[./0-9A-Za-z]{86}")
+# This bounded denylist exists only to reject retired or common defaults in built
+# artifacts. It is verification policy, not current login guidance.
+REJECTED_ROOT_PASSWORDS = (
+    "podroid",  # Retired product-name-derived credential.
+    "root",
+    "password",
+    "admin",
+    "alpine",
+    "changeme",
+    "123456",
+    "toor",
+)
+MAX_REJECTED_ROOT_PASSWORDS = 8
 KEY_MATERIAL = re.compile(
     rb"-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|"
     rb"^(?:ssh-(?:rsa|dss|ed25519)|ecdsa-sha2-nistp[0-9]+)[ \t]+[A-Za-z0-9+/=]{40,}",
@@ -80,15 +94,19 @@ def source_entries(roots: list[Path]):
     count = 0
     while pending:
         directory = pending.pop()
+        entries = []
         try:
-            entries = list(os.scandir(directory))
+            with os.scandir(directory) as iterator:
+                for entry in iterator:
+                    count += 1
+                    if count > MAX_SOURCE_ENTRIES:
+                        fail(f"credential source scan exceeds {MAX_SOURCE_ENTRIES} entries")
+                    entries.append(entry)
         except OSError as exc:
             fail(f"cannot scan source directory {directory}: {exc}")
+        # The collection is bounded before it is sorted or otherwise materialized.
         entries.sort(key=lambda item: os.fsencode(item.name))
         for entry in entries:
-            count += 1
-            if count > MAX_SOURCE_ENTRIES:
-                fail(f"credential source scan exceeds {MAX_SOURCE_ENTRIES} entries")
             try:
                 metadata = entry.stat(follow_symlinks=False)
             except OSError as exc:
@@ -119,6 +137,8 @@ def scan_packaged_sources(repo_root: Path) -> None:
         data = read_regular_file(path)
         if KEY_MATERIAL.search(data):
             fail(f"bundled SSH key material in {path!r}")
+        if SHA512_CRYPT_FRAGMENT.search(data):
+            fail(f"fixed SHA-512 crypt hash in packageable source {path!r}")
 
 
 def run_bounded(
@@ -228,6 +248,22 @@ def require_contains(data: bytes, value: bytes, message: str) -> None:
         fail(message)
 
 
+def verify_shadow_build_flow(build_script: bytes) -> None:
+    generator_command = b"ROOT_HASH=$(/work/generate-root-password-hash.sh)"
+    shadow_command = b'sed -i "s|^root:[^:]*:|root:${ROOT_HASH}:|" "$ROOTFS/etc/shadow"'
+    commands = active_config_lines(build_script)
+    if commands.count(generator_command) != 1:
+        fail("rootfs build must execute the root hash generator exactly once")
+    if commands.count(shadow_command) != 1:
+        fail("rootfs build must contain exactly one authoritative root shadow mutation")
+    root_hash_commands = [line for line in commands if b"ROOT_HASH" in line]
+    if root_hash_commands != [generator_command, shadow_command]:
+        fail("rootfs build has a non-authoritative root hash flow")
+    shadow_commands = [line for line in commands if b"$ROOTFS/etc/shadow" in line]
+    if shadow_commands != [shadow_command]:
+        fail("rootfs build has an additional shadow mutation")
+
+
 def verify_source(repo_root: Path) -> None:
     expected_files = [
         "README.md",
@@ -250,16 +286,7 @@ def verify_source(repo_root: Path) -> None:
 
     if active_config_lines(source["build-rootfs/files/etc/conf.d/dropbear"]) != [b'DROPBEAR_OPTS="-s"']:
         fail("Dropbear must be configured with password authentication disabled")
-    require_contains(
-        source["build-rootfs/build-rootfs.sh"],
-        b"ROOT_HASH=$(/work/generate-root-password-hash.sh)",
-        "rootfs build does not execute the root hash generator",
-    )
-    require_contains(
-        source["build-rootfs/build-rootfs.sh"],
-        b'root:${ROOT_HASH}:',
-        "rootfs build does not write the generated hash to shadow",
-    )
+    verify_shadow_build_flow(source["build-rootfs/build-rootfs.sh"])
     if b"--allow-untrusted" in source["build-rootfs/build-rootfs.sh"]:
         fail("rootfs package installation bypasses Alpine signature verification")
     require_contains(
@@ -333,6 +360,27 @@ def inspect_listing(listing: bytes, expected_inodes: int) -> None:
             fail("artifact bundles an SSH authorized key, identity, or host private key")
 
 
+def reject_known_root_password(root_hash: bytes) -> None:
+    if len(REJECTED_ROOT_PASSWORDS) > MAX_REJECTED_ROOT_PASSWORDS:
+        fail("rejected root password policy exceeds its configured bound")
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        fail("openssl is required for root password provenance verification")
+    salt = root_hash.split(b"$")[2].decode("ascii")
+    stdout, stderr = run_bounded(
+        [openssl, "passwd", "-6", "-salt", salt, *REJECTED_ROOT_PASSWORDS],
+        timeout_seconds=10.0,
+        output_limit_bytes=4_096,
+    )
+    if stderr:
+        fail("openssl reported unexpected diagnostics during root password verification")
+    candidate_hashes = stdout.splitlines()
+    if len(candidate_hashes) != len(REJECTED_ROOT_PASSWORDS):
+        fail("openssl returned an unexpected root password verification result")
+    if root_hash in candidate_hashes:
+        fail("artifact root hash matches a retired or common default password")
+
+
 def verify_shadow(shadow: bytes) -> None:
     root_hash = None
     for line in shadow.splitlines():
@@ -347,6 +395,7 @@ def verify_shadow(shadow: bytes) -> None:
             fail("artifact contains a non-root account with a usable password hash")
     if root_hash is None or not SHA512_CRYPT.fullmatch(root_hash):
         fail("artifact root account does not have a valid SHA-512 crypt hash")
+    reject_known_root_password(root_hash)
 
 
 def verify_open_artifact(tool: str, artifact: Path, artifact_fd: int, artifact_size: int) -> None:

@@ -13,9 +13,11 @@ plugins {
 
 val podroidQemuVersion = providers.gradleProperty("podroidQemuVersion").get()
 
-val verifyGuestCredentials by tasks.registering(Exec::class) {
+val guestRootfs = rootProject.file("app/src/main/assets/alpine-rootfs.squashfs")
+
+val verifyGuestCredentialSources by tasks.registering(Exec::class) {
     group = "verification"
-    description = "Checks guest credential sources without inspecting generated rootfs artifacts."
+    description = "Checks packageable guest credential sources."
     workingDir(rootProject.projectDir)
     commandLine("python3", rootProject.file("tests/verify_guest_credentials.py"))
     inputs.files(
@@ -30,8 +32,54 @@ val verifyGuestCredentials by tasks.registering(Exec::class) {
     )
 }
 
+val verifyGuestCredentialArtifact by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Checks the generated guest rootfs when it is present."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", rootProject.file("tests/verify_guest_credentials.py"), guestRootfs)
+    inputs.file(guestRootfs).withPropertyName("guestRootfs").optional()
+    onlyIf("the generated guest rootfs exists") { task -> task.inputs.files.singleFile.isFile }
+}
+
+val testGuestCredentialVerifier by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Runs guest credential verifier regression tests."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", "-m", "unittest", "-v", "tests/test_verify_guest_credentials.py")
+    inputs.files(
+        rootProject.file("tests/test_verify_guest_credentials.py"),
+        rootProject.file("tests/verify_guest_credentials.py"),
+        rootProject.file("build-rootfs/generate-root-password-hash.sh")
+    )
+}
+
+val requireGuestRootfsForRelease by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Requires a verified guest rootfs for release packaging."
+    dependsOn(verifyGuestCredentialSources, verifyGuestCredentialArtifact)
+    workingDir(rootProject.projectDir)
+    commandLine(
+        "sh",
+        "-c",
+        "test -f app/src/main/assets/alpine-rootfs.squashfs || " +
+            "{ echo 'Release packaging requires app/src/main/assets/alpine-rootfs.squashfs' >&2; exit 1; }"
+    )
+}
+
 tasks.named("preBuild") {
-    dependsOn(verifyGuestCredentials)
+    dependsOn(verifyGuestCredentialSources, verifyGuestCredentialArtifact)
+}
+
+tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+    dependsOn(requireGuestRootfsForRelease)
+}
+
+tasks.named("check") {
+    dependsOn(verifyGuestCredentialSources, verifyGuestCredentialArtifact, testGuestCredentialVerifier)
+}
+
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    dependsOn(testGuestCredentialVerifier)
 }
 
 android {

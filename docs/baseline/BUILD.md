@@ -1,19 +1,19 @@
 # Android, guest, and QEMU build baseline
 
-This procedure separates the verified Gradle-only build from the unverified full native/VM build. All host-side commands intentionally enter the `android-dev` distrobox.
+This procedure separates the verified Gradle-only build and Podman-built rootfs from the remaining unverified native/VM stages. All host-side commands intentionally enter the `android-dev` distrobox.
 
 ## Reproducibility status
 
 | Layer | Baseline status |
 |---|---|
 | Android unit tests and Gradle-only debug APK | Verified successful with `:app:testDebugUnitTest assembleDebug` |
-| Kernel/initramfs | Not rebuilt in this environment |
-| Alpine squashfs rootfs | Not rebuilt in this environment |
-| QEMU, libslirp, bridge, and launcher | Not rebuilt in this environment |
-| Full APK assembled from freshly generated native/VM artifacts | Not verified |
+| Kernel/initramfs | Not rebuilt in this environment; these stages remain Docker-only |
+| Alpine squashfs rootfs | Verified with the supported `CONTAINER_ENGINE=podman` path and explicit artifact checks |
+| QEMU, libslirp, bridge, and launcher | Not rebuilt in this environment; this stage remains Docker-only |
+| Full APK assembled from all freshly generated native/VM artifacts | Not verified |
 | Device install, RAM, QEMU boot, and AVF boot | Pending |
 
-The repository scripts invoke the `docker` command. Docker is absent in the recorded environment. Podman 5.8.4 is installed and its CLI works, but the scripts were not converted to Podman and a full image/native rebuild was not completed. Therefore this document does not claim bit-for-bit or full-build reproducibility.
+Docker is absent in the recorded environment. Podman 5.8.4 is installed, and `build-all.sh rootfs` has an explicit, verified `CONTAINER_ENGINE=podman` path. The kernel, initramfs, and QEMU stages still invoke `docker` directly, so the complete native/VM build was not run and this document does not claim bit-for-bit or full-build reproducibility.
 
 Confirm the runtime state:
 
@@ -28,7 +28,7 @@ Recorded output was `docker: absent` and `podman version 5.8.4`.
 
 ## Host prerequisites for credential and rootfs verification
 
-The ordinary Gradle `preBuild` runs source verification only. It requires Python 3 and OpenSSL; OpenSSL is used by the actual root-hash generator, which the verifier executes twice. It deliberately does not inspect an ignored or stale squashfs and therefore does not require `unsquashfs`:
+The ordinary Gradle `preBuild` always runs source verification. When `app/src/main/assets/alpine-rootfs.squashfs` exists, a separate task declares that exact artifact as an input and verifies it before packaging; release packaging requires the file. A Gradle-only debug build remains supported when it is absent. Source verification requires Python 3 and OpenSSL; OpenSSL is used by the actual root-hash generator, which the verifier executes twice. Artifact verification additionally requires `unsquashfs`:
 
 ```bash
 distrobox enter android-dev -- bash -lc '
@@ -182,9 +182,9 @@ distrobox enter android-dev -- bash -lc '
 
 This compiles the Android modules and the vendored Termux JNI with Gradle NDK 28.2.13676358. It does not invoke the Docker-backed kernel, initramfs, rootfs, or QEMU stages.
 
-## Full build entry points (not verified here)
+## Full build entry points (remaining stages not verified here)
 
-`build-all.sh` coordinates all stages and requires a working `docker` command with BuildKit-compatible behavior:
+`build-all.sh all` coordinates every stage and still requires a working `docker` command with BuildKit-compatible behavior because the kernel, initramfs, and QEMU stages are Docker-only:
 
 ```bash
 distrobox enter android-dev -- bash -lc '
@@ -210,7 +210,7 @@ distrobox enter android-dev -- bash -lc '
 '
 ```
 
-Do not report these stages as successful unless each command actually completes and the extracted artifacts are measured. A Podman compatibility wrapper or script conversion would be a separate implementation change and requires validation of build output, extraction, networking, and `--output` behavior.
+Do not report these stages as successful unless each command actually completes and the extracted artifacts are measured. Podman support is intentionally limited to the rootfs stage; converting the Docker-only kernel, initramfs, or QEMU stages would be a separate implementation change requiring validation of build output, extraction, networking, and `--output` behavior.
 
 ## Native output checks for a future full rebuild
 

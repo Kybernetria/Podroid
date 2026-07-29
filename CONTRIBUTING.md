@@ -13,7 +13,8 @@ cd Podroid
 
 You will need:
 
-- **Docker 20.10+** for the kernel, initramfs, rootfs, and QEMU build pipelines
+- **Docker 20.10+** for the kernel, initramfs, and QEMU build pipelines
+- **Docker 20.10+ or Podman** for the Alpine rootfs pipeline
 - **Android NDK r27c** for the bridge and Termux native libraries
 - **Android SDK** with platform 36 + build-tools
 - An **arm64 Android device** running **Android 8.0+ (API 26)** for testing
@@ -25,7 +26,8 @@ You will need:
 ```sh
 ./build-all.sh kernel       # custom Linux 6.6.87 (~5–10 min, Docker-cached)
 ./build-all.sh initramfs    # kernel + minimal initramfs
-./build-all.sh rootfs       # Alpine 3.23 squashfs (~30 s, Docker-cached)
+./build-all.sh rootfs       # Alpine 3.23 squashfs (Docker by default)
+CONTAINER_ENGINE=podman ./build-all.sh rootfs  # supported Podman rootfs path
 ./build-all.sh qemu         # QEMU 11 + podroid-bridge (~30 min first run)
 ./build-all.sh termux       # libtermux.so via local NDK
 ./gradlew installDebug      # build + install the APK
@@ -36,6 +38,8 @@ Or, for the common case where you only changed Kotlin / UI code:
 ```sh
 ./gradlew installDebug
 ```
+
+The kernel, initramfs, and QEMU stages remain Docker-only. `CONTAINER_ENGINE` applies only to `rootfs`; a complete `all` build therefore still requires Docker.
 
 To validate a full rebuild end-to-end:
 
