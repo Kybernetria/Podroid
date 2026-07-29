@@ -39,6 +39,9 @@ object AvfReflect {
         invokeDecl(mgr, "getOrCreate", String::class.java to name, CFG to cfg)
             ?: error("getOrCreate returned null")
 
+    /** Looks up only the fixed production VM name; unlike getOrCreate this has no effect. */
+    fun get(mgr: Any, name: String): Any? = invokeDecl(mgr, "get", String::class.java to name)
+
     fun create(mgr: Any, name: String, cfg: Any): Any =
         invokeDecl(mgr, "create", String::class.java to name, CFG to cfg)
             ?: error("create returned null")

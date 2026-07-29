@@ -224,6 +224,17 @@ internal class QmpClient(
 
     override suspend fun systemPowerdown(): Result<Unit> = exec("system_powerdown", null).map { Unit }
 
+    /** Fixed typed orphan-cleanup command; never exposed through Binder. */
+    internal suspend fun quit(): Result<Unit> = exec("quit", null).fold(
+        onSuccess = { Result.success(Unit) },
+        // QEMU commonly closes QMP immediately after accepting quit, before the
+        // reply is read. The caller still requires endpoint disappearance.
+        onFailure = { failure ->
+            if (!java.io.File(socketPath).exists()) Result.success(Unit)
+            else Result.failure(failure)
+        },
+    )
+
     override suspend fun queryStatus(): Result<String> = exec("query-status", null).mapCatching {
         it.getJSONObject("return").getString("status")
     }

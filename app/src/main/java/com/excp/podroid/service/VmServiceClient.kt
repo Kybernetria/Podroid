@@ -132,6 +132,7 @@ class VmServiceClient @Inject internal constructor(
     suspend fun list(): List<VmSummary> = call { it.list() }
     suspend fun status(): VmStatus = call { it.status() }
     suspend fun supervisorState(): HostSupervisorState = call { it.supervisorState() }
+    suspend fun setAutostart(enabled: Boolean): HostSupervisorState = call { it.setAutostart(enabled) }
     suspend fun ensureInstalled() = call { it.ensureInstalled() }
     suspend fun start() = call { it.start() }
     suspend fun gracefulStop() = call { it.gracefulStop() }

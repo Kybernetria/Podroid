@@ -55,6 +55,7 @@ class PodroidService : Service() {
     @Inject lateinit var portForwardRepository: PortForwardRepository
     @Inject lateinit var settingsRepository: SettingsRepository
     @Inject lateinit var usbPassthroughManager: UsbPassthroughManager
+    @Inject lateinit var hostReconciler: HostReconciler
     @Inject lateinit var notificationPoster: com.excp.podroid.engine.hostbridge.AndroidNotificationPoster
     @Inject lateinit var headlessModeManager: com.excp.podroid.engine.hostbridge.HeadlessModeManager
     private var hostRequestServer: com.excp.podroid.engine.hostbridge.HostRequestServer? = null
@@ -72,6 +73,9 @@ class PodroidService : Service() {
     )
 
     private val launchCoordinator = ServiceLaunchCoordinator<ServiceLaunchOwner>()
+    private val reconciliationActive = kotlinx.coroutines.flow.MutableStateFlow(false)
+    /** Main-thread count prevents a duplicate delivery from disarming an older run. */
+    private var activeReconciliationDeliveries = 0
     private val serviceDispatchMutex = Mutex()
     @Volatile private var queuedLaunchCommand: LifecycleTransactionToken? = null
 
@@ -186,6 +190,39 @@ class PodroidService : Service() {
                     }
                 }
             }
+            ACTION_RECONCILE_BOOT, ACTION_RECONCILE_APP, null -> {
+                enterForegroundStartWindow()
+                acquireWakeLock()
+                activeReconciliationDeliveries++
+                reconciliationActive.value = true
+                startSupervision()
+                val trigger = checkNotNull(ReconciliationServiceTriggerPolicy.fromAction(action))
+                serviceScope.launch(Dispatchers.IO) {
+                    val result = try {
+                        Result.success(hostReconciler.reconcile(trigger))
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (failure: Throwable) {
+                        Result.failure(failure)
+                    }
+                    withContext(NonCancellable + Dispatchers.Main.immediate) {
+                        activeReconciliationDeliveries = (activeReconciliationDeliveries - 1).coerceAtLeast(0)
+                        reconciliationActive.value = activeReconciliationDeliveries > 0
+                        result.onSuccess { completed ->
+                            Log.i(TAG, "Reconciliation trigger=${trigger.name} outcome=${completed.outcome.name}")
+                            if (completed.disposition == ReconciliationServiceDisposition.SUPERVISE_RUNTIME) {
+                                acquireWakeLock()
+                                startSupervision()
+                            } else if (currentLifecycleDecision().teardown) {
+                                teardown()
+                            }
+                        }.onFailure { failure ->
+                            Log.e(TAG, "Reconciliation failed type=${failure.javaClass.simpleName}")
+                            if (currentLifecycleDecision().teardown) teardown()
+                        }
+                    }
+                }
+            }
             ACTION_STOP -> {
                 val command = intent.preparedCommandOrNull(action)
                 if (command != null) {
@@ -207,7 +244,10 @@ class PodroidService : Service() {
             }
             else -> stopSelf()
         }
-        return START_NOT_STICKY
+        // Null-intent recreation is an explicit process-crash trigger. stopSelf()
+        // after desired STOPPED still prevents a framework restart; Android
+        // force-stop suppresses both sticky restart and receivers until launch.
+        return START_STICKY
     }
 
     private suspend fun deliverPreparedIntent(
@@ -650,8 +690,9 @@ class PodroidService : Service() {
             vmManager.quiescent(VmId.DEFAULT),
             vmManager.busy(VmId.DEFAULT),
             launchCoordinator.ownershipActive,
-        ) { state, quiescent, busy, pendingStart ->
-            VmServiceLifecyclePolicy.decide(state, quiescent, busy, pendingStart)
+            reconciliationActive,
+        ) { state, quiescent, busy, pendingStart, reconciling ->
+            VmServiceLifecyclePolicy.decide(state, quiescent, busy, pendingStart || reconciling)
         }.collect { decision ->
             // No unconditional baseline suppression: if cleanup completed before
             // this collector's first emission, that first terminal snapshot must
@@ -665,7 +706,7 @@ class PodroidService : Service() {
             vmManager.lifecycle(VmId.DEFAULT).value,
             vmManager.quiescent(VmId.DEFAULT).value,
             vmManager.busy(VmId.DEFAULT).value,
-            launchCoordinator.ownershipActive.value,
+            launchCoordinator.ownershipActive.value || reconciliationActive.value,
         )
 
     /** Release the WakeLock, drop the foreground notification, and stop. */
@@ -916,6 +957,11 @@ class PodroidService : Service() {
         const val ACTION_START   = "com.excp.podroid.action.START"
         const val ACTION_STOP    = "com.excp.podroid.action.STOP"
         const val ACTION_RESTART = "com.excp.podroid.action.RESTART"
+        const val ACTION_RECONCILE_BOOT = "com.excp.podroid.action.RECONCILE_BOOT"
+        const val ACTION_RECONCILE_APP = "com.excp.podroid.action.RECONCILE_APP"
+
+        internal fun reconciliationIntent(context: Context, action: String) =
+            Intent(context, PodroidService::class.java).setAction(action)
     }
 }
 

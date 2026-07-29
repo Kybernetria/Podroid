@@ -4,13 +4,28 @@
  */
 package com.excp.podroid.vm
 
-/** Persisted Host-supervisor intent. This ticket records intent but does not reconcile it. */
+/** Persisted Host-supervisor intent and bounded reconciliation evidence. */
 enum class VmDesiredState { RUNNING, STOPPED }
 enum class HostWakePolicy { WHILE_VM_ACTIVE, NEVER }
 enum class HostPowerPolicy { GRACEFUL_THEN_FORCE, FORCE }
 enum class HostThermalPolicy { STOP_AT_CRITICAL, IGNORE }
 enum class LifecycleOperation { SETUP, START, STOP, FORCE_STOP, RESTART, REMOVE }
 enum class LifecycleOutcome { PENDING, SUCCEEDED, FAILED }
+
+enum class ReconciliationTrigger { BOOT_COMPLETED, PROCESS_RESTART, APP_COLD_START }
+enum class ReconciliationOutcome {
+    NEVER_RUN,
+    ATTEMPTING,
+    SUCCEEDED,
+    INTERRUPTED,
+    SKIPPED_HOST_DISABLED,
+    SKIPPED_AUTOSTART_DISABLED,
+    SKIPPED_DESIRED_STOPPED,
+    BACKOFF,
+    EXHAUSTED,
+    SUPERSEDED,
+    FAILED,
+}
 
 /** Stable, redacted failure classification. No exception text is persisted. */
 enum class LifecycleErrorCode {
@@ -20,6 +35,9 @@ enum class LifecycleErrorCode {
     INVALID_STATE,
     INVALID_ARGUMENT,
     SECURITY,
+    PROCESS_DIED,
+    PROBE_TIMEOUT,
+    RUNTIME_OWNERSHIP,
     UNKNOWN,
 }
 
@@ -36,10 +54,8 @@ data class LifecycleTransaction(
         require(id > 0) { "transaction id must be positive" }
         require(requestedAtEpochMs >= 0) { "requested timestamp must be non-negative" }
         when (outcome) {
-            LifecycleOutcome.PENDING -> {
-                require(completedAtEpochMs == null && errorCode == null) {
-                    "pending transaction cannot contain a result"
-                }
+            LifecycleOutcome.PENDING -> require(completedAtEpochMs == null && errorCode == null) {
+                "pending transaction cannot contain a result"
             }
             LifecycleOutcome.SUCCEEDED -> {
                 require(effectStarted) { "successful transaction requires an effect claim" }
@@ -47,11 +63,44 @@ data class LifecycleTransaction(
                 require(errorCode == null) { "successful transaction cannot contain an error" }
             }
             LifecycleOutcome.FAILED -> {
-                require(effectStarted) { "failed transaction requires an effect claim" }
+                // PROCESS_DIED may resolve evidence for a command that died before
+                // its effect claim. Other failures still require a claimed effect.
+                require(effectStarted || errorCode == LifecycleErrorCode.PROCESS_DIED) {
+                    "failed transaction requires an effect claim or process-death evidence"
+                }
                 require(completedAtEpochMs != null && completedAtEpochMs >= requestedAtEpochMs)
                 require(errorCode != null) { "failed transaction requires a stable error code" }
             }
         }
+    }
+}
+
+data class ReconciliationMetadata(
+    val consecutiveAttempts: Int,
+    val nextEligibleEpochMs: Long,
+    val lastTrigger: ReconciliationTrigger?,
+    val lastOutcome: ReconciliationOutcome,
+    val lastErrorCode: LifecycleErrorCode?,
+) {
+    init {
+        require(consecutiveAttempts in 0..MAX_ATTEMPTS) { "reconciliation attempt count is out of bounds" }
+        require(nextEligibleEpochMs >= 0) { "next reconciliation timestamp must be non-negative" }
+        require(lastErrorCode == null || lastOutcome in setOf(
+            ReconciliationOutcome.INTERRUPTED,
+            ReconciliationOutcome.FAILED,
+            ReconciliationOutcome.EXHAUSTED,
+        )) { "reconciliation error requires a terminal error outcome" }
+    }
+
+    companion object {
+        const val MAX_ATTEMPTS = 5
+        fun safeDefaults() = ReconciliationMetadata(
+            consecutiveAttempts = 0,
+            nextEligibleEpochMs = 0,
+            lastTrigger = null,
+            lastOutcome = ReconciliationOutcome.NEVER_RUN,
+            lastErrorCode = null,
+        )
     }
 }
 
@@ -66,6 +115,7 @@ data class HostSupervisorState(
     val thermalPolicy: HostThermalPolicy,
     val runtimeGeneration: Long,
     val latestTransaction: LifecycleTransaction?,
+    val reconciliation: ReconciliationMetadata,
 ) {
     init {
         require(schemaVersion == SCHEMA_VERSION) { "unsupported Host supervisor schema" }
@@ -73,9 +123,9 @@ data class HostSupervisorState(
     }
 
     companion object {
-        const val SCHEMA_VERSION = 1
+        const val SCHEMA_VERSION = 2
 
-        /** Fail-safe v1 initialization used only when the v0 record is absent. */
+        /** Fail-safe initialization used only when the v0 record is absent. */
         fun safeDefaults() = HostSupervisorState(
             schemaVersion = SCHEMA_VERSION,
             hostEnabled = false,
@@ -86,6 +136,7 @@ data class HostSupervisorState(
             thermalPolicy = HostThermalPolicy.STOP_AT_CRITICAL,
             runtimeGeneration = 0,
             latestTransaction = null,
+            reconciliation = ReconciliationMetadata.safeDefaults(),
         )
     }
 }
@@ -105,34 +156,21 @@ data class LifecycleTransactionToken internal constructor(
     }
 
     companion object {
-        /** Reconstructs a token carried through bounded primitive Intent extras. */
-        fun restore(
-            id: Long,
-            operation: LifecycleOperation,
-            baseRuntimeGeneration: Long,
-        ) = LifecycleTransactionToken(id, operation, baseRuntimeGeneration)
+        fun restore(id: Long, operation: LifecycleOperation, baseRuntimeGeneration: Long) =
+            LifecycleTransactionToken(id, operation, baseRuntimeGeneration)
     }
 }
 
 class StaleLifecycleCommandException(message: String) : IllegalStateException(message)
 
 /** Atomic persistence port owned by the lifecycle manager. */
-internal interface HostSupervisorTransactions {
+internal interface HostSupervisorTransactions : HostReconciliationStore {
     suspend fun snapshot(): HostSupervisorState
-
-    /**
-     * Persists desired state and exactly one PENDING command. When supplied,
-     * [expectedId] must be the next transaction id or no mutation is committed.
-     */
-    suspend fun prepare(
-        operation: LifecycleOperation,
-        expectedId: Long? = null,
-    ): LifecycleTransactionToken
-
-    /** Atomically claims id + closed operation while keeping outcome PENDING. */
+    suspend fun prepare(operation: LifecycleOperation, expectedId: Long? = null): LifecycleTransactionToken
     suspend fun claim(token: LifecycleTransactionToken): Boolean
-    /** Re-loads the same PENDING token, including an already-started effect. */
     suspend fun isCurrent(token: LifecycleTransactionToken): Boolean
     suspend fun succeed(token: LifecycleTransactionToken, runtimeStarted: Boolean = false): Boolean
     suspend fun fail(token: LifecycleTransactionToken, errorCode: LifecycleErrorCode): Boolean
+    suspend fun setAutostart(enabled: Boolean): HostSupervisorState =
+        throw UnsupportedOperationException("autostart mutation unavailable")
 }

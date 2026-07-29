@@ -108,6 +108,51 @@ class VmFileSafetyTest {
     }
 
     @Test
+    fun `asset refresh preserves fixed live endpoint while strict extraction rejects it`() {
+        assumeTrue(!System.getProperty("os.name").startsWith("Windows", ignoreCase = true))
+        val filesDir = temporaryFolder.newFolder("live-endpoint-files")
+        val paths = VmPaths.default(filesDir)
+        val security = VmPathSecurity(paths)
+        security.prepareExtractionLayout()
+        val process = ProcessBuilder("mkfifo", paths.qmpSocket.absolutePath).start()
+        assumeTrue(process.waitFor(5, TimeUnit.SECONDS) && process.exitValue() == 0)
+
+        security.validateForAssetRefresh()
+        expectIOException { security.validateForExtraction() }
+        assertTrue(Files.exists(paths.qmpSocket.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS))
+    }
+
+    @Test
+    fun `stale endpoint cleanup removes only checked fixed special files`() {
+        assumeTrue(!System.getProperty("os.name").startsWith("Windows", ignoreCase = true))
+        val filesDir = temporaryFolder.newFolder("stale-endpoint-files")
+        val paths = VmPaths.default(filesDir)
+        val security = VmPathSecurity(paths)
+        security.prepareExtractionLayout()
+        val process = ProcessBuilder("mkfifo", paths.qmpSocket.absolutePath).start()
+        assumeTrue(process.waitFor(5, TimeUnit.SECONDS) && process.exitValue() == 0)
+
+        security.removeStaleRuntimeEndpoints()
+
+        assertFalse(Files.exists(paths.qmpSocket.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS))
+    }
+
+    @Test
+    fun `stale endpoint cleanup rejects symlink at fixed endpoint`() {
+        val filesDir = temporaryFolder.newFolder("linked-endpoint-files")
+        val paths = VmPaths.default(filesDir)
+        val security = VmPathSecurity(paths)
+        security.prepareExtractionLayout()
+        val outside = temporaryFolder.newFile("outside-endpoint").apply { writeText("outside") }
+        Files.createSymbolicLink(paths.qmpSocket.toPath(), outside.toPath())
+
+        expectIOException { security.removeStaleRuntimeEndpoints() }
+
+        assertEquals("outside", outside.readText())
+        assertTrue(Files.isSymbolicLink(paths.qmpSocket.toPath()))
+    }
+
+    @Test
     fun `atomic writer rejects a pre-existing tmp symlink`() {
         val filesDir = temporaryFolder.newFolder("atomic-files")
         val paths = VmPaths.default(filesDir)

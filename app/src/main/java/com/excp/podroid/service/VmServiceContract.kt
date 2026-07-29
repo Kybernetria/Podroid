@@ -95,6 +95,8 @@ interface VmServiceEndpoint {
     suspend fun list(): List<VmSummary>
     suspend fun status(): VmStatus
     suspend fun supervisorState(): HostSupervisorState
+    suspend fun setAutostart(enabled: Boolean): HostSupervisorState =
+        throw UnsupportedOperationException("autostart mutation unavailable")
     suspend fun ensureInstalled()
     suspend fun start()
     suspend fun gracefulStop()
@@ -204,6 +206,8 @@ internal class LocalVmServiceEndpoint(
     override suspend fun status(): VmStatus = checked { manager.status(VmId.DEFAULT) }
     override suspend fun supervisorState(): HostSupervisorState =
         checked { manager.supervisorState(VmId.DEFAULT) }
+    override suspend fun setAutostart(enabled: Boolean): HostSupervisorState =
+        command { manager.setAutostart(VmId.DEFAULT, enabled) }
     override suspend fun ensureInstalled() = command { manager.ensureInstalled(VmId.DEFAULT) }
     override suspend fun start() = command { lifecycleCommands.startForeground() }
     override suspend fun gracefulStop() = command { lifecycleCommands.stop(force = false) }

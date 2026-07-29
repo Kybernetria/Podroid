@@ -48,6 +48,7 @@ object EngineModule {
         portForwards: PortForwardRepository,
         hostSupervisor: HostSupervisorRepository,
         paths: VmPaths,
+        runtimePreflight: ProductionRuntimePreflight,
         @ApplicationScope scope: CoroutineScope,
     ): VmManager = DefaultVmManager(
         runtime = EngineManagedVmRuntime(engine),
@@ -56,5 +57,6 @@ object EngineModule {
         files = VmPathFiles(paths),
         supervisor = hostSupervisor,
         scope = scope,
+        runtimePreflight = runtimePreflight.coordinator,
     )
 }

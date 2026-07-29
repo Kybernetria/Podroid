@@ -7,6 +7,8 @@
 package com.excp.podroid.di
 
 import android.content.Context
+import com.excp.podroid.vm.HostTransportReconciler
+import com.excp.podroid.vm.NoConfiguredHostTransportReconciler
 import com.excp.podroid.vm.VmPaths
 import dagger.Module
 import dagger.Provides
@@ -49,4 +51,10 @@ object AppModule {
     @ApplicationScope
     fun provideApplicationScope(): CoroutineScope =
         CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Explicit successful no-op until ticket #15 configures host transport. */
+    @Provides
+    @Singleton
+    internal fun provideHostTransportReconciler(): HostTransportReconciler =
+        NoConfiguredHostTransportReconciler
 }

@@ -120,12 +120,11 @@ class PodroidApplication : Application() {
         val instanceDir = vmPaths.instanceDirectory
         val pathSecurity = VmPathSecurity(vmPaths)
         pathSecurity.prepareExtractionLayout()
-        // Runtime sockets are the only legitimate special files in this tree.
-        // They are stale before initial extraction, so remove their exact names
-        // before the strict cleaner rejects every remaining special file.
-        pathSecurity.removeStaleRuntimeEndpoints()
-        StaleTmpFileCleaner().clean(instanceDir)
-        pathSecurity.validateForExtraction()
+        // Process recreation can leave a live QEMU/AVF runtime. Asset refresh
+        // must never infer that its sockets are stale or delete them. The typed
+        // runtime preflight owns that decision before any later launch.
+        StaleTmpFileCleaner(allowedSpecialFiles = runtimeEndpoints()).clean(instanceDir)
+        pathSecurity.validateForAssetRefresh()
 
         // Asset extraction has a self-healing version stamp: on every install
         // or upgrade `packageInfo.lastUpdateTime` changes, so we record it in
@@ -196,8 +195,18 @@ class PodroidApplication : Application() {
         VmAtomicFile.write(stampFile, pathSecurity) { output ->
             output.write(currentStamp.toByteArray(Charsets.UTF_8))
         }
-        pathSecurity.validateForExtraction()
+        pathSecurity.validateForAssetRefresh()
     }
+
+    private fun runtimeEndpoints(): Set<File> = setOf(
+        vmPaths.serialSocket,
+        vmPaths.terminalSocket,
+        vmPaths.controlSocket,
+        vmPaths.hostSocket,
+        vmPaths.qmpSocket,
+        vmPaths.avfTerminalSocket,
+        vmPaths.avfControlSocket,
+    )
 
     /**
      * Copies an asset to destDir if missing OR if the size differs OR if the

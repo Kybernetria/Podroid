@@ -43,26 +43,44 @@ class VmPathSecurity(private val paths: VmPaths) {
         validateHierarchy()
     }
 
-    /** Removes only the known stale VM socket endpoints before strict extraction-tree scanning. */
+    /**
+     * Removes only fixed runtime endpoint names after a probe proved no live
+     * runtime. Physical confinement, NOFOLLOW type, owner, and identity are
+     * rechecked immediately before each deletion.
+     */
     @Throws(IOException::class)
     fun removeStaleRuntimeEndpoints() {
         validateHierarchy()
+        val expectedOwner = Files.getOwner(instanceRoot, LinkOption.NOFOLLOW_LINKS)
         for (endpoint in runtimeEndpoints) {
             if (!existsNoFollow(endpoint)) continue
-            val attrs = attributesNoFollow(endpoint)
-            if (attrs.isDirectory || attrs.isSymbolicLink) {
+            val before = attributesNoFollow(endpoint)
+            if (before.isDirectory || before.isSymbolicLink || before.isRegularFile ||
+                Files.getOwner(endpoint, LinkOption.NOFOLLOW_LINKS) != expectedOwner
+            ) {
                 throw IOException("Unsafe runtime endpoint: $endpoint")
+            }
+            val after = attributesNoFollow(endpoint)
+            if (before.fileKey() != after.fileKey() || before.size() != after.size()) {
+                throw IOException("Runtime endpoint changed before deletion: $endpoint")
             }
             Files.delete(endpoint)
         }
         forceDirectory(instanceRoot)
     }
 
-    /** Extraction permits only real directories and regular files in the instance tree. */
+    /** Strict validation after a probe/cleanup has established quiescence. */
     @Throws(IOException::class)
     fun validateForExtraction() {
         validateHierarchy()
         scanInstanceTree(allowRuntimeEndpoints = false)
+    }
+
+    /** Asset refresh may coexist with a probed-but-not-yet-reconciled runtime. */
+    @Throws(IOException::class)
+    fun validateForAssetRefresh() {
+        validateHierarchy()
+        scanInstanceTree(allowRuntimeEndpoints = true)
     }
 
     /** Revalidates all physical boot paths immediately before a backend launch. */
@@ -238,7 +256,11 @@ class VmPathSecurity(private val paths: VmPaths) {
 internal class StaleTmpFileCleaner(
     private val maxDepth: Int = 32,
     private val maxEntries: Int = 20_000,
+    allowedSpecialFiles: Set<File> = emptySet(),
 ) {
+    private val allowedSpecialPaths = allowedSpecialFiles.mapTo(mutableSetOf()) {
+        it.toPath().toAbsolutePath().normalize()
+    }
     init {
         require(maxDepth >= 0)
         require(maxEntries > 0)
@@ -276,6 +298,7 @@ internal class StaleTmpFileCleaner(
                         attrs.isRegularFile -> if (normalized.fileName.toString().endsWith(TMP_SUFFIX)) {
                             staleFiles.add(normalized)
                         }
+                        normalized in allowedSpecialPaths -> Unit
                         else -> throw IOException("Special file rejected during stale-temp cleanup: $normalized")
                     }
                 }
