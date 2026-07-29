@@ -65,7 +65,7 @@
       </div>
 
       <h2>Setup wizard</h2>
-      <p>The first time you open Podroid a three-step wizard runs before anything else.</p>
+      <p>The first time you open Podroid a four-step wizard runs before anything else.</p>
 
       <h3>Step 1: Persistent storage size</h3>
       <p>Choose how large the writable VM disk image will be: 2, 4, 8, 16, 32, or 64 GB. This image lives in the app's private storage and holds everything you install inside the VM - packages, container images, config files. Pick more than you think you need.</p>
@@ -85,6 +85,9 @@
         <span class="label">Instability warning</span>
         <p>On the QEMU backend, Downloads sharing can be unstable on some devices. If the VM behaves oddly after enabling it, try disabling it in Settings. The AVF path is stable.</p>
       </div>
+
+      <h3>Step 4: USB passthrough (optional)</h3>
+      <p>On the QEMU backend, you may enable USB passthrough for devices attached through USB-C or OTG. Android asks for device permission when you attach hardware. AVF does not support this file-descriptor passthrough path, so leave it disabled there. The setting can be changed later while the VM is stopped.</p>
 
       <h2>First boot</h2>
       <p>Tap <strong>Start VM</strong> on the home screen. The first boot takes roughly 50-60 seconds, noticeably longer than the 10-15 seconds of later boots. Two one-time tasks run:</p>

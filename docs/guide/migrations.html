@@ -49,7 +49,7 @@
 
     <main class="content">
       <h1>Updates &amp; migrations</h1>
-      <p class="lead">When you update Podroid, the guest system layer refreshes automatically on the next boot. Your installed packages, edited configs, running services, containers, and home directory are all preserved - no VM reset, no reinstall.</p>
+      <p class="lead">When you update Podroid, the guest system layer refreshes automatically on the next boot. Workload data, installed packages, home directories, and unrelated configuration are preserved without a VM reset. A versioned migration may deliberately remove a documented obsolete system path.</p>
 
       <h2>The model: squashfs lower + persistent upper</h2>
       <p>The guest filesystem is a two-layer overlayfs:</p>
@@ -102,18 +102,18 @@
       </div>
 
       <h2>What is preserved across an update</h2>
-      <p>Everything on the persistent upper survives. Concretely:</p>
+      <p>Updates preserve workload and user data. Concretely:</p>
 
       <ul>
         <li>Packages installed with <code>apk add</code></li>
-        <li>Config files you edited under <code>/etc</code></li>
-        <li>Services added with <code>rc-update add</code></li>
-        <li>Containers, images, and volumes managed by Podman, Docker, or LXC</li>
-        <li><code>/root</code> and any other home directories</li>
-        <li>Any files you created or modified anywhere in the guest filesystem</li>
+        <li><code>/root</code>, other home directories, and unrelated configuration</li>
+        <li>Container images, volumes, and runtime data under persistent data directories if you installed an orchestrator yourself</li>
+        <li>Services and files that are not named by a versioned migration</li>
       </ul>
 
-      <p>What changes are the system files that Podroid ships in the squashfs - OpenRC service scripts, binaries like <code>podroid-hostd</code>, kernel modules, base configs - but only where the upper does not already shadow them.</p>
+      <p>A migration may intentionally remove obsolete Podroid-owned system paths even when an old upper shadows them. Migration 31 removes the retired Docker/LXC/X11 runlevel links, the old X11 and PulseAudio service paths, <code>/etc/containers/storage.conf</code>, the retired container backup/statistics helpers, and the old appliance logo. It also normalizes <code>/etc/podroid/forwards.conf</code> to the control entry; explicit Android DataStore rules are reapplied separately. It does not traverse or delete container data directories, volumes, home directories, or unrelated files.</p>
+
+      <p>Outside documented migration exceptions, the upper copy continues to take precedence over system files shipped in the replacement squashfs.</p>
 
       <h2>Adding a migration script</h2>
       <p>Pure file additions and content changes ship automatically with the squashfs - no script needed. A script is only required when a structural change must happen at runtime, such as enabling a newly-added service, creating a device node, or writing a config that depends on the running system state.</p>
