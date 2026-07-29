@@ -17,6 +17,7 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
+from typing import Callable
 
 MAX_SOURCE_ENTRIES = 2_000
 MAX_SOURCE_FILE_BYTES = 16 * 1024 * 1024
@@ -517,8 +518,10 @@ def copy_apk_rootfs(archive: zipfile.ZipFile, entry: zipfile.ZipInfo, destinatio
         fail("packaged rootfs is empty or exceeds 1 GiB declared-size bound")
     if entry.compress_size > MAX_APK_BYTES:
         fail("packaged rootfs compressed size exceeds the APK bound")
-    if entry.is_dir() or entry.flag_bits & 0x1:
-        fail("packaged rootfs must be an unencrypted file entry")
+    unix_mode = (entry.external_attr >> 16) & 0xFFFF
+    unix_type = stat.S_IFMT(unix_mode)
+    if entry.is_dir() or entry.flag_bits & 0x1 or unix_type not in (0, stat.S_IFREG):
+        fail("packaged rootfs must be an unencrypted regular file entry")
 
     descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
     try:
@@ -551,7 +554,12 @@ def copy_apk_rootfs(archive: zipfile.ZipFile, entry: zipfile.ZipInfo, destinatio
         fail("packaged rootfs actual size differs from ZIP metadata")
 
 
-def verify_apk(repo_root: Path, apk: Path, require_rootfs: bool) -> None:
+def verify_packaged_rootfs(
+    apk: Path,
+    require_rootfs: bool,
+    verify_rootfs: Callable[[Path], object],
+) -> bool:
+    """Safely stream the exact APK rootfs entry and invoke its semantic verifier."""
     try:
         apk_fd = os.open(apk, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     except OSError as exc:
@@ -591,16 +599,25 @@ def verify_apk(repo_root: Path, apk: Path, require_rootfs: bool) -> None:
                         if rootfs_entry is None:
                             if require_rootfs:
                                 fail(f"APK is missing required {APK_ROOTFS_ENTRY}")
-                            return
+                            return False
                         copy_apk_rootfs(archive, rootfs_entry, temporary_rootfs)
             except VerificationError:
                 raise
             except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as exc:
                 fail(f"malformed APK ZIP: {exc}")
 
-            verify_artifact(repo_root, temporary_rootfs)
+            verify_rootfs(temporary_rootfs)
+            return True
     finally:
         os.close(apk_fd)
+
+
+def verify_apk(repo_root: Path, apk: Path, require_rootfs: bool) -> None:
+    verify_packaged_rootfs(
+        apk,
+        require_rootfs,
+        lambda rootfs: verify_artifact(repo_root, rootfs),
+    )
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

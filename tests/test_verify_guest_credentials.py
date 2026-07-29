@@ -256,6 +256,17 @@ class GuestCredentialVerifierTest(unittest.TestCase):
             ):
                 self.verify_mock_apk(entries)
 
+    def test_apk_rejects_symlink_metadata_on_exact_rootfs_entry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            apk = Path(temporary) / "symlink.apk"
+            entry = zipfile.ZipInfo(verifier.APK_ROOTFS_ENTRY)
+            entry.create_system = 3
+            entry.external_attr = (stat.S_IFLNK | 0o777) << 16
+            with zipfile.ZipFile(apk, "w") as archive:
+                archive.writestr(entry, b"target")
+            with self.assertRaisesRegex(verifier.VerificationError, "regular file entry"):
+                verifier.verify_apk(Path(temporary), apk, require_rootfs=True)
+
     def test_apk_rejects_oversize_declared_rootfs_before_streaming(self):
         with tempfile.TemporaryDirectory() as temporary:
             apk = Path(temporary) / "oversize.apk"

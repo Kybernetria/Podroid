@@ -62,6 +62,7 @@ val verifyMinimalGuestSources by tasks.registering(Exec::class) {
     commandLine("python3", rootProject.file("tests/verify_minimal_guest.py"))
     inputs.files(
         rootProject.fileTree("build-rootfs"),
+        rootProject.fileTree("app/src/main/java") { include("**/*.kt") },
         rootProject.file("app/build.gradle.kts"),
         rootProject.file("tests/verify_minimal_guest.py")
     )
@@ -132,6 +133,35 @@ val verifyPackagedReleaseGuestCredentials by tasks.registering(Exec::class) {
     outputs.upToDateWhen { false }
 }
 
+val verifyPackagedDebugMinimalGuest by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Checks the exact optional minimal rootfs entry in the completed debug APK."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", rootProject.file("tests/verify_minimal_guest.py"), "--apk", debugApk.get().asFile)
+    inputs.files(
+        debugApk,
+        rootProject.file("tests/verify_minimal_guest.py"),
+        rootProject.file("tests/verify_guest_credentials.py")
+    )
+    outputs.upToDateWhen { false }
+}
+
+val verifyPackagedReleaseMinimalGuest by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Requires and checks the exact minimal rootfs entry in the completed release APK."
+    workingDir(rootProject.projectDir)
+    commandLine(
+        "python3", rootProject.file("tests/verify_minimal_guest.py"),
+        "--apk", releaseApk.get().asFile, "--require-rootfs"
+    )
+    inputs.files(
+        releaseApk,
+        rootProject.file("tests/verify_minimal_guest.py"),
+        rootProject.file("tests/verify_guest_credentials.py")
+    )
+    outputs.upToDateWhen { false }
+}
+
 tasks.named("preBuild") {
     dependsOn(
         verifyGuestCredentialSources,
@@ -146,11 +176,11 @@ tasks.matching { it.name == "preReleaseBuild" }.configureEach {
 }
 
 tasks.matching { it.name == "assembleDebug" }.configureEach {
-    finalizedBy(verifyPackagedDebugGuestCredentials)
+    finalizedBy(verifyPackagedDebugGuestCredentials, verifyPackagedDebugMinimalGuest)
 }
 
 tasks.matching { it.name == "assembleRelease" }.configureEach {
-    finalizedBy(verifyPackagedReleaseGuestCredentials)
+    finalizedBy(verifyPackagedReleaseGuestCredentials, verifyPackagedReleaseMinimalGuest)
 }
 
 tasks.named("check") {
