@@ -128,6 +128,7 @@ build_rootfs() {
     command -v "$container_engine" >/dev/null || error "Container engine not found: $container_engine"
     command -v python3 >/dev/null || error "Python 3 is required for rootfs verification"
     command -v unsquashfs >/dev/null || error "unsquashfs (squashfs-tools) is required for rootfs verification"
+    python3 "${SCRIPT_DIR}/tests/verify_minimal_guest.py"
     log "Building Alpine rootfs squashfs with ${container_engine}..."
     local sysver
     sysver=$(grep -E '^[[:space:]]*versionCode[[:space:]]*=' "${SCRIPT_DIR}/app/build.gradle.kts" | grep -oE '[0-9]+' | head -1)
@@ -137,6 +138,7 @@ build_rootfs() {
         --output type=local,dest="${ASSETS}" \
         "${SCRIPT_DIR}/build-rootfs/"
     python3 "${SCRIPT_DIR}/tests/verify_guest_credentials.py" "${ASSETS}/alpine-rootfs.squashfs"
+    python3 "${SCRIPT_DIR}/tests/verify_minimal_guest.py" "${ASSETS}/alpine-rootfs.squashfs"
     success "Built ${ASSETS}/alpine-rootfs.squashfs ($(du -h "${ASSETS}/alpine-rootfs.squashfs" | cut -f1)), system-version ${sysver:-0}"
 }
 

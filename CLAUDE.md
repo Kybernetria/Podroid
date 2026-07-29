@@ -4,13 +4,13 @@ Guidance for Claude Code (and any AI assistant or new contributor) working in th
 
 ## What Is This
 
-Podroid is an Android app that runs a real **Alpine 3.23** Linux VM on stock Android 8+ (arm64) to provide rootless **Podman / Docker / LXC** containers and an in-app **X11 desktop** - no root, no custom recovery.
+Podroid is an Android app that runs a real, minimal **Alpine 3.23** Linux VM on stock Android 8+ (arm64) as the direct-kernel foundation for later guest-owned orchestration - no Android root or custom recovery.
 
 - **Two interchangeable VM backends** behind one interface (`VmEngine`):
   - **QEMU (TCG)** - software emulation, the default, needs no special permission.
   - **AVF (pKVM)** - hardware-accelerated via the Android Virtualization Framework on Pixel-class devices, after a one-time `pm grant`.
 - The guest is a standard Alpine root with **OpenRC as PID 1**. System services live in `/etc/init.d/podroid-*` on a read-only squashfs; a persistent ext4 overlay captures user changes (`apk add`, `rc-update add`).
-- An embedded **Termux-based terminal**, an **X11/VNC viewer** (Xvnc + PulseAudio), and a **guest-to-Android bridge** (`podroid-notify` / `podroid-forward`) round it out.
+- An embedded **Termux-based terminal** and a **guest-to-Android bridge** (`podroid-notify` / `podroid-forward`) remain. The inherited Android X11/VNC UI is still present during staged refactoring, but the minimal guest no longer ships Xvnc, PulseAudio, display/audio defaults, or their packages.
 
 ## Key Facts
 
@@ -99,7 +99,7 @@ On **AVF** there is no QMP and no PL011: the console is captured via `ConsoleFan
 2. **`init-podroid`** (initramfs, ~45 lines): mounts the persistent ext4 (`/dev/vda` → upper) and the read-only squashfs (`/dev/vdb` → lower), stacks an overlayfs, moves the mounts into the new root, and `switch_root`s into `/sbin/init` (busybox).
 3. Busybox `/sbin/init` reads `/etc/inittab` and starts **OpenRC** (runlevels are pre-symlinked at build time - chroot-into-aarch64 doesn't work on an x86_64 builder).
 4. OpenRC services on the squashfs do all system bringup:
-   - `podroid-bootstrap` - kernel modules, cgroup v2, devpts/shm/mqueue, sysctl, ZRAM swap, `mount --make-rshared /`, container dirs.
+   - `podroid-bootstrap` - kernel modules, cgroup v2, devpts/shm/mqueue, ZRAM/OOM policy, `mount --make-rshared /`, QEMU Downloads/9p, and future TUN/FUSE workload prerequisites. It does not create or bind container-runtime data directories.
    - `podroid-network` - eth0 up, addressing, default route, `/etc/resolv.conf`.
    - `podroid-resize` - reads `RESIZE rows cols` from `/dev/hvc1`, `stty`s `/dev/hvc0`.
    - `podroid-hostd` - the host-bridge daemon (both backends).
@@ -119,9 +119,9 @@ Lets guest processes call back to Android. Guest side: `podroid-hostd` (multi-ca
 
 QEMU backend only. An unprivileged app can't open `/dev/bus/usb`, so it takes the already-open fd from `UsbManager`/`UsbDeviceConnection` and streams it to QEMU over `qmp.sock` as SCM_RIGHTS (`add-fd`), then hot-plugs with `device_add usb-host,hostdevice=/dev/fdset/N`. A code-registered `BroadcastReceiver` (no manifest `device_filter.xml`) is live only while the VM is `Running`. Gated by the `usb_passthrough_enabled` setting, which also makes `buildCommand()` emit `-device qemu-xhci`. Needs a libusb-enabled QEMU build.
 
-### X11 viewer (`x11/` + `ui/screens/x11/`)
+### Inherited X11 viewer (`x11/` + `ui/screens/x11/`)
 
-In-app viewer that talks RFB to `Xvnc` in the guest, with touch→mouse, soft-keyboard, external mouse/keyboard, fullscreen, rotation lock, resolution presets, and PCM audio over PulseAudio loopback. Backed by always-on implicit VNC/audio port forwards.
+The Android viewer/settings code and its in-memory legacy forward injection remain temporarily because ticket #5 is guest-image-only. The minimal guest has no Xvnc/PulseAudio packages, service, profile, or seed forwards, so this UI has no bundled guest endpoint. Removing or replacing Android UI/engine paths is a later isolated ticket.
 
 ### Internationalization
 
@@ -201,7 +201,7 @@ The terminal emulator JNI is built from the vendored `terminal-emulator` module 
 ## Build pipelines
 
 - **`Dockerfile`** - custom Linux kernel (arm64 defconfig + `podroid_kernel.config` modules + `forced_builtin.config` forcing overlayfs / netfilter / bridge / veth / tun / FUSE / IPv6 etc. to `=y`) and QEMU cross-compiled against the NDK. A build-time check greps the resolved `.config` and **fails the build** if any critical option isn't `=y` (guards against silent Kconfig demotion from unmet tristate deps). QEMU needs `--enable-libusb` (for passthrough) and a few Android/Bionic patches; `build-all.sh qemu` may need `docker build --network=host`.
-- **`build-rootfs/Dockerfile.rootfs`** - fetches the Alpine minirootfs, runs `build-rootfs.sh` (apk-installs alpine-base + openrc + podman + crun + fuse-overlayfs + docker + lxc + dropbear + iptables/nftables + bridge-utils, gives root an unknown random build-time password hash so public-key SSH remains usable, disables Dropbear password authentication, seals file caps on `newuidmap`/`newgidmap`, copies the OpenRC services and the cross-compiled `podroid-vsock-agent` + `podroid-hostd`, wires runlevels via direct symlinks), then `mksquashfs -comp zstd` (kernel ships `CONFIG_SQUASHFS_ZSTD=y`). No password or authorized key is bundled; provision `/root/.ssh/authorized_keys` through the in-app guest console before connecting over SSH.
+- **`build-rootfs/Dockerfile.rootfs`** - fetches the Alpine minirootfs and installs only the reviewed `minimal-packages.txt` set (`alpine-base`, OpenRC, iproute2, Dropbear, and CA certificates). It gives root an unknown random build-time password hash so public-key SSH remains usable, disables Dropbear password authentication, copies the console/migration/9p/host-bridge/vsock services and static helpers, wires only required runlevels, then creates a zstd SquashFS. Docker, Podman, LXC, X11/VNC, PulseAudio, desktop/font packages, appliance helpers, predefined workload services, default credentials, and authorized keys are not bundled. `tests/verify_minimal_guest.py` checks both source and resolved artifact closure.
 
 ## Performance tuning (TCG path; KVM is impossible without root)
 

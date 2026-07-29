@@ -1,8 +1,8 @@
 /*
- * Podroid — Rootless Podman for Android
+ * Podroid — direct-kernel Alpine VM for Android
  *
- * A headless AArch64 QEMU micro-VM running Alpine Linux with Podman,
- * accessed via built-in serial terminal.
+ * A headless AArch64 QEMU/AVF VM running a minimal Alpine Linux guest,
+ * accessed through the app-owned console.
  */
 plugins {
     alias(libs.plugins.android.application)
@@ -55,6 +55,41 @@ val testGuestCredentialVerifier by tasks.registering(Exec::class) {
     )
 }
 
+val verifyMinimalGuestSources by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Checks the fail-closed minimal Alpine guest source contract."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", rootProject.file("tests/verify_minimal_guest.py"))
+    inputs.files(
+        rootProject.fileTree("build-rootfs"),
+        rootProject.file("app/build.gradle.kts"),
+        rootProject.file("tests/verify_minimal_guest.py")
+    )
+}
+
+val verifyMinimalGuestArtifact by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Checks the generated minimal guest rootfs when it is present."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", rootProject.file("tests/verify_minimal_guest.py"), guestRootfs)
+    inputs.file(guestRootfs).withPropertyName("minimalGuestRootfs").optional()
+    onlyIf("the generated guest rootfs exists") { task -> task.inputs.files.singleFile.isFile }
+}
+
+val testMinimalGuestVerifier by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Runs minimal guest verifier regression tests."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", "-m", "unittest", "-v", "tests/test_verify_minimal_guest.py")
+    inputs.files(
+        rootProject.file("tests/test_verify_minimal_guest.py"),
+        rootProject.file("tests/verify_minimal_guest.py"),
+        rootProject.file("tests/verify_guest_credentials.py"),
+        rootProject.fileTree("build-rootfs"),
+        rootProject.file("app/build.gradle.kts")
+    )
+}
+
 val requireGuestRootfsForRelease by tasks.registering(Exec::class) {
     group = "verification"
     description = "Requires a verified guest rootfs for release packaging."
@@ -98,7 +133,12 @@ val verifyPackagedReleaseGuestCredentials by tasks.registering(Exec::class) {
 }
 
 tasks.named("preBuild") {
-    dependsOn(verifyGuestCredentialSources, verifyGuestCredentialArtifact)
+    dependsOn(
+        verifyGuestCredentialSources,
+        verifyGuestCredentialArtifact,
+        verifyMinimalGuestSources,
+        verifyMinimalGuestArtifact
+    )
 }
 
 tasks.matching { it.name == "preReleaseBuild" }.configureEach {
@@ -114,11 +154,18 @@ tasks.matching { it.name == "assembleRelease" }.configureEach {
 }
 
 tasks.named("check") {
-    dependsOn(verifyGuestCredentialSources, verifyGuestCredentialArtifact, testGuestCredentialVerifier)
+    dependsOn(
+        verifyGuestCredentialSources,
+        verifyGuestCredentialArtifact,
+        testGuestCredentialVerifier,
+        verifyMinimalGuestSources,
+        verifyMinimalGuestArtifact,
+        testMinimalGuestVerifier
+    )
 }
 
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
-    dependsOn(testGuestCredentialVerifier)
+    dependsOn(testGuestCredentialVerifier, testMinimalGuestVerifier)
 }
 
 android {
@@ -133,7 +180,7 @@ android {
         applicationId = "com.excp.podroid"
         minSdk = 26
         targetSdk = 36
-        versionCode = 30
+        versionCode = 31
         versionName = "1.2.6"
         buildConfigField("String", "QEMU_VERSION", "\"$podroidQemuVersion\"")
 

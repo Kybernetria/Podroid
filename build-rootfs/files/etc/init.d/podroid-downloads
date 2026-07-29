@@ -24,7 +24,20 @@ start() {
         --stdout /var/log/podroid-downloads.log \
         --stderr /var/log/podroid-downloads.log \
         --exec /usr/local/bin/podroid-vsock-agent -- downloads-9p
-    eend $?
+    downloads_rc=$?
+    if [ "$downloads_rc" -eq 0 ]; then
+        downloads_pid=$(cat "$pidfile" 2>/dev/null)
+        attempt=0
+        while [ "$attempt" -lt 10 ]; do
+            sleep 0.1
+            kill -0 "$downloads_pid" 2>/dev/null && break
+            attempt=$((attempt + 1))
+        done
+        kill -0 "$downloads_pid" 2>/dev/null || downloads_rc=1
+    fi
+    [ "$downloads_rc" -eq 0 ] || \
+        ewarn "Downloads rendezvous failed to start (see /var/log/podroid-downloads.log)"
+    eend "$downloads_rc"
 }
 
 stop() {

@@ -39,6 +39,7 @@ distrobox enter android-dev -- bash -lc '
   command -v openssl
   openssl version
   python3 tests/verify_guest_credentials.py
+  python3 tests/verify_minimal_guest.py
 '
 ```
 
@@ -53,8 +54,11 @@ distrobox enter android-dev -- bash -lc '
   unsquashfs -version
   CONTAINER_ENGINE=podman ./build-all.sh rootfs
   python3 tests/verify_guest_credentials.py app/src/main/assets/alpine-rootfs.squashfs
+  python3 tests/verify_minimal_guest.py app/src/main/assets/alpine-rootfs.squashfs
 '
 ```
+
+The minimal-guest verifier checks the exact explicit package manifest, resolved `/lib/apk/db/installed` closure, forbidden source/artifact paths, required OpenRC/runlevel and backend contracts, migration 31, and bounded artifact metadata. Ticket 5 before/after package and size evidence is recorded in `docs/baseline/MINIMAL_GUEST.md`.
 
 `openssl` and Alpine signing keys are installed inside the rootfs builder image. The rootfs package installation explicitly uses the copied Alpine keys and does not use apk's `--allow-untrusted` bypass.
 

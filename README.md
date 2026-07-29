@@ -4,89 +4,76 @@
 
 # Podroid
 
-**Run Linux containers and a full Linux desktop on your Android phone. No root.**
+**Run a real minimal Alpine Linux VM on an Android phone. No root required.**
 
-A real Alpine Linux VM with its own kernel - not a chroot or proot trick - so **Podman, Docker and LXC** behave exactly like they do on a server.
+Podroid boots an AArch64 direct-kernel guest through QEMU TCG on stock Android or AVF/pKVM on supported devices. The system image is read-only; package installs and user changes persist on a writable ext4 overlay.
 
 [![Release](https://img.shields.io/github/v/release/ExTV/Podroid?include_prereleases&style=flat-square&label=release&color=blue)](https://github.com/ExTV/Podroid/releases)
-[![Downloads](https://img.shields.io/github/downloads/ExTV/Podroid/total?style=flat-square&color=brightgreen)](https://github.com/ExTV/Podroid/releases)
-[![Stars](https://img.shields.io/github/stars/ExTV/Podroid?style=flat-square&color=yellow)](https://github.com/ExTV/Podroid/stargazers)
 [![License](https://img.shields.io/github/license/ExTV/Podroid?style=flat-square)](LICENSE)
 ![Android 8+](https://img.shields.io/badge/Android-8%2B-3DDC84?style=flat-square&logo=android&logoColor=white)
 ![arm64](https://img.shields.io/badge/arch-arm64-orange?style=flat-square)
 
-[**Website**](https://extv.github.io/Podroid/) · [**Documentation**](https://extv.github.io/Podroid/guide/) · [**Download APK**](https://github.com/ExTV/Podroid/releases/latest)
-
-<table>
-  <tr>
-    <td align="center" width="25%"><img src="docs/screenshots/01-home-idle.png" alt="Home screen before the VM starts" width="190" /><br /><sub><b>Home</b></sub></td>
-    <td align="center" width="25%"><img src="docs/screenshots/02-home-running.png" alt="Home screen with the VM running and network info" width="190" /><br /><sub><b>Running</b></sub></td>
-    <td align="center" width="25%"><img src="docs/screenshots/03-terminal-fastfetch.png" alt="Built-in terminal showing Alpine system info" width="190" /><br /><sub><b>Terminal</b></sub></td>
-    <td align="center" width="25%"><img src="docs/screenshots/04-quick-settings.png" alt="Terminal Quick Settings with themes and fonts" width="190" /><br /><sub><b>Themes &amp; fonts</b></sub></td>
-  </tr>
-</table>
-
 </div>
 
-## What you get
+## Minimal guest profile
 
-- **Podman, Docker and LXC** - pre-installed, ready the moment it boots
-- **A real VM** - Alpine Linux on a custom kernel via QEMU, or hardware-accelerated AVF on supported pKVM devices
-- **In-app terminal** - full xterm-256color, 122 color themes, 13 fonts, live resize
-- **X11 desktop** - run GUI Linux apps in a built-in viewer with touch, keyboard, mouse and audio
-- **USB passthrough**, **SSH**, **port forwarding** and a **guest-to-Android bridge**
-- **Container backup**, a **live VM/device status view** and **Downloads-folder sharing** with the guest
-- **English and 中文**, no root, any arm64 device on Android 8+
+The shipped Alpine 3.23 image deliberately contains only the reviewed explicit package set:
+
+- `alpine-base`, `openrc`, and `busybox-openrc`
+- `iproute2` for QEMU static SLIRP networking and AVF DHCP
+- `dropbear` and `dropbear-openrc`, configured for public-key authentication only
+- `ca-certificates`; `apk` remains available through Alpine base
+
+Docker, Podman, LXC, X11/VNC, PulseAudio, desktop/font packages, predefined workload services, and container backup/status helpers are **not bundled**. They are not part of the minimal base-image contract. The inherited Android X11 UI remains during the staged application refactor, but this guest image does not provide an X11/audio server for it.
+
+## Preserved VM contract
+
+- OpenRC-managed boot with the app-owned `hvc0` console/getty and stable `Ready!` boot markers
+- QEMU and AVF networking, terminal control, Downloads/9p sharing, and guest-to-Android host bridge
+- Read-only SquashFS system image plus persistent ext4 overlay and versioned migrations
+- `/dev/net/tun`, FUSE, shared-mount, cgroup v2, ZRAM, and basic OOM prerequisites for later guest-side orchestration
+- No default password, bundled SSH key, or generated host key in source
+
+Existing `/mnt/persist` data is retained across image upgrades. Migration 31 removes obsolete system startup/config/helper paths only; it does not delete old container or user data directories.
 
 ## Quick start
 
-1. [Download the APK](https://github.com/ExTV/Podroid/releases/latest) and install it.
-2. Tap **Start VM**, wait for **Ready!**, open the terminal.
+1. Build or install the APK.
+2. Tap **Start VM**, wait for **Ready!**, and open the terminal.
+3. Use Alpine's package manager for additional guest software:
 
 ```sh
-# rootless containers, straight away
-podman run --rm alpine echo "hello from a container"
-docker run -d -p 8080:80 nginx
+apk update
+apk add <package>
+```
 
-# expose that container to your phone and LAN, right from the VM shell
-podroid-forward add 8080 8080 tcp     # TCP or UDP, on both the QEMU and AVF backends
-curl http://<phone-ip>:8080
+To use SSH, enable it in Settings and first provision your public key from the app-owned guest console:
 
-# SSH in from your laptop (enable SSH in the setup wizard or Settings).
-# First paste your laptop's public key into /root/.ssh/authorized_keys
-# from Podroid's in-app terminal; SSH password authentication is disabled.
+```sh
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+# append your public key to /root/.ssh/authorized_keys, then:
+chmod 600 /root/.ssh/authorized_keys
 ssh root@<phone-ip> -p 9922
 ```
 
-Setup, the two backends, networking, the X11 viewer and troubleshooting all live in the **[documentation](https://extv.github.io/Podroid/guide/)**.
+Password authentication is disabled.
 
-## Build
+## Build and verification
 
 ```sh
-git clone https://github.com/ExTV/Podroid.git
-cd Podroid
-./build-all.sh all     # kernel, rootfs, QEMU and APK (needs Docker + Android SDK/NDK)
+CONTAINER_ENGINE=podman ./build-all.sh rootfs
+./gradlew :app:testDebugUnitTest assembleDebug
 ```
 
-Per-component builds and toolchain details: [CONTRIBUTING.md](CONTRIBUTING.md). Repository architecture and accepted decisions start at [docs/README.md](docs/README.md).
+The rootfs command verifies both credential policy and the minimal package/path/boot contract before reporting success. Generated kernel, rootfs, native, and APK artifacts are ignored and must not be committed.
+
+Per-component toolchain details are in [CONTRIBUTING.md](CONTRIBUTING.md). Architecture decisions and the ordered implementation backlog are under [docs/](docs/README.md).
 
 ## Contributing
 
-Contributions of every size are welcome: bug reports, kernel-config tweaks, new themes, UI polish, X11 input fixes, anything.
+Keep changes scoped to the ordered ticket or approved architecture decision. Run the narrow source tests first, then the rootfs verifier and Android unit/assemble checks. A physical QEMU and AVF boot remains required before declaring the guest boot milestone complete.
 
-- **Pull requests:** read [CONTRIBUTING.md](CONTRIBUTING.md) first. Keep changes scoped, run `./build-all.sh test` before pushing, and explain *why* in the PR description.
-- **Bug reports:** [open an issue](https://github.com/ExTV/Podroid/issues/new) with your device and Android version, a short repro, and the diagnostic log (**Settings → Export Diagnostic Log** in the app).
+## Credits and license
 
-## Credits
-
-| | |
-|---|---|
-| [QEMU](https://www.qemu.org)                   | Machine emulation |
-| [Termux](https://github.com/termux/termux-app) | Terminal emulator engine |
-| [Alpine Linux](https://alpinelinux.org)        | The guest distribution |
-
-Full list in [CREDITS.md](CREDITS.md).
-
-## License
-
-[GPLv2](LICENSE). If Podroid is useful to you, a [star](https://github.com/ExTV/Podroid/stargazers) helps other people find it.
+Podroid builds on [QEMU](https://www.qemu.org), [Alpine Linux](https://alpinelinux.org), and the [Termux terminal emulator](https://github.com/termux/termux-app). See [CREDITS.md](CREDITS.md). Licensed under [GPLv2](LICENSE).

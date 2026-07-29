@@ -1,9 +1,8 @@
 #!/sbin/openrc-run
 description="Podroid system migrations (runs versioned upgrade scripts once)"
 
-# Run early, before the rest of Podroid bringup, so migrations can prepare state
-# the other services rely on. localmount is already satisfied (initramfs mounted
-# /mnt/persist), but we declare it for ordering correctness.
+# Run before all other Podroid bringup. The initramfs has already mounted the
+# authoritative persistent ext4 filesystem at /mnt/persist.
 depend() {
     need localmount
     before podroid-bootstrap
@@ -12,41 +11,92 @@ depend() {
 SYSVER_FILE="/etc/podroid/system-version"
 APPLIED_FILE="/mnt/persist/.podroid/applied-version"
 MIGRATIONS_DIR="/etc/podroid/migrations"
+MAX_MIGRATIONS=256
+
+valid_version() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#1}" -le 9 ]
+}
+
+write_applied_version() {
+    # mktemp creates the candidate with O_EXCL in the authoritative directory,
+    # so a stale/corrupt symlink cannot redirect the write. mv is atomic on the
+    # same ext4 filesystem.
+    temporary=$(mktemp "${APPLIED_FILE}.tmp.XXXXXX") || return 1
+    chmod 0600 "$temporary" || { rm -f "$temporary"; return 1; }
+    if printf '%s\n' "$current" > "$temporary" && mv -f "$temporary" "$APPLIED_FILE"; then
+        return 0
+    fi
+    rm -f "$temporary"
+    return 1
+}
 
 start() {
     ebegin "Running Podroid migrations"
     mkdir -p /mnt/persist/.podroid
 
-    current=$(cat "$SYSVER_FILE" 2>/dev/null || echo 0)
+    current=$(cat "$SYSVER_FILE" 2>/dev/null || echo "")
     applied=$(cat "$APPLIED_FILE" 2>/dev/null || echo "")
+    if ! valid_version "$current"; then
+        eend 1 "invalid system version"
+        return 1
+    fi
 
-    # Fresh install (no marker): seed the marker, run nothing — the squashfs
-    # already ships the current state.
-    if [ -z "$applied" ]; then
-        printf '%s\n' "$current" > "$APPLIED_FILE.tmp" && mv "$APPLIED_FILE.tmp" "$APPLIED_FILE"
+    # A missing marker can mean either a fresh disk or a legacy installation
+    # from before version tracking. Treat it as version 0 and execute the
+    # idempotent hooks: they are harmless on a clean lower and required to clean
+    # stale upper-layer startup paths on legacy upgrades.
+    [ -n "$applied" ] || applied=0
+    if ! valid_version "$applied"; then
+        eend 1 "invalid applied version"
+        return 1
+    fi
+
+    if [ "$current" -le "$applied" ]; then
         eend 0
         return 0
     fi
 
-    # Fast path / downgrade: nothing to do.
-    if [ "$current" -le "$applied" ] 2>/dev/null; then
-        eend 0
-        return 0
-    fi
-
-    # Run each migrations/<v>.sh with applied < v <= current, in ascending
-    # numeric order (sort the basenames, not full paths). Scripts MUST be
-    # idempotent (a crash mid-run re-runs them next boot).
-    for base in $(ls "$MIGRATIONS_DIR" 2>/dev/null | sed -n 's/\.sh$//p' | sort -n); do
-        case "$base" in *[!0-9]*) continue ;; esac   # digits only
-        if [ "$base" -gt "$applied" ] 2>/dev/null && [ "$base" -le "$current" ] 2>/dev/null; then
-            echo "podroid-migrate: applying $base" > /dev/console
-            sh "$MIGRATIONS_DIR/$base.sh" > /dev/console 2>&1 \
-                || echo "podroid-migrate: $base failed (continuing)" > /dev/console
+    # Materialize at most MAX_MIGRATIONS validated basenames, then sort them
+    # numerically. This avoids unbounded or filename-confused work if the
+    # persistent upper layer contains unexpected migration entries.
+    migration_list=/run/podroid-migrations.list
+    : > "$migration_list"
+    migration_count=0
+    for migration in "$MIGRATIONS_DIR"/*.sh; do
+        [ -e "$migration" ] || break
+        base=${migration##*/}
+        base=${base%.sh}
+        valid_version "$base" || continue
+        migration_count=$((migration_count + 1))
+        if [ "$migration_count" -gt "$MAX_MIGRATIONS" ]; then
+            rm -f "$migration_list"
+            eend 1 "too many migration scripts"
+            return 1
         fi
+        printf '%s\n' "$base" >> "$migration_list"
     done
+    sort -n -o "$migration_list" "$migration_list"
 
-    # Advance the marker atomically only after the loop completes.
-    printf '%s\n' "$current" > "$APPLIED_FILE.tmp" && mv "$APPLIED_FILE.tmp" "$APPLIED_FILE"
-    eend 0
+    while IFS= read -r base; do
+        [ -n "$base" ] || continue
+        if [ "$base" -gt "$applied" ] && [ "$base" -le "$current" ]; then
+            echo "podroid-migrate: applying $base" > /dev/console
+            if ! sh "$MIGRATIONS_DIR/$base.sh" > /dev/console 2>&1; then
+                rm -f "$migration_list"
+                eend 1 "migration $base failed"
+                return 1
+            fi
+        fi
+    done < "$migration_list"
+    rm -f "$migration_list"
+
+    # Advance only after every selected hook succeeds. A crash or hook failure
+    # leaves the previous marker intact, so idempotent hooks rerun next boot.
+    if write_applied_version; then
+        eend 0
+        return 0
+    fi
+    eend 1 "cannot advance applied version"
+    return 1
 }

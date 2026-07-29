@@ -1,5 +1,5 @@
 #!/sbin/openrc-run
-description="Podroid VM networking (10.0.2.15 via SLIRP)"
+description="Podroid VM networking (QEMU SLIRP static address or AVF DHCP)"
 
 depend() {
     need podroid-bootstrap
@@ -9,16 +9,13 @@ depend() {
 
 start() {
     ebegin "Configuring network..."
-    echo "Configuring containers..." > /dev/console
+    echo "Configuring network..." > /dev/console
     ip link set lo up 2>/dev/null
+
     NETIF=""
     for _i in $(seq 1 10); do
-        # Exclude virtual/bridge devices so the real virtio NIC is picked.
-        # The LXC bridge lxcbr0 (brought up by the dnsmasq.lxcbr0 service),
-        # podman/docker/cni bridges, and veth pairs would otherwise be
-        # candidates; the grep below filters them all out by name.
-        NETIF=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | \
-            grep -vE '^(lo|dummy[0-9]*|veth|podman|cni|docker|lxcbr|br-)' | head -1)
+        NETIF=$(ip -o link show 2>/dev/null | awk -F': ' '$2 != "lo" {print $2; exit}')
+        NETIF=${NETIF%%@*}
         [ -n "$NETIF" ] && break
         sleep 0.05
     done
@@ -29,43 +26,34 @@ start() {
     ip link set "$NETIF" up
 
     if grep -q 'podroid\.backend=avf' /proc/cmdline 2>/dev/null; then
-        # AVF backend: crosvm wires the guest to a TAP that Android's tethering
-        # manager runs DHCP on. The lease decides our IP / gateway / DNS — the
-        # SLIRP-style 10.0.2.15 hardcode won't sit on the right subnet (on
-        # IPv6-only cellular w/ CLAT it lands on 192.0.0.x). udhcpc applies
-        # everything via the default /usr/share/udhcpc/default.script.
-        udhcpc -i "$NETIF" -t 8 -T 1 -A 1 -q -f -n 2>/dev/null || \
-            udhcpc -i "$NETIF" -q -f -n 2>/dev/null || true
-        # Belt-and-suspenders: if DHCP didn't write resolv.conf (busybox
-        # variants differ), drop public DNS so apk/curl don't die silently.
-        [ -s /etc/resolv.conf ] || printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
-        # Don't report success on a total DHCP failure: dependents that
-        # `need` us would start believing the link is up, then SSH/apk fail
-        # with no obvious cause. Surface it instead.
+        # AVF networking is assigned by Android's tethering DHCP service. Keep
+        # the request bounded to eight one-second attempts and fail visibly if
+        # no address is assigned.
+        udhcpc -i "$NETIF" -t 8 -T 1 -A 1 -q -f -n 2>/dev/null || true
+        [ -s /etc/resolv.conf ] || \
+            printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
         if ! ip -o -4 addr show dev "$NETIF" 2>/dev/null | grep -q 'inet '; then
             eend 1 "DHCP did not assign an address to $NETIF"
             return 1
         fi
     else
-        # QEMU/TCG backend: SLIRP's built-in DHCP also exists but hardcoding
-        # is faster + matches every existing user's setup. Original behavior.
-        ip addr add 10.0.2.15/24 dev "$NETIF" 2>/dev/null
-        ip route add default via 10.0.2.2 dev "$NETIF" 2>/dev/null
+        # QEMU uses the stable SLIRP subnet and DNS endpoint.
+        ip addr add 10.0.2.15/24 dev "$NETIF" 2>/dev/null || true
+        ip route replace default via 10.0.2.2 dev "$NETIF"
         printf 'nameserver 10.0.2.3\nnameserver 8.8.8.8\nnameserver 1.1.1.1\n' \
             > /etc/resolv.conf
-        # Mirror the AVF post-check: if the static assignment didn't stick
-        # (wrong NIC, link not up), don't report success. Dependents that
-        # `need` us would assume the link is up and then SSH/apk fail with no
-        # obvious cause. Surface it instead.
         if ! ip -o -4 addr show dev "$NETIF" 2>/dev/null | grep -q 'inet '; then
             eend 1 "static IP did not stick on $NETIF"
             return 1
         fi
     fi
+
     BW_MBIT=$(sed -n 's/.*podroid\.bandwidth=\([0-9]*\).*/\1/p' /proc/cmdline 2>/dev/null)
     if [ -n "$BW_MBIT" ] && [ "$BW_MBIT" -gt 0 ]; then
-        tc qdisc replace dev "$NETIF" root tbf rate "${BW_MBIT}mbit" burst 32kbit latency 400ms 2>/dev/null || true
+        tc qdisc replace dev "$NETIF" root tbf rate "${BW_MBIT}mbit" \
+            burst 32kbit latency 400ms 2>/dev/null || true
     fi
+
     echo "Network found" > /dev/console
     eend 0
 }

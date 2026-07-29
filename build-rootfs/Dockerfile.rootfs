@@ -38,6 +38,7 @@ ENV SYSTEM_VERSION=${SYSTEM_VERSION}
 
 ENV ALPINE_VERSION=${ALPINE_RELEASE}
 COPY files /work/files
+COPY minimal-packages.txt /work/minimal-packages.txt
 COPY build-rootfs.sh /work/build-rootfs.sh
 COPY generate-root-password-hash.sh /work/generate-root-password-hash.sh
 RUN chmod +x /work/build-rootfs.sh /work/generate-root-password-hash.sh \
@@ -45,8 +46,8 @@ RUN chmod +x /work/build-rootfs.sh /work/generate-root-password-hash.sh \
 
 RUN mksquashfs /work/rootfs /work/alpine-rootfs.squashfs \
     -comp zstd -Xcompression-level 19 -all-root -noappend
-# (No -no-xattrs: rootless podman's newuidmap/newgidmap need their
-# file capabilities preserved; they're stored as security.capability xattr.)
+# Preserve normal filesystem xattrs; no container-runtime file capabilities are
+# added by the minimal guest build.
 
 FROM scratch AS export
 COPY --from=builder /work/alpine-rootfs.squashfs /alpine-rootfs.squashfs

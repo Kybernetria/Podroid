@@ -1,0 +1,7 @@
+alpine-base
+openrc
+busybox-openrc
+iproute2
+dropbear
+dropbear-openrc
+ca-certificates

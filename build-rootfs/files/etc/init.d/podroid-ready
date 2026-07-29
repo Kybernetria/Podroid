@@ -7,23 +7,15 @@ depend() {
 }
 
 start() {
-    # By the time we run, every other service has started (depend: after *).
-    # OOM-protect Podroid's infrastructure processes so a hungry user app
-    # (Firefox, Chromium, big npm builds, podman pulls) gets reaped first.
-    # -1000 makes a process completely immune to OOM. Match by argv[0]
-    # basename instead of pidfile to catch all variants (multiple Xvnc
-    # screens, forked dropbear instances per SSH session, the agent's
-    # listener children).
-    for _name in dropbear Xvnc pulseaudio podroid-vsock-agent dnsmasq; do
-        for _pid in $(pgrep -x "$_name" 2>/dev/null); do
-            echo -1000 > "/proc/$_pid/oom_score_adj" 2>/dev/null
+    # Keep the remote-access and Android control plane available under ordinary
+    # guest memory pressure. This is a bounded scan of three process names.
+    for name in dropbear podroid-vsock-agent podroid-hostd; do
+        for pid in $(pgrep -x "$name" 2>/dev/null); do
+            echo -1000 > "/proc/$pid/oom_score_adj" 2>/dev/null
         done
     done
 
-    # Emit the boot stages PodroidQemu.detectBootStage() expects.
-    if [ -x /usr/local/bin/podroid-update-stats ]; then
-        /usr/local/bin/podroid-update-stats || true
-    fi
+    # Preserve the backend-neutral boot-stage contract consumed by Android.
     echo "Starting SSH..." > /dev/console
     echo "Almost ready..." > /dev/console
     echo "Ready!" > /dev/console
