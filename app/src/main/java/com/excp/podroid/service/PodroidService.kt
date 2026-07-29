@@ -36,6 +36,7 @@ import com.excp.podroid.vm.VmLifecycleState
 import com.excp.podroid.vm.VmManager
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
 import javax.inject.Inject
 
@@ -54,7 +55,10 @@ class PodroidService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var notificationJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
-    @Volatile private var startRequested = false
+    // True only while this service owns a manager.start call that has not yet
+    // been accepted or failed. A retained terminal replay may not tear down that
+    // pending start, but every other terminal+quiescent snapshot is actionable.
+    private val pendingStartOwned = MutableStateFlow(false)
 
     private var notificationBuilder: NotificationCompat.Builder? = null
     private var stopPendingIntent: PendingIntent? = null
@@ -99,18 +103,21 @@ class PodroidService : Service() {
                     fgType,
                 )
                 // Manager busy includes launch assembly and Error cleanup, not
-                // merely UI-active states. Always restore foreground supervision
-                // for a busy generation, but never launch a duplicate.
-                val alreadyBusy = vmManager.busy(VmId.DEFAULT).value || startRequested
-                acquireWakeLock()
-                startSupervision()
-                if (!alreadyBusy) {
-                    startRequested = true
-                    launchPodroid()
-                }
+                // merely UI-active states. ACTION_START always restores foreground
+                // supervision and the WakeLock for such a generation, but never
+                // launches a duplicate. Claim pending ownership before collectors
+                // start so a retained terminal replay cannot cancel our new start.
+                val startDecision = VmServiceStartPolicy.decide(
+                    managerBusy = vmManager.busy(VmId.DEFAULT).value,
+                    pendingStartOwned = pendingStartOwned.value,
+                )
+                if (startDecision.launchNewGeneration) pendingStartOwned.value = true
+                if (startDecision.acquireWakeLock) acquireWakeLock()
+                if (startDecision.armSupervision) startSupervision()
+                if (startDecision.launchNewGeneration) launchPodroid()
             }
             ACTION_STOP -> {
-                val wasBusy = vmManager.busy(VmId.DEFAULT).value || startRequested
+                val wasBusy = vmManager.busy(VmId.DEFAULT).value || pendingStartOwned.value
                 serviceScope.launch(Dispatchers.IO) {
                     stopAndApplyPolicy("VM graceful stop failed")
                 }
@@ -156,7 +163,7 @@ class PodroidService : Service() {
         // App swiped from recents — request the manager's bounded graceful stop.
         // Keep the WakeLock/foreground service until the state observer sees the
         // terminal transition; an idle service has no transition, so tear it down.
-        val wasBusy = vmManager.busy(VmId.DEFAULT).value || startRequested
+        val wasBusy = vmManager.busy(VmId.DEFAULT).value || pendingStartOwned.value
         serviceScope.launch(Dispatchers.IO) {
             stopAndApplyPolicy("Task-removal graceful stop failed")
         }
@@ -167,11 +174,7 @@ class PodroidService : Service() {
         runCatching { vmManager.stop(VmId.DEFAULT) }
             .onFailure { Log.e(TAG, failureLog, it) }
         withContext(Dispatchers.Main) {
-            val decision = VmServiceLifecyclePolicy.decide(
-                vmManager.lifecycle(VmId.DEFAULT).value,
-                vmManager.quiescent(VmId.DEFAULT).value,
-                vmManager.busy(VmId.DEFAULT).value,
-            )
+            val decision = currentLifecycleDecision()
             if (decision.teardown) teardown()
             else if (decision.notification == VmServiceNotification.CLEANUP_INCOMPLETE) {
                 updateNotification("VM error — cleanup incomplete; Stop retries cleanup")
@@ -246,30 +249,28 @@ class PodroidService : Service() {
      * cleanup signal (including one produced by a Stop retry).
      */
     private suspend fun observeStateForShutdown() {
-        // The manager wraps a process-lifetime @Singleton engine, so its flow replays
-        // the PRIOR cycle's retained terminal state (Stopped/Error) the instant
-        // this fresh collector subscribes — before manager.start() flips it to
-        // launchPodroid is about to run flips it to Starting. Acting on that
-        // replayed value would teardown (stopSelf → onDestroy → serviceScope
-        // .cancel) the very start we are kicking off, cancelling it as "Job was
-        // cancelled" and leaving a new stale Error that poisons the next attempt
-        // too — so the VM never restarts until the process is killed. Consume the
-        // first emission as a baseline; only act on transitions that follow it.
-        var baselineConsumed = false
         combine(
             vmManager.lifecycle(VmId.DEFAULT),
             vmManager.quiescent(VmId.DEFAULT),
             vmManager.busy(VmId.DEFAULT),
-        ) { state, quiescent, busy ->
-            VmServiceLifecyclePolicy.decide(state, quiescent, busy)
+            pendingStartOwned,
+        ) { state, quiescent, busy, pendingStart ->
+            VmServiceLifecyclePolicy.decide(state, quiescent, busy, pendingStart)
         }.collect { decision ->
-            if (!baselineConsumed) {
-                baselineConsumed = true
-                return@collect
-            }
+            // No unconditional baseline suppression: if cleanup completed before
+            // this collector's first emission, that first terminal snapshot must
+            // tear down the service. Only an actually-owned pending start defers it.
             if (decision.teardown) teardown()
         }
     }
+
+    private fun currentLifecycleDecision(): VmServiceLifecycleDecision =
+        VmServiceLifecyclePolicy.decide(
+            vmManager.lifecycle(VmId.DEFAULT).value,
+            vmManager.quiescent(VmId.DEFAULT).value,
+            vmManager.busy(VmId.DEFAULT).value,
+            pendingStartOwned.value,
+        )
 
     /** Release the WakeLock, drop the foreground notification, and stop. */
     private fun teardown() {
@@ -348,28 +349,28 @@ class PodroidService : Service() {
 
     private fun launchPodroid() {
         serviceScope.launch {
-            withContext(Dispatchers.IO) {
-                try {
+            var failure: Throwable? = null
+            try {
+                withContext(Dispatchers.IO) {
                     // Installation, launch settings, implicit SSH forwarding, and
                     // backend engine invocation are all owned by VmManager.
                     vmManager.start(VmId.DEFAULT)
-                    startRequested = false
-                } catch (failure: Throwable) {
-                    startRequested = false
-                    Log.e(TAG, "VM failed to start", failure)
-                    // Error is not a cleanup signal. Keep foreground/WakeLock and
-                    // management channels when the manager remains non-quiescent;
-                    // teardown only when the pure lifecycle policy permits it.
-                    withContext(Dispatchers.Main) {
-                        val decision = VmServiceLifecyclePolicy.decide(
-                            vmManager.lifecycle(VmId.DEFAULT).value,
-                            vmManager.quiescent(VmId.DEFAULT).value,
-                            vmManager.busy(VmId.DEFAULT).value,
-                        )
-                        if (decision.teardown) teardown()
-                        else if (decision.notification == VmServiceNotification.CLEANUP_INCOMPLETE) {
-                            updateNotification("VM error — cleanup incomplete; Stop retries cleanup")
-                        }
+                }
+            } catch (caught: Throwable) {
+                failure = caught
+                Log.e(TAG, "VM failed to start", caught)
+            } finally {
+                withContext(NonCancellable + Dispatchers.Main.immediate) {
+                    // Acceptance and failure both end this service's ownership.
+                    // Re-evaluate the exact current snapshot immediately because
+                    // a terminal emission may already have been suppressed while
+                    // pendingStartOwned was true.
+                    pendingStartOwned.value = false
+                    val decision = currentLifecycleDecision()
+                    if (decision.teardown) teardown()
+                    else if (failure != null &&
+                        decision.notification == VmServiceNotification.CLEANUP_INCOMPLETE) {
+                        updateNotification("VM error — cleanup incomplete; Stop retries cleanup")
                     }
                 }
             }

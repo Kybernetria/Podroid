@@ -349,6 +349,7 @@ class QemuEngine @Inject constructor(
             return
         }
 
+        var processOwner: QemuProcessOwner<Process, Int>? = null
         try {
             val cmd = buildCommand(qemuExe, portForwards, config)
             Log.d(TAG, "Launching QEMU with ${cmd.size} args: $cmd")
@@ -375,21 +376,24 @@ class QemuEngine @Inject constructor(
             // Recheck after disk preparation/socket cleanup and directly before
             // the irreversible process launch.
             pathSecurity.validateForLaunch()
-            val proc = withContext(dispatcher) {
-                // Final check on the process-owning thread, immediately before
-                // ProcessBuilder.start(). A force observed during preparation
-                // therefore prevents a later launch.
-                if (launchGate.mayLaunch(generation)) pb.start() else null
+            val owner = QemuProcessOwner<Process, Int>(
+                commit = { child ->
+                    launchGate.commitLaunch(generation) { process = child }
+                },
+                forceDestroy = { it.destroyForcibly() },
+                reap = { child -> withContext(dispatcher) { child.waitFor() } },
+            )
+            processOwner = owner
+            val proc = owner.createAndCommit {
+                withContext(dispatcher) {
+                    // Final check on the process-owning thread, immediately before
+                    // ProcessBuilder.start(). The surrounding NonCancellable owner
+                    // block guarantees that a returned child cannot be discarded
+                    // by prompt cancellation before commit-or-reap completes.
+                    if (launchGate.mayLaunch(generation)) pb.start() else null
+                }
             }
             if (proc == null) {
-                finishBeforeProcess(generation, VmState.Stopped)
-                return
-            }
-            if (!launchGate.commitLaunch(generation) { process = proc }) {
-                // Stop intent landed while ProcessBuilder.start() was in flight,
-                // before assignment. Reap the uncommitted child immediately.
-                proc.destroyForcibly()
-                withContext(dispatcher) { proc.waitFor() }
                 finishBeforeProcess(generation, VmState.Stopped)
                 return
             }
@@ -427,7 +431,9 @@ class QemuEngine @Inject constructor(
             var socketsReady = false
             while (System.currentTimeMillis() - startMs < SOCKET_READY_TIMEOUT_MS) {
                 if (!proc.isAlive) {
-                    val exitCode = proc.exitValue()
+                    // isAlive=false is not the ownership boundary: explicitly
+                    // waitFor-reap before cleanup may publish quiescence.
+                    val exitCode = owner.awaitCommittedReap(proc)
                     lastExitCode = exitCode
                     Log.e(TAG, "QEMU died during startup, exit code: $exitCode")
                     _state.value = VmState.Error("QEMU exited with code $exitCode")
@@ -474,7 +480,7 @@ class QemuEngine @Inject constructor(
 
             // Block until QEMU exits, ON THE SAME dedicated thread that fork'd
             // it, so PR_SET_PDEATHSIG never fires while QEMU is healthy.
-            val exitCode = withContext(dispatcher) { proc.waitFor() }
+            val exitCode = owner.awaitCommittedReap(proc)
             lastExitCode = exitCode
             Log.d(TAG, "QEMU exited: $exitCode")
             val priorError = _state.value as? VmState.Error
@@ -487,20 +493,36 @@ class QemuEngine @Inject constructor(
                 else -> VmState.Error(formatExitError(exitCode, config.storageAccessEnabled))
             }
         } catch (e: CancellationException) {
-            // The start() coroutine lives in PodroidService.serviceScope, which
-            // onDestroy() cancels on every stop/teardown. A stop destroys the
-            // process first (engine.stop() → proc.destroy()), so this cancellation
-            // IS the stop completing — finalize as a clean Stopped instead of
-            // mislabeling it Error("Job was cancelled"). A sticky Error here also
-            // poisoned the next start: its replayed value tore the new service
-            // down before the VM could boot. cleanup() is idempotent.
-            Log.d(TAG, "start() cancelled — finalizing as Stopped")
-            cleanup()
-            _state.value = VmState.Stopped
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start QEMU", e)
-            _state.value = VmState.Error(e.message ?: "Unknown error")
-            cleanup()
+            // Cancellation can land immediately after child creation or after
+            // publication. The owner shields create/commit and then force-reaps
+            // any committed child before cleanup is allowed to publish quiescence.
+            Log.d(TAG, "start() cancelled — force-reaping before cleanup")
+            try {
+                withContext(NonCancellable) {
+                    processOwner?.forceDestroyAndReapCommitted()
+                    cleanup()
+                    _state.value = VmState.Stopped
+                }
+            } catch (cleanupFailure: Throwable) {
+                e.addSuppressed(cleanupFailure)
+                Log.e(TAG, "QEMU cancellation cleanup failed; runtime remains non-quiescent", cleanupFailure)
+                _state.value = VmState.Error("QEMU cancellation cleanup failed")
+            }
+            throw e
+        } catch (failure: Throwable) {
+            Log.e(TAG, "Failed to start QEMU", failure)
+            try {
+                withContext(NonCancellable) {
+                    processOwner?.forceDestroyAndReapCommitted()
+                    cleanup()
+                    _state.value = VmState.Error(failure.message ?: "Unknown error")
+                }
+            } catch (cleanupFailure: Throwable) {
+                failure.addSuppressed(cleanupFailure)
+                Log.e(TAG, "QEMU cleanup failed; runtime remains non-quiescent", cleanupFailure)
+                _state.value = VmState.Error("${failure.message ?: "QEMU failed"}; cleanup incomplete")
+            }
+            if (failure is Error) throw failure
         }
     }
 

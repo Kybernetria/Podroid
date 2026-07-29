@@ -281,30 +281,30 @@ class EngineHolder @Inject constructor(
             observed.quiescent.first { it }
             firstPickPublished.set(true)
             val next = pick(newSel)
-            val published = engineRouter.publishSelection(
+            when (val publication = engineRouter.publishSelection(
                 expected = observed,
                 next = next,
                 canPublish = { it.quiescent.value },
-            )
-            if (published) {
-                if (next !== observed) {
-                    android.util.Log.i(TAG, "swap: ${observed.backendId} → ${next.backendId}")
-                    appliedRules = emptySet()
-                    // Fresh selection: the swapped-in @Singleton engine may retain a stale
-                    // terminal state from a prior cycle; clear the marker so the state flow
-                    // surfaces Idle until this engine is started again.
-                    startedEngine = null
+            )) {
+                SelectionPublication.Published -> {
+                    if (next !== observed) {
+                        android.util.Log.i(TAG, "swap: ${observed.backendId} → ${next.backendId}")
+                        appliedRules = emptySet()
+                        // Fresh selection: the swapped-in @Singleton engine may retain a stale
+                        // terminal state from a prior cycle; clear the marker so the state flow
+                        // surfaces Idle until this engine is started again.
+                        startedEngine = null
+                    }
+                    return
                 }
-                return
+                SelectionPublication.Retry -> Unit
+                is SelectionPublication.ClaimActive -> {
+                    // Selection never owns lifecycle cleanup. Only start() retains
+                    // the opaque claim token, so a swap can merely await its
+                    // explicit release signal before retrying.
+                    engineRouter.awaitClaimReleased(publication)
+                }
             }
-            // A lifecycle claim won the race. Do not spin or hold the gate for
-            // its lifetime; wait on the claimed engine's cleanup signal.
-            val claimed = currentFlow.value
-            claimed.quiescent.first { it }
-            // The cleanup signal itself is sufficient to release the matching
-            // claim. This also avoids a retry loop starving the watcher on the
-            // holder's single-thread dispatcher once quiescence is already true.
-            engineRouter.releaseClaim(claimed)
         }
     }
 
@@ -374,7 +374,8 @@ class EngineHolder @Inject constructor(
         // The claim and a concurrent swap publish are one atomic decision. The
         // gate is released immediately; only the engine identity remains bound
         // until its authoritative cleanup-complete signal.
-        val claimedEngine = engineRouter.claimSelected { it.quiescent.value }
+        val claim = engineRouter.claimSelected { it.quiescent.value }
+        val claimedEngine = claim.engine
         require(config.vmId == claimedEngine.vmId) {
             "Engine holder ${claimedEngine.vmId.serialized} cannot start ${config.vmId.serialized}"
         }
@@ -384,10 +385,11 @@ class EngineHolder @Inject constructor(
             claimedEngine.start(portForwards, config)
         } finally {
             // AVF start may return before its lifecycle ends; QEMU normally
-            // returns after cleanup. In both cases release only after quiescence.
+            // returns after cleanup. In both cases this start generation alone
+            // retains and releases its exact claim after authoritative cleanup.
             scope.launch {
                 claimedEngine.quiescent.first { it }
-                engineRouter.releaseClaim(claimedEngine)
+                engineRouter.releaseClaim(claim)
             }
         }
     }

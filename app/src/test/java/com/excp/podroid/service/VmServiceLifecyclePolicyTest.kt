@@ -30,6 +30,60 @@ class VmServiceLifecyclePolicyTest {
     }
 
     @Test
+    fun `cleanup completed before first observer emission tears down`() {
+        val firstEmission = VmServiceLifecyclePolicy.decide(
+            VmLifecycleState.STOPPED,
+            quiescent = true,
+            busy = false,
+            pendingStartOwned = false,
+        )
+
+        assertTrue(firstEmission.teardown)
+        assertFalse(firstEmission.retainSupervision)
+    }
+
+    @Test
+    fun `prior terminal replay is suppressed only during owned pending start`() {
+        val replayDuringStart = VmServiceLifecyclePolicy.decide(
+            VmLifecycleState.STOPPED,
+            quiescent = true,
+            busy = false,
+            pendingStartOwned = true,
+        )
+        assertFalse(replayDuringStart.teardown)
+        assertTrue(replayDuringStart.retainSupervision)
+
+        val immediatelyReevaluatedAfterAcceptance = VmServiceLifecyclePolicy.decide(
+            VmLifecycleState.STOPPED,
+            quiescent = true,
+            busy = false,
+            pendingStartOwned = false,
+        )
+        assertTrue(immediatelyReevaluatedAfterAcceptance.teardown)
+    }
+
+    @Test
+    fun `ACTION_START always supervises busy runtime without duplicate launch`() {
+        val start = VmServiceStartPolicy.decide(
+            managerBusy = true,
+            pendingStartOwned = false,
+        )
+        assertTrue(start.armSupervision)
+        assertTrue(start.acquireWakeLock)
+        assertFalse(start.launchNewGeneration)
+
+        val busyRuntime = VmServiceLifecyclePolicy.decide(
+            VmLifecycleState.STARTING,
+            quiescent = false,
+            busy = true,
+        )
+
+        assertTrue(busyRuntime.retainSupervision)
+        assertFalse(busyRuntime.teardown)
+        assertEquals(VmServiceNotification.STARTING, busyRuntime.notification)
+    }
+
+    @Test
     fun `persistent cleanup rejection never tears down or drops runtime channels`() {
         repeat(3) {
             val rejected = VmServiceLifecyclePolicy.decide(

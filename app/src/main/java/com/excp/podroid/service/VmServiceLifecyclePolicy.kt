@@ -16,18 +16,32 @@ internal data class VmServiceLifecycleDecision(
     val notification: VmServiceNotification,
 )
 
+internal data class VmServiceStartDecision(
+    val launchNewGeneration: Boolean,
+    val armSupervision: Boolean = true,
+    val acquireWakeLock: Boolean = true,
+)
+
+/** Pure ACTION_START policy: busy work is supervised but never relaunched. */
+internal object VmServiceStartPolicy {
+    fun decide(managerBusy: Boolean, pendingStartOwned: Boolean) = VmServiceStartDecision(
+        launchNewGeneration = !managerBusy && !pendingStartOwned,
+    )
+}
+
 /** Pure adapter from manager lifecycle signals to foreground-service effects. */
 internal object VmServiceLifecyclePolicy {
     fun decide(
         lifecycle: VmLifecycleState,
         quiescent: Boolean,
         busy: Boolean,
+        pendingStartOwned: Boolean = false,
     ): VmServiceLifecycleDecision {
         val terminal = lifecycle == VmLifecycleState.IDLE ||
             lifecycle == VmLifecycleState.STOPPED || lifecycle == VmLifecycleState.ERROR
         return VmServiceLifecycleDecision(
-            retainSupervision = busy || !quiescent,
-            teardown = terminal && quiescent && !busy,
+            retainSupervision = pendingStartOwned || busy || !quiescent,
+            teardown = terminal && quiescent && !busy && !pendingStartOwned,
             runtimeChannels = when {
                 lifecycle == VmLifecycleState.RUNNING -> RuntimeChannelDirective.START
                 quiescent -> RuntimeChannelDirective.STOP

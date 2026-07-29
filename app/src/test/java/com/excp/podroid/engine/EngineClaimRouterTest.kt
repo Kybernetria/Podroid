@@ -3,6 +3,7 @@ package com.excp.podroid.engine
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -33,12 +34,12 @@ class EngineClaimRouterTest {
         }
 
         selectionPaused.await()
-        val claimed = router.claimSelected { it.quiescent }
-        claimed.quiescent = false
-        claimed.starts++
+        val claim = router.claimSelected { it.quiescent }
+        claim.engine.quiescent = false
+        claim.engine.starts++
         releaseSelection.complete(Unit)
 
-        assertFalse(selection.await())
+        assertTrue(selection.await() is SelectionPublication.ClaimActive)
         assertSame(old, router.routed.value)
         router.routed.value.removals++
         assertEquals(1, old.starts)
@@ -47,23 +48,57 @@ class EngineClaimRouterTest {
         assertEquals(0, next.removals)
 
         old.quiescent = true
-        assertTrue(router.releaseClaim(old))
-        assertTrue(router.publishSelection(old, next) { it.quiescent })
+        assertTrue(router.releaseClaim(claim))
+        assertSame(
+            SelectionPublication.Published,
+            router.publishSelection(old, next) { it.quiescent },
+        )
         assertSame(next, router.routed.value)
     }
 
     @Test
-    fun `stale cleanup cannot release a newer engine claim`() = runBlocking {
-        val first = FakeEngine("first")
-        val second = FakeEngine("second")
-        val router = EngineClaimRouter(first)
+    fun `same engine ABA stale release cannot clear newer generation`() = runBlocking {
+        val engine = FakeEngine("same-singleton")
+        val router = EngineClaimRouter(engine)
 
-        assertSame(first, router.claimSelected { true })
-        assertTrue(router.releaseClaim(first))
-        assertTrue(router.publishSelection(first, second) { true })
-        assertSame(second, router.claimSelected { true })
+        val firstGeneration = router.claimSelected { true }
+        assertTrue(router.releaseClaim(firstGeneration))
+        val secondGeneration = router.claimSelected { true }
 
-        assertFalse(router.releaseClaim(first))
-        assertSame(second, router.routed.value)
+        assertFalse(router.releaseClaim(firstGeneration))
+        assertSame(engine, router.routed.value)
+        assertTrue(router.releaseClaim(secondGeneration))
+    }
+
+    @Test
+    fun `swap paused between claim and start waits for start owner release`() = runBlocking {
+        val old = FakeEngine("old")
+        val next = FakeEngine("next")
+        val router = EngineClaimRouter(old)
+        val claim = router.claimSelected { it.quiescent }
+        val publicationAttempted = CompletableDeferred<Unit>()
+
+        val swap = async {
+            val publication = router.publishSelection(old, next) { it.quiescent }
+            assertTrue(publication is SelectionPublication.ClaimActive)
+            publicationAttempted.complete(Unit)
+            router.awaitClaimReleased(publication as SelectionPublication.ClaimActive)
+            router.publishSelection(old, next) { it.quiescent }
+        }
+
+        publicationAttempted.await()
+        yield()
+        assertFalse("swap must not release a lifecycle claim", swap.isCompleted)
+        assertSame(old, router.routed.value)
+
+        // The owning start generation begins only after the swap has already
+        // observed the otherwise-quiescent backend.
+        claim.engine.quiescent = false
+        claim.engine.starts++
+        claim.engine.quiescent = true
+        assertTrue(router.releaseClaim(claim))
+
+        assertSame(SelectionPublication.Published, swap.await())
+        assertSame(next, router.routed.value)
     }
 }
