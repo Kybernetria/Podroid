@@ -10,14 +10,20 @@ import selectors
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 MAX_SOURCE_ENTRIES = 2_000
 MAX_SOURCE_FILE_BYTES = 16 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024
+MAX_APK_BYTES = MAX_ARTIFACT_BYTES + 512 * 1024 * 1024
+MAX_APK_ENTRIES = 20_000
+MAX_APK_CENTRAL_DIRECTORY_BYTES = 16 * 1024 * 1024
 MAX_ARTIFACT_INODES = 100_000
 MAX_ARTIFACT_EXPANDED_BYTES = 8 * 1024 * 1024 * 1024
 MAX_METADATA_OUTPUT_BYTES = 64 * 1024
@@ -25,6 +31,12 @@ MAX_LISTING_OUTPUT_BYTES = 64 * 1024 * 1024
 MAX_CAT_OUTPUT_BYTES = 1024 * 1024
 TOOL_TIMEOUT_SECONDS = 60.0
 CAT_TIMEOUT_SECONDS = 20.0
+APK_STREAM_TIMEOUT_SECONDS = 120.0
+APK_ROOTFS_ENTRY = "assets/alpine-rootfs.squashfs"
+APK_ROOTFS_BASENAME = "alpine-rootfs.squashfs"
+ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
+ZIP_EOCD_SIZE = 22
+ZIP_MAX_COMMENT_BYTES = 65_535
 
 SHA512_CRYPT = re.compile(rb"^\$6\$[./0-9A-Za-z]{1,16}\$[./0-9A-Za-z]{86}$")
 SHA512_CRYPT_FRAGMENT = re.compile(rb"\$6\$[./0-9A-Za-z]{1,16}\$[./0-9A-Za-z]{86}")
@@ -465,12 +477,149 @@ def verify_artifact(repo_root: Path, artifact: Path) -> None:
         os.close(artifact_fd)
 
 
+def apk_entry_count(apk_file, apk_size: int) -> int:
+    tail_size = min(apk_size, ZIP_EOCD_SIZE + ZIP_MAX_COMMENT_BYTES)
+    apk_file.seek(apk_size - tail_size)
+    tail = apk_file.read(tail_size)
+    offset = tail.rfind(ZIP_EOCD_SIGNATURE)
+    while offset >= 0:
+        if offset + ZIP_EOCD_SIZE <= len(tail):
+            fields = struct.unpack_from("<4s4H2IH", tail, offset)
+            comment_size = fields[-1]
+            if offset + ZIP_EOCD_SIZE + comment_size == len(tail):
+                break
+        offset = tail.rfind(ZIP_EOCD_SIGNATURE, 0, offset)
+    if offset < 0:
+        fail("APK is not a well-formed bounded ZIP archive")
+
+    _, disk_number, central_disk, disk_entries, total_entries, central_size, central_offset, _ = fields
+    if disk_number != 0 or central_disk != 0 or disk_entries != total_entries:
+        fail("APK uses unsupported split ZIP metadata")
+    if total_entries == 0xFFFF or central_size == 0xFFFFFFFF or central_offset == 0xFFFFFFFF:
+        fail("APK uses unsupported ZIP64 metadata")
+    if total_entries > MAX_APK_ENTRIES:
+        fail(f"APK contains more than {MAX_APK_ENTRIES} declared entries")
+    if central_size > MAX_APK_CENTRAL_DIRECTORY_BYTES:
+        fail("APK central directory exceeds its 16 MiB bound")
+    eocd_offset = apk_size - tail_size + offset
+    if central_offset + central_size != eocd_offset:
+        fail("APK central directory metadata is inconsistent")
+    return total_entries
+
+
+def rootfs_like_apk_name(name: str) -> bool:
+    normalized_separators = name.replace("\\", "/").rstrip("/")
+    return normalized_separators.rsplit("/", 1)[-1] == APK_ROOTFS_BASENAME
+
+
+def copy_apk_rootfs(archive: zipfile.ZipFile, entry: zipfile.ZipInfo, destination: Path) -> None:
+    if not 0 < entry.file_size <= MAX_ARTIFACT_BYTES:
+        fail("packaged rootfs is empty or exceeds 1 GiB declared-size bound")
+    if entry.compress_size > MAX_APK_BYTES:
+        fail("packaged rootfs compressed size exceeds the APK bound")
+    if entry.is_dir() or entry.flag_bits & 0x1:
+        fail("packaged rootfs must be an unencrypted file entry")
+
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    try:
+        output = os.fdopen(descriptor, "wb", closefd=True)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+    actual_size = 0
+    deadline = time.monotonic() + APK_STREAM_TIMEOUT_SECONDS
+    try:
+        with output, archive.open(entry, "r") as source:
+            while True:
+                if time.monotonic() >= deadline:
+                    fail(f"packaged rootfs streaming timed out after {APK_STREAM_TIMEOUT_SECONDS:g}s")
+                chunk = source.read(min(1024 * 1024, MAX_ARTIFACT_BYTES + 1 - actual_size))
+                if time.monotonic() >= deadline:
+                    fail(f"packaged rootfs streaming timed out after {APK_STREAM_TIMEOUT_SECONDS:g}s")
+                if not chunk:
+                    break
+                actual_size += len(chunk)
+                if actual_size > MAX_ARTIFACT_BYTES:
+                    fail("packaged rootfs exceeds 1 GiB actual-size bound")
+                output.write(chunk)
+    except VerificationError:
+        raise
+    except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as exc:
+        fail(f"cannot safely stream packaged rootfs: {exc}")
+    if actual_size != entry.file_size:
+        fail("packaged rootfs actual size differs from ZIP metadata")
+
+
+def verify_apk(repo_root: Path, apk: Path, require_rootfs: bool) -> None:
+    try:
+        apk_fd = os.open(apk, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        fail(f"cannot open APK without symlink traversal {apk}: {exc}")
+    try:
+        metadata = os.fstat(apk_fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            fail("APK must be a regular file, not a symlink or special file")
+        if not 0 < metadata.st_size <= MAX_APK_BYTES:
+            fail("APK is empty or exceeds 1.5 GiB size bound")
+
+        with tempfile.TemporaryDirectory(prefix="podroid-rootfs-verification-") as temporary:
+            temporary_rootfs = Path(temporary) / APK_ROOTFS_BASENAME
+            try:
+                with os.fdopen(os.dup(apk_fd), "rb", closefd=True) as apk_file:
+                    declared_entries = apk_entry_count(apk_file, metadata.st_size)
+                    apk_file.seek(0)
+                    with zipfile.ZipFile(apk_file, "r") as archive:
+                        entries = archive.infolist()
+                        if len(entries) != declared_entries:
+                            fail("APK entry count differs from end-of-directory metadata")
+                        seen_names = set()
+                        rootfs_entry = None
+                        for entry in entries:
+                            if entry.orig_filename != entry.filename or "\x00" in entry.orig_filename:
+                                fail("APK contains a NUL-confused entry name")
+                            if entry.filename in seen_names:
+                                fail(f"APK contains duplicate entry: {entry.filename!r}")
+                            seen_names.add(entry.filename)
+                            if rootfs_like_apk_name(entry.filename):
+                                if entry.filename != APK_ROOTFS_ENTRY:
+                                    fail(f"APK contains a path-confused rootfs entry: {entry.filename!r}")
+                                if rootfs_entry is not None:
+                                    fail("APK contains duplicate rootfs entries")
+                                rootfs_entry = entry
+
+                        if rootfs_entry is None:
+                            if require_rootfs:
+                                fail(f"APK is missing required {APK_ROOTFS_ENTRY}")
+                            return
+                        copy_apk_rootfs(archive, rootfs_entry, temporary_rootfs)
+            except VerificationError:
+                raise
+            except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as exc:
+                fail(f"malformed APK ZIP: {exc}")
+
+            verify_artifact(repo_root, temporary_rootfs)
+    finally:
+        os.close(apk_fd)
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Verify guest credential sources and, when explicitly supplied, a rootfs artifact."
+        description="Verify guest credential sources, a SquashFS artifact, or its exact packaged APK entry."
     )
     parser.add_argument("artifact", nargs="?", type=Path, help="explicit SquashFS artifact to inspect")
-    return parser.parse_args(argv)
+    parser.add_argument("--apk", type=Path, help="APK whose exact packaged rootfs entry is inspected")
+    parser.add_argument(
+        "--require-rootfs",
+        action="store_true",
+        help="fail when --apk does not contain the expected rootfs entry",
+    )
+    args = parser.parse_args(argv)
+    if args.artifact is not None and args.apk is not None:
+        parser.error("artifact and --apk are mutually exclusive")
+    if args.require_rootfs and args.apk is None:
+        parser.error("--require-rootfs requires --apk")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -481,10 +630,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.artifact is not None:
             artifact = args.artifact if args.artifact.is_absolute() else repo_root / args.artifact
             verify_artifact(repo_root, artifact)
+        elif args.apk is not None:
+            apk = args.apk if args.apk.is_absolute() else repo_root / args.apk
+            verify_apk(repo_root, apk, args.require_rootfs)
     except (VerificationError, OSError) as exc:
         print(f"guest credential verification failed: {exc}", file=sys.stderr)
         return 1
-    suffix = " and explicit artifact" if args.artifact is not None else ""
+    suffix = " and explicit artifact" if args.artifact is not None else " and packaged APK" if args.apk else ""
     print(f"Guest credential source{suffix} verification passed.")
     return 0
 

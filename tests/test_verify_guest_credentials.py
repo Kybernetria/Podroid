@@ -3,9 +3,12 @@
 import importlib.util
 import os
 import stat
+import struct
 import subprocess
 import tempfile
 import unittest
+import warnings
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -16,6 +19,7 @@ verifier = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(verifier)
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_ROOTFS = REPO_ROOT / "app/src/main/assets/alpine-rootfs.squashfs"
+MOCK_PACKAGED_ROOTFS = b"valid rootfs" * 100
 
 
 def sha512_crypt(password: str, salt: str = "testsalt") -> bytes:
@@ -32,6 +36,14 @@ def sha512_crypt(password: str, salt: str = "testsalt") -> bytes:
 
 def shadow_with(root_hash: bytes) -> bytes:
     return b"root:" + root_hash + b":20000:0:99999:7:::\nmessagebus:!:20000::::::\n"
+
+
+def write_apk(path: Path, entries: list[tuple[str, bytes]]) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+            for name, data in entries:
+                archive.writestr(name, data)
 
 
 class MockArtifact:
@@ -197,6 +209,85 @@ class GuestCredentialVerifierTest(unittest.TestCase):
         del artifact.files["etc/issue"]
         with self.assertRaisesRegex(verifier.VerificationError, "failed while reading etc/issue"):
             self.verify_mock_artifact(artifact)
+
+    def verify_mock_apk(self, entries, *, require_rootfs=False, expected_rootfs=MOCK_PACKAGED_ROOTFS):
+        with tempfile.TemporaryDirectory() as temporary:
+            apk = Path(temporary) / "app.apk"
+            write_apk(apk, entries)
+            artifact = MockArtifact()
+
+            def bounded_for_packaged_bytes(command, **kwargs):
+                if "-s" in command:
+                    packaged_path = Path(command[-1])
+                    if packaged_path.read_bytes() != expected_rootfs:
+                        raise verifier.VerificationError("tampered packaged rootfs")
+                return artifact.run_bounded(command, **kwargs)
+
+            with mock.patch.object(verifier.shutil, "which", return_value="/mock/tool"), mock.patch.object(
+                verifier, "run_bounded", side_effect=bounded_for_packaged_bytes
+            ):
+                verifier.verify_apk(Path(temporary), apk, require_rootfs)
+
+    def test_apk_present_rootfs_is_streamed_and_semantically_verified(self):
+        self.verify_mock_apk(
+            [("AndroidManifest.xml", b"manifest"), (verifier.APK_ROOTFS_ENTRY, MOCK_PACKAGED_ROOTFS)]
+        )
+
+    def test_debug_apk_may_omit_rootfs(self):
+        self.verify_mock_apk([("AndroidManifest.xml", b"manifest")])
+
+    def test_release_apk_must_contain_rootfs(self):
+        with self.assertRaisesRegex(verifier.VerificationError, "missing required"):
+            self.verify_mock_apk([("AndroidManifest.xml", b"manifest")], require_rootfs=True)
+
+    def test_apk_rejects_duplicate_and_path_confused_rootfs_entries(self):
+        cases = {
+            "duplicate": [
+                (verifier.APK_ROOTFS_ENTRY, MOCK_PACKAGED_ROOTFS),
+                (verifier.APK_ROOTFS_ENTRY, MOCK_PACKAGED_ROOTFS),
+            ],
+            "parent component": [("assets/../assets/alpine-rootfs.squashfs", MOCK_PACKAGED_ROOTFS)],
+            "backslash": [(r"assets\alpine-rootfs.squashfs", MOCK_PACKAGED_ROOTFS)],
+            "wrong directory": [("other/alpine-rootfs.squashfs", MOCK_PACKAGED_ROOTFS)],
+        }
+        for name, entries in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(
+                verifier.VerificationError, "duplicate|path-confused"
+            ):
+                self.verify_mock_apk(entries)
+
+    def test_apk_rejects_oversize_declared_rootfs_before_streaming(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            apk = Path(temporary) / "oversize.apk"
+            write_apk(apk, [(verifier.APK_ROOTFS_ENTRY, b"x")])
+            data = bytearray(apk.read_bytes())
+            central_offset = data.index(b"PK\x01\x02")
+            struct.pack_into("<I", data, central_offset + 24, verifier.MAX_ARTIFACT_BYTES + 1)
+            apk.write_bytes(data)
+            with self.assertRaisesRegex(verifier.VerificationError, "declared-size bound"):
+                verifier.verify_apk(Path(temporary), apk, require_rootfs=True)
+
+    def test_apk_rejects_malformed_zip(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            apk = Path(temporary) / "malformed.apk"
+            apk.write_bytes(b"not a ZIP archive")
+            with self.assertRaisesRegex(verifier.VerificationError, "well-formed bounded ZIP"):
+                verifier.verify_apk(Path(temporary), apk, require_rootfs=False)
+
+    def test_apk_rejects_tampered_packaged_rootfs(self):
+        with self.assertRaisesRegex(verifier.VerificationError, "tampered packaged rootfs"):
+            self.verify_mock_apk(
+                [(verifier.APK_ROOTFS_ENTRY, b"tampered rootfs")],
+                expected_rootfs=MOCK_PACKAGED_ROOTFS,
+            )
+
+    def test_apk_rootfs_streaming_deadline_is_enforced(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            apk = Path(temporary) / "slow.apk"
+            write_apk(apk, [(verifier.APK_ROOTFS_ENTRY, MOCK_PACKAGED_ROOTFS)])
+            with mock.patch.object(verifier.time, "monotonic", side_effect=[0.0, 121.0]):
+                with self.assertRaisesRegex(verifier.VerificationError, "streaming timed out"):
+                    verifier.verify_apk(Path(temporary), apk, require_rootfs=True)
 
     def test_missing_artifact_is_rejected_before_tool_execution(self):
         with tempfile.TemporaryDirectory() as temporary:

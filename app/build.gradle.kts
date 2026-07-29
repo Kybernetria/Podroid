@@ -14,6 +14,8 @@ plugins {
 val podroidQemuVersion = providers.gradleProperty("podroidQemuVersion").get()
 
 val guestRootfs = rootProject.file("app/src/main/assets/alpine-rootfs.squashfs")
+val debugApk = layout.buildDirectory.file("outputs/apk/debug/app-debug.apk")
+val releaseApk = layout.buildDirectory.file("outputs/apk/release/app-release.apk")
 
 val verifyGuestCredentialSources by tasks.registering(Exec::class) {
     group = "verification"
@@ -66,12 +68,49 @@ val requireGuestRootfsForRelease by tasks.registering(Exec::class) {
     )
 }
 
+val verifyPackagedDebugGuestCredentials by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Checks the exact optional rootfs entry packaged in the debug APK."
+    workingDir(rootProject.projectDir)
+    commandLine(
+        "python3",
+        rootProject.file("tests/verify_guest_credentials.py"),
+        "--apk",
+        debugApk.get().asFile
+    )
+    inputs.files(debugApk, rootProject.file("tests/verify_guest_credentials.py"))
+    outputs.upToDateWhen { false }
+}
+
+val verifyPackagedReleaseGuestCredentials by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Requires and checks the exact rootfs entry packaged in the release APK."
+    workingDir(rootProject.projectDir)
+    commandLine(
+        "python3",
+        rootProject.file("tests/verify_guest_credentials.py"),
+        "--apk",
+        releaseApk.get().asFile,
+        "--require-rootfs"
+    )
+    inputs.files(releaseApk, rootProject.file("tests/verify_guest_credentials.py"))
+    outputs.upToDateWhen { false }
+}
+
 tasks.named("preBuild") {
     dependsOn(verifyGuestCredentialSources, verifyGuestCredentialArtifact)
 }
 
 tasks.matching { it.name == "preReleaseBuild" }.configureEach {
     dependsOn(requireGuestRootfsForRelease)
+}
+
+tasks.matching { it.name == "assembleDebug" }.configureEach {
+    finalizedBy(verifyPackagedDebugGuestCredentials)
+}
+
+tasks.matching { it.name == "assembleRelease" }.configureEach {
+    finalizedBy(verifyPackagedReleaseGuestCredentials)
 }
 
 tasks.named("check") {
