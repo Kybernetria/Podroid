@@ -6,6 +6,7 @@ package com.excp.podroid.engine
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Process
 import androidx.core.content.ContextCompat
 import com.excp.podroid.engine.avf.AvfReflect
 import com.excp.podroid.vm.*
@@ -27,14 +28,22 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
 internal interface QemuRuntimeQmp {
-    suspend fun queryStatus(): Result<String>
-    suspend fun quit(): Result<Unit>
+    suspend fun queryStatus(owner: QemuRuntimeOwner): Result<String>
+    suspend fun quit(owner: QemuRuntimeOwner): Result<Unit>
 }
 
-private class QemuRuntimeQmpClient(socketPath: String, timeoutMs: Long) : QemuRuntimeQmp {
-    private val client = QmpClient(socketPath, timeoutMs)
-    override suspend fun queryStatus() = client.queryStatus()
-    override suspend fun quit() = client.quit()
+private class QemuRuntimeQmpClient(
+    private val socketPath: String,
+    private val timeoutMs: Long,
+    private val ownerStore: QemuRuntimeOwnerStore,
+) : QemuRuntimeQmp {
+    private fun client(owner: QemuRuntimeOwner) = QmpClient(
+        socketPath,
+        timeoutMs,
+        peerVerifier = QemuOwnerPeerVerifier(ownerStore, owner, Process.myUid()),
+    )
+    override suspend fun queryStatus(owner: QemuRuntimeOwner) = client(owner).queryStatus()
+    override suspend fun quit(owner: QemuRuntimeOwner) = client(owner).quit()
 }
 
 internal class QemuNamedRuntimeProbe(
@@ -42,7 +51,9 @@ internal class QemuNamedRuntimeProbe(
     private val ownerStore: QemuRuntimeOwnerStore,
     private val fixedRuntimeEndpoints: List<File> = listOf(qmpSocket),
     private val timeoutMs: Long = QmpClient.SOCKET_TIMEOUT_MS,
-    private val qmp: QemuRuntimeQmp = QemuRuntimeQmpClient(qmpSocket.absolutePath, timeoutMs),
+    private val qmp: QemuRuntimeQmp = QemuRuntimeQmpClient(
+        qmpSocket.absolutePath, timeoutMs, ownerStore,
+    ),
 ) : NamedRuntimeProbe {
     override val backend = RuntimeBackend.QEMU
     @Volatile private var liveOwner: QemuRuntimeOwner? = null
@@ -64,9 +75,17 @@ internal class QemuNamedRuntimeProbe(
         if (attributes.isSymbolicLink || attributes.isDirectory || attributes.isRegularFile) {
             return RuntimeProbeResult.Uncertain(LifecycleErrorCode.SECURITY, runtimeMayBeLive = true)
         }
-        return qmp.queryStatus().fold(
+        val validOwner = owner as? QemuOwnerInspection.Valid ?: return classifyDeadOwner(owner)
+        when (val proof = ownerStore.proveDead(validOwner)) {
+            is DeadOwnerProof.Proven -> return RuntimeProbeResult.StaleEndpoints(proof.evidence)
+            is DeadOwnerProof.Uncertain -> return RuntimeProbeResult.Uncertain(
+                proof.errorCode, runtimeMayBeLive = true,
+            )
+            DeadOwnerProof.ExactProcessAlive -> Unit
+        }
+        return qmp.queryStatus(validOwner.owner).fold(
             onSuccess = {
-                liveOwner = (owner as? QemuOwnerInspection.Valid)?.owner
+                liveOwner = validOwner.owner
                 RuntimeProbeResult.Live(RuntimeBackend.QEMU)
             },
             onFailure = { failure ->
@@ -89,7 +108,10 @@ internal class QemuNamedRuntimeProbe(
         )
     }
 
-    override suspend fun stopLiveRuntime(): Boolean = qmp.quit().isSuccess
+    override suspend fun stopLiveRuntime(): Boolean {
+        val owner = liveOwner ?: return false
+        return qmp.quit(owner).isSuccess
+    }
 
     override suspend fun awaitStopped(): Boolean {
         val owner = liveOwner ?: return false

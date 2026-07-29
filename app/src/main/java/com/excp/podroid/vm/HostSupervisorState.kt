@@ -84,7 +84,9 @@ data class ReconciliationMetadata(
 ) {
     init {
         require(consecutiveAttempts in 0..MAX_ATTEMPTS) { "reconciliation attempt count is out of bounds" }
-        require(nextEligibleEpochMs >= 0) { "next reconciliation timestamp must be non-negative" }
+        require(nextEligibleEpochMs in 0..MAX_EPOCH_MS) {
+            "next reconciliation timestamp is outside the supported wall-clock range"
+        }
         when (lastOutcome) {
             ReconciliationOutcome.NEVER_RUN -> require(
                 consecutiveAttempts == 0 && nextEligibleEpochMs == 0L &&
@@ -103,7 +105,8 @@ data class ReconciliationMetadata(
                     lastTrigger != null && lastErrorCode != null,
             ) { "backoff reconciliation metadata is inconsistent" }
             ReconciliationOutcome.EXHAUSTED -> require(
-                consecutiveAttempts == MAX_ATTEMPTS && lastTrigger != null && lastErrorCode != null,
+                consecutiveAttempts == MAX_ATTEMPTS && nextEligibleEpochMs == 0L &&
+                    lastTrigger != null && lastErrorCode != null,
             ) { "exhausted reconciliation metadata is inconsistent" }
             ReconciliationOutcome.SUCCEEDED -> require(
                 consecutiveAttempts == 0 && nextEligibleEpochMs == 0L &&
@@ -127,6 +130,7 @@ data class ReconciliationMetadata(
 
     companion object {
         const val MAX_ATTEMPTS = 5
+        const val MAX_EPOCH_MS = 253_402_300_799_999L // 9999-12-31T23:59:59.999Z
         fun safeDefaults() = ReconciliationMetadata(
             consecutiveAttempts = 0,
             nextEligibleEpochMs = 0,
@@ -147,16 +151,27 @@ data class HostSupervisorState(
     val powerPolicy: HostPowerPolicy,
     val thermalPolicy: HostThermalPolicy,
     val runtimeGeneration: Long,
+    val runtimeMayBeLive: Boolean,
+    val runtimeEvidenceVersion: Long,
     val latestTransaction: LifecycleTransaction?,
     val reconciliation: ReconciliationMetadata,
 ) {
     init {
         require(schemaVersion == SCHEMA_VERSION) { "unsupported Host supervisor schema" }
         require(runtimeGeneration >= 0) { "runtime generation must be non-negative" }
+        require(runtimeEvidenceVersion >= 0) { "runtime evidence version must be non-negative" }
+        require(!runtimeMayBeLive || runtimeEvidenceVersion > 0) {
+            "possible-live evidence requires a positive version"
+        }
+        if (latestTransaction?.outcome == LifecycleOutcome.SUCCEEDED &&
+            latestTransaction.operation in setOf(LifecycleOperation.STOP, LifecycleOperation.FORCE_STOP)
+        ) {
+            require(!runtimeMayBeLive) { "successful explicit stop requires definitive runtime absence" }
+        }
     }
 
     companion object {
-        const val SCHEMA_VERSION = 2
+        const val SCHEMA_VERSION = 3
 
         /** Fail-safe initialization used only when the v0 record is absent. */
         fun safeDefaults() = HostSupervisorState(
@@ -168,6 +183,8 @@ data class HostSupervisorState(
             powerPolicy = HostPowerPolicy.GRACEFUL_THEN_FORCE,
             thermalPolicy = HostThermalPolicy.STOP_AT_CRITICAL,
             runtimeGeneration = 0,
+            runtimeMayBeLive = false,
+            runtimeEvidenceVersion = 0,
             latestTransaction = null,
             reconciliation = ReconciliationMetadata.safeDefaults(),
         )

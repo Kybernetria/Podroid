@@ -23,6 +23,37 @@ class RuntimePreflightCoordinatorTest {
         )
     }
 
+    @Test fun `QEMU confirmed reap with removed endpoints is definitive absence`() = runBlocking {
+        val qemu = FakeProbe(
+            RuntimeBackend.QEMU,
+            RuntimeProbeResult.Live(RuntimeBackend.QEMU),
+        ).apply { removeEndpointsOnStop = true }
+        val coordinator = RuntimePreflightCoordinator(
+            qemu,
+            FakeProbe(RuntimeBackend.AVF, RuntimeProbeResult.Absent),
+        ) {}
+
+        coordinator.ensureAllFixedRuntimesStopped()
+
+        assertEquals(1, qemu.stopCalls)
+        assertEquals(RuntimeProbeResult.Absent, qemu.result)
+    }
+
+    @Test fun `AVF live stop is re-probed by fixed name before success`() = runBlocking {
+        val events = mutableListOf<String>()
+        val coordinator = RuntimePreflightCoordinator(
+            FakeProbe(RuntimeBackend.QEMU, RuntimeProbeResult.Absent, events),
+            FakeProbe(RuntimeBackend.AVF, RuntimeProbeResult.Live(RuntimeBackend.AVF), events),
+        ) {}
+
+        coordinator.ensureAllFixedRuntimesStopped()
+
+        assertEquals(
+            listOf("probe:QEMU", "probe:AVF", "stop:AVF", "await:AVF", "probe:AVF"),
+            events,
+        )
+    }
+
     @Test fun `stale sockets clean only after typed no-runtime result`() = runBlocking {
         var cleaned = 0
         val coordinator = RuntimePreflightCoordinator(
@@ -118,6 +149,7 @@ class RuntimePreflightCoordinatorTest {
     ) : NamedRuntimeProbe {
         var stopCalls = 0
         var stopResult = true
+        var removeEndpointsOnStop = false
         override suspend fun probe(): RuntimeProbeResult {
             events += "probe:$backend"
             return result
@@ -126,7 +158,7 @@ class RuntimePreflightCoordinatorTest {
             events += "stop:$backend"
             stopCalls++
             if (delayMs > 0) delay(delayMs)
-            if (stopResult) result = if (backend == RuntimeBackend.QEMU) {
+            if (stopResult) result = if (backend == RuntimeBackend.QEMU && !removeEndpointsOnStop) {
                 RuntimeProbeResult.StaleEndpoints(Evidence)
             } else RuntimeProbeResult.Absent
             return stopResult

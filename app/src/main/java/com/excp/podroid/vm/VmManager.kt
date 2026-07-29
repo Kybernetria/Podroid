@@ -143,11 +143,16 @@ interface VmManager {
         vmId: VmId,
         trigger: ReconciliationTrigger,
     ): ReconciliationAdmission = throw UnsupportedOperationException("reconciliation unavailable")
+    /** Stops and proves absence of every fixed backend identity without changing desired state. */
+    suspend fun ensureFixedRuntimesStopped(vmId: VmId): Unit =
+        throw UnsupportedOperationException("runtime reconciliation unavailable")
     suspend fun finishReconciliation(
         vmId: VmId,
         token: ReconciliationAttemptToken,
         outcome: ReconciliationOutcome,
         errorCode: LifecycleErrorCode? = null,
+        runtimeMayBeLive: Boolean = false,
+        authoritativeRuntimeAbsence: Boolean = false,
     ): HostSupervisorState = throw UnsupportedOperationException("reconciliation unavailable")
     /** Persists desired state and one PENDING command before service dispatch. */
     suspend fun prepareLifecycleCommand(
@@ -388,15 +393,31 @@ class DefaultVmManager internal constructor(
         return commandAuthorityMutex.withLock { supervisor.begin(trigger) }
     }
 
+    override suspend fun ensureFixedRuntimesStopped(vmId: VmId) {
+        requireDefault(vmId)
+        awaitInitial(vmId)
+        lifecycleMutex.withLock {
+            check(runtime.quiescent.value) {
+                "In-process runtime must be quiescent before fixed-runtime cleanup"
+            }
+            runtimePreflight?.ensureAllFixedRuntimesStopped()
+                ?: throw IllegalStateException("Fixed-runtime preflight is unavailable")
+        }
+    }
+
     override suspend fun finishReconciliation(
         vmId: VmId,
         token: ReconciliationAttemptToken,
         outcome: ReconciliationOutcome,
         errorCode: LifecycleErrorCode?,
+        runtimeMayBeLive: Boolean,
+        authoritativeRuntimeAbsence: Boolean,
     ): HostSupervisorState {
         requireDefault(vmId)
         return commandAuthorityMutex.withLock {
-            supervisor.finish(token, outcome, errorCode)
+            supervisor.finish(
+                token, outcome, errorCode, runtimeMayBeLive, authoritativeRuntimeAbsence,
+            )
         }
     }
 
@@ -868,7 +889,14 @@ class DefaultVmManager internal constructor(
         stopForceSignal = forceSignal
         val task = scope.async(start = CoroutineStart.LAZY) {
             beforeCoordinatedStop()
-            lifecycleMutex.withLock { coordinatedStopLocked(forceSignal) }
+            lifecycleMutex.withLock {
+                coordinatedStopLocked(forceSignal)
+                check(runtime.quiescent.value) { "In-process runtime is not quiescent after stop" }
+                // Explicit STOP/FORCE_STOP owns all fixed runtime identities, not
+                // only the backend object reconstructed in this process.
+                runtimePreflight?.ensureAllFixedRuntimesStopped()
+                Unit
+            }
         }
         // Publish ownership before dispatch so a superseding START cannot miss
         // a task that has begun but has not yet reached its backend signal.

@@ -48,78 +48,131 @@ private class PreferencesHostSupervisorRecordStore(
 class HostSupervisorSchemaException(message: String) : IOException(message)
 class HostSupervisorCorruptionException(message: String) : IOException(message)
 
-/** Strict bounded codec with the one explicit v1 -> v2 migration. */
+/** Strict bounded codec with atomic v1 -> v2 -> v3 migration. */
 internal object HostSupervisorRecordCodec {
     private const val MAX_ENCODED_CHARS = 2_048
     private const val ABSENT_RESULT = "-"
     private const val V1 = 1
     private const val V2 = 2
+    private const val V3 = 3
 
     fun decodeV0AbsentOrCurrent(encoded: String?): HostSupervisorState = when {
         encoded == null -> HostSupervisorState.safeDefaults()
         schema(encoded) == V1 -> decodeV1(encoded)
         schema(encoded) == V2 -> decodeV2(encoded)
+        schema(encoded) == V3 -> decodeV3(encoded)
         else -> throw HostSupervisorSchemaException(
             "Unsupported Host supervisor schema version ${schema(encoded)}",
         )
     }
 
-    /** Returns a current in-memory value; callers commit [encode] atomically. */
+    /** Legacy values are returned as current in-memory values and committed once by mutate. */
     fun decodeV1(encoded: String): HostSupervisorState {
         val lines = checkedLines(encoded)
         if (parsedSchema(lines) != V1) throw HostSupervisorSchemaException("Not a schema v1 record")
         val common = decodeCommon(lines, transactionIndex = 8, noTransactionCount = 9, transactionCounts = 15..16)
-        return HostSupervisorState(
-            schemaVersion = V2,
-            hostEnabled = common.hostEnabled,
-            desiredState = common.desiredState,
-            autostart = common.autostart,
-            wakePolicy = common.wakePolicy,
-            powerPolicy = common.powerPolicy,
-            thermalPolicy = common.thermalPolicy,
-            runtimeGeneration = common.runtimeGeneration,
-            latestTransaction = common.transaction,
-            reconciliation = ReconciliationMetadata.safeDefaults(),
-        )
+        return currentState(common, ReconciliationMetadata.safeDefaults())
     }
 
     fun decodeV2(encoded: String): HostSupervisorState {
         val lines = checkedLines(encoded)
         if (parsedSchema(lines) != V2) throw HostSupervisorSchemaException("Not a schema v2 record")
         val common = decodeCommon(lines, transactionIndex = 13, noTransactionCount = 14, transactionCounts = 20..21)
-        val triggerRaw = value(lines, 10, "reconcile_last_trigger")
-        val errorRaw = value(lines, 12, "reconcile_last_error")
+        return currentState(common, decodeReconciliation(lines, 8))
+    }
+
+    fun decodeV3(encoded: String): HostSupervisorState {
+        val lines = checkedLines(encoded)
+        if (parsedSchema(lines) != V3) throw HostSupervisorSchemaException("Not a schema v3 record")
+        val common = decodeCommon(lines, transactionIndex = 15, noTransactionCount = 16, transactionCounts = 22..23)
         return construct("record invariants") {
-            HostSupervisorState(
-                schemaVersion = V2,
-                hostEnabled = common.hostEnabled,
-                desiredState = common.desiredState,
-                autostart = common.autostart,
-                wakePolicy = common.wakePolicy,
-                powerPolicy = common.powerPolicy,
-                thermalPolicy = common.thermalPolicy,
-                runtimeGeneration = common.runtimeGeneration,
-                latestTransaction = common.transaction,
-                reconciliation = ReconciliationMetadata(
-                    consecutiveAttempts = value(lines, 8, "reconcile_attempts").toIntOrNull()
-                        ?.takeIf { it >= 0 } ?: corrupt("reconcile_attempts"),
-                    nextEligibleEpochMs = parseNonNegativeLong(
-                        value(lines, 9, "reconcile_next_ms"), "reconcile_next_ms",
-                    ),
-                    lastTrigger = if (triggerRaw == ABSENT_RESULT) null else
-                        parseEnum<ReconciliationTrigger>(triggerRaw, "reconcile_last_trigger"),
-                    lastOutcome = parseEnum(
-                        value(lines, 11, "reconcile_last_outcome"), "reconcile_last_outcome",
-                    ),
-                    lastErrorCode = if (errorRaw == ABSENT_RESULT) null else
-                        parseEnum<LifecycleErrorCode>(errorRaw, "reconcile_last_error"),
+            currentState(
+                common = common,
+                reconciliation = decodeReconciliation(lines, 10),
+                runtimeMayBeLive = parseBoolean(
+                    value(lines, 8, "runtime_may_be_live"), "runtime_may_be_live",
+                ),
+                runtimeEvidenceVersion = parseNonNegativeLong(
+                    value(lines, 9, "runtime_evidence_version"), "runtime_evidence_version",
                 ),
             )
         }
     }
 
+    private fun decodeReconciliation(lines: List<String>, start: Int): ReconciliationMetadata {
+        val triggerRaw = value(lines, start + 2, "reconcile_last_trigger")
+        val errorRaw = value(lines, start + 4, "reconcile_last_error")
+        return construct("reconciliation metadata") {
+            ReconciliationMetadata(
+                consecutiveAttempts = value(lines, start, "reconcile_attempts").toIntOrNull()
+                    ?.takeIf { it >= 0 } ?: corrupt("reconcile_attempts"),
+                nextEligibleEpochMs = parseNonNegativeLong(
+                    value(lines, start + 1, "reconcile_next_ms"), "reconcile_next_ms",
+                ),
+                lastTrigger = if (triggerRaw == ABSENT_RESULT) null else
+                    parseEnum<ReconciliationTrigger>(triggerRaw, "reconcile_last_trigger"),
+                lastOutcome = parseEnum(
+                    value(lines, start + 3, "reconcile_last_outcome"), "reconcile_last_outcome",
+                ),
+                lastErrorCode = if (errorRaw == ABSENT_RESULT) null else
+                    parseEnum<LifecycleErrorCode>(errorRaw, "reconcile_last_error"),
+            )
+        }
+    }
+
+    private fun currentState(
+        common: Common,
+        reconciliation: ReconciliationMetadata,
+        runtimeMayBeLive: Boolean = legacyRuntimeMayBeLive(common.transaction),
+        runtimeEvidenceVersion: Long = if (runtimeMayBeLive) 1 else 0,
+    ) = HostSupervisorState(
+        schemaVersion = V3,
+        hostEnabled = common.hostEnabled,
+        desiredState = common.desiredState,
+        autostart = common.autostart,
+        wakePolicy = common.wakePolicy,
+        powerPolicy = common.powerPolicy,
+        thermalPolicy = common.thermalPolicy,
+        runtimeGeneration = common.runtimeGeneration,
+        runtimeMayBeLive = runtimeMayBeLive,
+        runtimeEvidenceVersion = runtimeEvidenceVersion,
+        latestTransaction = common.transaction,
+        reconciliation = reconciliation,
+    )
+
+    private fun legacyRuntimeMayBeLive(transaction: LifecycleTransaction?): Boolean =
+        transaction?.outcome == LifecycleOutcome.PENDING && (
+            (transaction.effectStarted && transaction.operation != LifecycleOperation.SETUP) ||
+                transaction.operation in setOf(
+                    LifecycleOperation.STOP,
+                    LifecycleOperation.FORCE_STOP,
+                )
+            )
+
     fun encode(state: HostSupervisorState): String = buildString {
+        appendLine("schema=$V3")
+        appendCommon(state)
+        appendLine("runtime_may_be_live=${bit(state.runtimeMayBeLive)}")
+        appendLine("runtime_evidence_version=${state.runtimeEvidenceVersion}")
+        appendReconciliation(state.reconciliation)
+        appendTransaction(state.latestTransaction)
+    }.also { check(it.length <= MAX_ENCODED_CHARS) }
+
+    /** Test/documentation helper for producing the exact legacy schemas. */
+    fun encodeV1ForMigration(state: HostSupervisorState): String = buildString {
+        appendLine("schema=$V1")
+        appendCommon(state)
+        appendTransaction(state.latestTransaction)
+    }
+
+    fun encodeV2ForMigration(state: HostSupervisorState): String = buildString {
         appendLine("schema=$V2")
+        appendCommon(state)
+        appendReconciliation(state.reconciliation)
+        appendTransaction(state.latestTransaction)
+    }
+
+    private fun StringBuilder.appendCommon(state: HostSupervisorState) {
         appendLine("host_enabled=${bit(state.hostEnabled)}")
         appendLine("desired_state=${state.desiredState.name}")
         appendLine("autostart=${bit(state.autostart)}")
@@ -127,26 +180,14 @@ internal object HostSupervisorRecordCodec {
         appendLine("power_policy=${state.powerPolicy.name}")
         appendLine("thermal_policy=${state.thermalPolicy.name}")
         appendLine("runtime_generation=${state.runtimeGeneration}")
-        val reconciliation = state.reconciliation
+    }
+
+    private fun StringBuilder.appendReconciliation(reconciliation: ReconciliationMetadata) {
         appendLine("reconcile_attempts=${reconciliation.consecutiveAttempts}")
         appendLine("reconcile_next_ms=${reconciliation.nextEligibleEpochMs}")
         appendLine("reconcile_last_trigger=${reconciliation.lastTrigger?.name ?: ABSENT_RESULT}")
         appendLine("reconcile_last_outcome=${reconciliation.lastOutcome.name}")
         appendLine("reconcile_last_error=${reconciliation.lastErrorCode?.name ?: ABSENT_RESULT}")
-        appendTransaction(state.latestTransaction)
-    }.also { check(it.length <= MAX_ENCODED_CHARS) }
-
-    /** Test/documentation helper for producing the exact legacy schema. */
-    fun encodeV1ForMigration(state: HostSupervisorState): String = buildString {
-        appendLine("schema=$V1")
-        appendLine("host_enabled=${bit(state.hostEnabled)}")
-        appendLine("desired_state=${state.desiredState.name}")
-        appendLine("autostart=${bit(state.autostart)}")
-        appendLine("wake_policy=${state.wakePolicy.name}")
-        appendLine("power_policy=${state.powerPolicy.name}")
-        appendLine("thermal_policy=${state.thermalPolicy.name}")
-        appendLine("runtime_generation=${state.runtimeGeneration}")
-        appendTransaction(state.latestTransaction)
     }
 
     private fun StringBuilder.appendTransaction(transaction: LifecycleTransaction?) {
@@ -349,9 +390,20 @@ class HostSupervisorRepository internal constructor(
                 } else current
             } else {
                 completed = true
-                current.copy(
+                val clearsRuntimeEvidence = outcome == LifecycleOutcome.SUCCEEDED &&
+                    token.operation in setOf(
+                        LifecycleOperation.START,
+                        LifecycleOperation.RESTART,
+                        LifecycleOperation.STOP,
+                        LifecycleOperation.FORCE_STOP,
+                    )
+                val completedState = current.copy(
                     runtimeGeneration = if (runtimeStarted) Math.addExact(current.runtimeGeneration, 1L)
                         else current.runtimeGeneration,
+                    runtimeMayBeLive = if (clearsRuntimeEvidence) false else current.runtimeMayBeLive,
+                    runtimeEvidenceVersion = if (clearsRuntimeEvidence && current.runtimeMayBeLive) {
+                        Math.addExact(current.runtimeEvidenceVersion, 1L)
+                    } else current.runtimeEvidenceVersion,
                     latestTransaction = transaction!!.copy(
                         outcome = outcome,
                         completedAtEpochMs = maxOf(now(), transaction.requestedAtEpochMs),
@@ -366,6 +418,13 @@ class HostSupervisorRepository internal constructor(
                         ReconciliationMetadata.safeDefaults()
                     } else current.reconciliation,
                 )
+                when {
+                    outcome == LifecycleOutcome.FAILED && token.operation in setOf(
+                        LifecycleOperation.STOP,
+                        LifecycleOperation.FORCE_STOP,
+                    ) -> completedState.withRuntimeEvidence(true)
+                    else -> completedState
+                }
             }
         }
         return completed
@@ -389,7 +448,23 @@ class HostSupervisorRepository internal constructor(
                         lastOutcome = ReconciliationOutcome.INTERRUPTED,
                         lastErrorCode = LifecycleErrorCode.PROCESS_DIED,
                     ),
-                )
+                ).let { interrupted ->
+                    val latestProvesStopped = original.latestTransaction?.outcome ==
+                        LifecycleOutcome.SUCCEEDED && original.latestTransaction.operation in setOf(
+                        LifecycleOperation.STOP,
+                        LifecycleOperation.FORCE_STOP,
+                    )
+                    val pendingCouldLeaveRuntimeLive = pending != null && (
+                        (pending.effectStarted && pending.operation != LifecycleOperation.SETUP) ||
+                            pending.operation in setOf(
+                                LifecycleOperation.STOP,
+                                LifecycleOperation.FORCE_STOP,
+                            )
+                        )
+                    if ((interruptedAttempt && !latestProvesStopped) || pendingCouldLeaveRuntimeLive) {
+                        interrupted.withRuntimeEvidence(true)
+                    } else interrupted
+                }
             } else original
             val decision = HostReconciliationPolicy.decide(current, trigger, timestamp)
             if (decision != ReconciliationOutcome.ATTEMPTING) {
@@ -430,6 +505,8 @@ class HostSupervisorRepository internal constructor(
         token: ReconciliationAttemptToken,
         outcome: ReconciliationOutcome,
         errorCode: LifecycleErrorCode?,
+        runtimeMayBeLive: Boolean,
+        authoritativeRuntimeAbsence: Boolean,
     ): HostSupervisorState {
         require(outcome in setOf(
             ReconciliationOutcome.SUCCEEDED,
@@ -437,11 +514,19 @@ class HostSupervisorRepository internal constructor(
             ReconciliationOutcome.FAILED,
         ))
         require((outcome == ReconciliationOutcome.FAILED) == (errorCode != null))
+        require(!runtimeMayBeLive || outcome == ReconciliationOutcome.FAILED)
+        require(!authoritativeRuntimeAbsence || outcome == ReconciliationOutcome.SUCCEEDED)
         return mutate { current ->
             val metadata = current.reconciliation
+            val latestId = current.latestTransaction?.id ?: 0L
+            val reconciliationStillOwnsAuthority =
+                latestId == token.expectedNextTransactionId - 1L ||
+                    (latestId == token.expectedNextTransactionId &&
+                        current.latestTransaction?.operation == LifecycleOperation.RECOVER)
             if (metadata.lastTrigger != token.trigger ||
                 metadata.consecutiveAttempts != token.attempt ||
-                metadata.lastOutcome != ReconciliationOutcome.ATTEMPTING
+                metadata.lastOutcome != ReconciliationOutcome.ATTEMPTING ||
+                !reconciliationStillOwnsAuthority
             ) return@mutate current
             when (outcome) {
                 ReconciliationOutcome.SUCCEEDED -> current.copy(reconciliation = metadata.copy(
@@ -449,7 +534,9 @@ class HostSupervisorRepository internal constructor(
                     nextEligibleEpochMs = 0,
                     lastOutcome = ReconciliationOutcome.SUCCEEDED,
                     lastErrorCode = null,
-                ))
+                )).let { completed ->
+                    if (authoritativeRuntimeAbsence) completed.withRuntimeEvidence(false) else completed
+                }
                 ReconciliationOutcome.SUPERSEDED -> current.copy(reconciliation = metadata.copy(
                     nextEligibleEpochMs = 0,
                     lastOutcome = ReconciliationOutcome.SUPERSEDED,
@@ -457,14 +544,19 @@ class HostSupervisorRepository internal constructor(
                 ))
                 ReconciliationOutcome.FAILED -> {
                     val delayMs = HostReconciliationPolicy.backoffDelayMs(token.attempt)
-                    val next = saturatingAdd(now(), delayMs)
+                    val next = minOf(
+                        saturatingAdd(now(), delayMs),
+                        ReconciliationMetadata.MAX_EPOCH_MS,
+                    )
                     current.copy(reconciliation = metadata.copy(
-                        nextEligibleEpochMs = next,
+                        nextEligibleEpochMs = if (token.attempt >= ReconciliationMetadata.MAX_ATTEMPTS) 0 else next,
                         lastOutcome = if (token.attempt >= ReconciliationMetadata.MAX_ATTEMPTS) {
                             ReconciliationOutcome.EXHAUSTED
                         } else ReconciliationOutcome.FAILED,
                         lastErrorCode = errorCode,
-                    ))
+                    )).let { failed ->
+                        if (runtimeMayBeLive) failed.withRuntimeEvidence(true) else failed
+                    }
                 }
                 else -> error("validated above")
             }
@@ -481,7 +573,15 @@ class HostSupervisorRepository internal constructor(
                 HostSupervisorRecordCodec.encode(transform(current))
             }
         }
-        return HostSupervisorRecordCodec.decodeV2(encoded)
+        return HostSupervisorRecordCodec.decodeV3(encoded)
+    }
+
+    private fun HostSupervisorState.withRuntimeEvidence(mayBeLive: Boolean): HostSupervisorState {
+        if (runtimeMayBeLive == mayBeLive) return this
+        return copy(
+            runtimeMayBeLive = mayBeLive,
+            runtimeEvidenceVersion = Math.addExact(runtimeEvidenceVersion, 1L),
+        )
     }
 
     private fun now(): Long = currentTimeMillis().also { require(it >= 0) }

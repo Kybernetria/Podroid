@@ -125,7 +125,12 @@ class QemuEngine @Inject constructor(
     private val qmpSocketPath: String get() = vmPaths.qmpSocket.absolutePath
     private val runtimeOwnerStore = QemuRuntimeOwnerStore(vmPaths)
 
-    override val qmpController: QmpController? by lazy { QmpClient(qmpSocketPath) }
+    override val qmpController: QmpController? by lazy {
+        QmpClient(
+            qmpSocketPath,
+            peerVerifier = QemuOwnerPeerVerifier(runtimeOwnerStore),
+        )
+    }
 
     private var ioScope: CoroutineScope? = null
 

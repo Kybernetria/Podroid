@@ -4,6 +4,8 @@
  */
 package com.excp.podroid.engine
 
+import android.net.LocalSocket
+import android.os.Process
 import com.excp.podroid.vm.LifecycleErrorCode
 import com.excp.podroid.vm.StaleRuntimeEvidence
 import com.excp.podroid.vm.VmPathSecurity
@@ -82,6 +84,50 @@ internal sealed interface DeadOwnerProof {
     data class Proven(val evidence: QemuStaleRuntimeEvidence) : DeadOwnerProof
     data object ExactProcessAlive : DeadOwnerProof
     data class Uncertain(val errorCode: LifecycleErrorCode) : DeadOwnerProof
+}
+
+internal enum class QmpPeerOwnershipVerdict { AUTHENTICATED, DEAD_OWNER, REJECTED }
+
+internal object QmpPeerOwnershipPolicy {
+    fun classify(
+        expected: QemuRuntimeOwner,
+        appUid: Int,
+        peer: LocalSocketPeerIdentity,
+        process: ProcessIdentityObservation,
+    ): QmpPeerOwnershipVerdict = when {
+        process == ProcessIdentityObservation.Dead -> QmpPeerOwnershipVerdict.DEAD_OWNER
+        process !is ProcessIdentityObservation.Alive -> QmpPeerOwnershipVerdict.REJECTED
+        process.identity != expected.process -> QmpPeerOwnershipVerdict.DEAD_OWNER
+        peer.uid != appUid || peer.pid.toLong() != expected.process.pid ->
+            QmpPeerOwnershipVerdict.REJECTED
+        else -> QmpPeerOwnershipVerdict.AUTHENTICATED
+    }
+}
+
+internal class QmpPeerAuthenticationException : IOException("QMP peer ownership check failed")
+
+/** Revalidates owner file, peer UID/PID, and /proc start ticks after connect. */
+internal class QemuOwnerPeerVerifier(
+    private val ownerStore: QemuRuntimeOwnerStore,
+    private val expectedOwner: QemuRuntimeOwner? = null,
+    private val appUid: Int = Process.myUid(),
+    private val credentials: LocalSocketPeerCredentialReader = AndroidLocalSocketPeerCredentialReader,
+) : QmpPeerVerifier {
+    override fun verify(socket: LocalSocket) {
+        val inspection = ownerStore.inspect() as? QemuOwnerInspection.Valid
+            ?: throw QmpPeerAuthenticationException()
+        val owner = inspection.owner
+        if (expectedOwner != null && owner != expectedOwner) throw QmpPeerAuthenticationException()
+        val verdict = QmpPeerOwnershipPolicy.classify(
+            owner,
+            appUid,
+            credentials.read(socket),
+            ownerStore.observeProcess(owner.process.pid),
+        )
+        if (verdict != QmpPeerOwnershipVerdict.AUTHENTICATED) {
+            throw QmpPeerAuthenticationException()
+        }
+    }
 }
 
 internal data class CheckedFileIdentity(
@@ -171,8 +217,11 @@ internal class QemuRuntimeOwnerStore(
         }
     }
 
+    internal fun observeProcess(pid: Long): ProcessIdentityObservation =
+        processIdentityReader.observe(pid)
+
     fun proveDead(inspection: QemuOwnerInspection.Valid): DeadOwnerProof =
-        when (val observed = processIdentityReader.observe(inspection.owner.process.pid)) {
+        when (val observed = observeProcess(inspection.owner.process.pid)) {
             ProcessIdentityObservation.Dead -> deadEvidence(inspection)
             is ProcessIdentityObservation.Alive -> if (observed.identity == inspection.owner.process) {
                 DeadOwnerProof.ExactProcessAlive

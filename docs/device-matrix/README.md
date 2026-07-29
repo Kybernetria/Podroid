@@ -18,4 +18,4 @@ Patched-device results must identify `my-avbroot-setup` inputs and remain separa
 
 ## Ticket #11 physical verification (pending)
 
-The JVM suite covers reconciliation policy, migration, duplicate-runtime cleanup, timeouts, backoff, concurrency, and transport calls. Physical-device evidence is still pending for: post-unlock boot delivery on Android 8/12/14/15+, foreground-service notification timing, sticky null-intent recreation after process kill, QMP orphan quit on QEMU, named-VM stop/restart on AVF, WakeLock release/retention, and force-stop suppression until launcher relaunch.
+The JVM suite covers reconciliation policy, migration, duplicate-runtime cleanup, timeouts, backoff, concurrency, and transport calls. Physical-device evidence is still pending for: post-unlock boot delivery on Android 8/12/14/15+, foreground-service notification timing, sticky null-intent recreation after process kill, QMP orphan quit on QEMU, named-VM stop/restart on AVF, WakeLock release/retention, and force-stop suppression until an explicit Start VM action.

@@ -11,6 +11,12 @@ internal object HostReconciliationPolicy {
         trigger: ReconciliationTrigger,
         nowEpochMs: Long,
     ): ReconciliationOutcome = when {
+        state.runtimeMayBeLive &&
+            state.reconciliation.consecutiveAttempts >= ReconciliationMetadata.MAX_ATTEMPTS ->
+            ReconciliationOutcome.EXHAUSTED
+        state.runtimeMayBeLive && nowEpochMs < state.reconciliation.nextEligibleEpochMs ->
+            ReconciliationOutcome.BACKOFF
+        state.runtimeMayBeLive -> ReconciliationOutcome.ATTEMPTING
         !state.hostEnabled -> ReconciliationOutcome.SKIPPED_HOST_DISABLED
         state.desiredState != VmDesiredState.RUNNING -> ReconciliationOutcome.SKIPPED_DESIRED_STOPPED
         trigger == ReconciliationTrigger.BOOT_COMPLETED && !state.autostart ->
@@ -22,7 +28,8 @@ internal object HostReconciliationPolicy {
     }
 
     fun shouldStartServiceAtBoot(state: HostSupervisorState): Boolean =
-        state.hostEnabled && state.autostart && state.desiredState == VmDesiredState.RUNNING
+        state.runtimeMayBeLive ||
+            (state.hostEnabled && state.autostart && state.desiredState == VmDesiredState.RUNNING)
 
     fun backoffDelayMs(attempt: Int): Long {
         require(attempt in 1..ReconciliationMetadata.MAX_ATTEMPTS)
@@ -56,6 +63,8 @@ internal interface HostReconciliationStore {
         token: ReconciliationAttemptToken,
         outcome: ReconciliationOutcome,
         errorCode: LifecycleErrorCode? = null,
+        runtimeMayBeLive: Boolean = false,
+        authoritativeRuntimeAbsence: Boolean = false,
     ): HostSupervisorState =
         throw UnsupportedOperationException("reconciliation metadata unavailable")
 }

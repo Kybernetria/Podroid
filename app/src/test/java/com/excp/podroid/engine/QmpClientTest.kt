@@ -7,6 +7,7 @@ package com.excp.podroid.engine
 import com.excp.podroid.engine.QmpClient.Companion.QmpVerdict
 import com.excp.podroid.engine.QmpClient.Companion.classifyQmpFields
 import java.io.ByteArrayInputStream
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Job
@@ -130,6 +131,17 @@ class QmpClientTest {
         job.cancel()
         assertTrue(closed.get())
         handle?.dispose()
+    }
+
+    @Test
+    fun `peer authentication precedes every QMP read or command write`() {
+        val source = File("src/main/java/com/excp/podroid/engine/QmpClient.kt").readText()
+        val executeIo = source.substringAfter("private suspend fun executeIo(")
+            .substringBefore("private fun writeCommand(")
+        val verification = executeIo.indexOf("peerVerifier?.verify(socket)")
+        assertTrue(verification >= 0)
+        assertTrue(verification < executeIo.indexOf("socket.inputStream"))
+        assertTrue(verification < executeIo.indexOf("writeCommand("))
     }
 
     @Test

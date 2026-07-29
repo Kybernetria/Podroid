@@ -20,6 +20,22 @@ class HostReconciliationPolicyTest {
         assertTrue(HostReconciliationPolicy.shouldStartServiceAtBoot(running.copy(autostart = true)))
     }
 
+    @Test fun `possible-live evidence starts boot cleanup regardless of autostart or desired state`() {
+        val possibleLive = HostSupervisorState.safeDefaults().copy(
+            runtimeMayBeLive = true,
+            runtimeEvidenceVersion = 1,
+        )
+        assertTrue(HostReconciliationPolicy.shouldStartServiceAtBoot(possibleLive))
+        assertEquals(
+            ReconciliationOutcome.ATTEMPTING,
+            HostReconciliationPolicy.decide(
+                possibleLive,
+                ReconciliationTrigger.BOOT_COMPLETED,
+                1,
+            ),
+        )
+    }
+
     @Test fun `explicit stopped and disabled never launch from any trigger`() {
         for (trigger in ReconciliationTrigger.entries) {
             assertEquals(ReconciliationOutcome.SKIPPED_HOST_DISABLED,

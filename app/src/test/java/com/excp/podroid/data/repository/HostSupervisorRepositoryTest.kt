@@ -15,14 +15,14 @@ import org.junit.Test
 
 class HostSupervisorRepositoryTest {
     @Test
-    fun `v0 absence initializes explicit safe v2 record`() = runBlocking {
+    fun `v0 absence initializes explicit safe v3 record`() = runBlocking {
         val store = FakeAtomicStore()
         val state = repository(store).snapshot()
-        assertEquals(2, state.schemaVersion)
+        assertEquals(3, state.schemaVersion)
         assertFalse(state.hostEnabled)
         assertEquals(VmDesiredState.STOPPED, state.desiredState)
         assertEquals(ReconciliationMetadata.safeDefaults(), state.reconciliation)
-        assertEquals(state, HostSupervisorRecordCodec.decodeV2(store.raw!!))
+        assertEquals(state, HostSupervisorRecordCodec.decodeV3(store.raw!!))
     }
 
     @Test
@@ -41,13 +41,37 @@ class HostSupervisorRepositoryTest {
 
         val migrated = repository(store).snapshot()
 
-        assertEquals(2, migrated.schemaVersion)
+        assertEquals(3, migrated.schemaVersion)
         assertTrue(migrated.hostEnabled)
         assertTrue(migrated.autostart)
         assertEquals(7, migrated.runtimeGeneration)
         assertEquals(original.latestTransaction, migrated.latestTransaction)
         assertEquals(ReconciliationMetadata.safeDefaults(), migrated.reconciliation)
-        assertTrue(store.raw!!.startsWith("schema=2\n"))
+        assertTrue(migrated.runtimeMayBeLive)
+        assertEquals(1L, migrated.runtimeEvidenceVersion)
+        assertTrue(store.raw!!.startsWith("schema=3\n"))
+        assertEquals(1, store.commits)
+    }
+
+    @Test
+    fun `explicit v2 migration preserves reconciliation and initializes versioned possible-live evidence`() = runBlocking {
+        val original = HostSupervisorState.safeDefaults().copy(
+            hostEnabled = true,
+            desiredState = VmDesiredState.RUNNING,
+            reconciliation = ReconciliationMetadata(
+                1, 6_000, ReconciliationTrigger.PROCESS_RESTART,
+                ReconciliationOutcome.FAILED, LifecycleErrorCode.IO,
+            ),
+        )
+        val store = FakeAtomicStore(HostSupervisorRecordCodec.encodeV2ForMigration(original))
+
+        val migrated = repository(store).snapshot()
+
+        assertEquals(3, migrated.schemaVersion)
+        assertEquals(original.reconciliation, migrated.reconciliation)
+        assertFalse(migrated.runtimeMayBeLive)
+        assertEquals(0L, migrated.runtimeEvidenceVersion)
+        assertTrue(store.raw!!.startsWith("schema=3\n"))
         assertEquals(1, store.commits)
     }
 
@@ -66,7 +90,7 @@ class HostSupervisorRepositoryTest {
 
     @Test
     fun `unknown future schema fails closed without overwriting evidence`() = runBlocking {
-        val evidence = "schema=3\nopaque=future-evidence"
+        val evidence = "schema=4\nopaque=future-evidence"
         val store = FakeAtomicStore(evidence)
         val failure = runCatching { repository(store).snapshot() }.exceptionOrNull()
         assertTrue(failure is HostSupervisorSchemaException)
@@ -75,7 +99,7 @@ class HostSupervisorRepositoryTest {
     }
 
     @Test
-    fun `corrupt v2 fails closed without normalizing evidence`() = runBlocking {
+    fun `corrupt v3 fails closed without normalizing evidence`() = runBlocking {
         val evidence = HostSupervisorRecordCodec.encode(HostSupervisorState.safeDefaults())
             .replace("desired_state=STOPPED", "desired_state=maybe")
         val store = FakeAtomicStore(evidence)
@@ -90,6 +114,7 @@ class HostSupervisorRepositoryTest {
         val base = HostSupervisorRecordCodec.encode(HostSupervisorState.safeDefaults())
         val invalidRecords = listOf(
             base.replace("reconcile_attempts=0", "reconcile_attempts=1"),
+            base.replace("runtime_may_be_live=0", "runtime_may_be_live=1"),
             base.replace("reconcile_last_outcome=NEVER_RUN", "reconcile_last_outcome=ATTEMPTING"),
             base.replace("reconcile_last_outcome=NEVER_RUN", "reconcile_last_outcome=FAILED"),
             base.replace("reconcile_last_outcome=NEVER_RUN", "reconcile_last_outcome=BACKOFF"),
@@ -102,6 +127,48 @@ class HostSupervisorRepositoryTest {
             assertEquals(evidence, store.raw)
             assertEquals(0, store.commits)
         }
+    }
+
+    @Test
+    fun `possible-live failure is sticky against delayed superseded completion`() = runBlocking {
+        val repository = enabledRunningRepository(AtomicLong(1_000))
+        val attempt = repository.begin(ReconciliationTrigger.PROCESS_RESTART) as ReconciliationAdmission.Execute
+
+        val failed = repository.finish(
+            attempt.token,
+            ReconciliationOutcome.FAILED,
+            LifecycleErrorCode.RUNTIME_OWNERSHIP,
+            runtimeMayBeLive = true,
+        )
+        val delayed = repository.finish(attempt.token, ReconciliationOutcome.SUPERSEDED)
+
+        assertTrue(failed.runtimeMayBeLive)
+        assertEquals(1L, failed.runtimeEvidenceVersion)
+        assertTrue(delayed.runtimeMayBeLive)
+        assertEquals(1L, delayed.runtimeEvidenceVersion)
+        assertEquals(ReconciliationOutcome.FAILED, delayed.reconciliation.lastOutcome)
+    }
+
+    @Test
+    fun `authoritative successful reconciliation clears versioned possible-live evidence`() = runBlocking {
+        val clock = AtomicLong(1_000)
+        val initial = HostSupervisorState.safeDefaults().copy(
+            hostEnabled = true,
+            desiredState = VmDesiredState.RUNNING,
+            runtimeMayBeLive = true,
+            runtimeEvidenceVersion = 4,
+        )
+        val repository = repository(FakeAtomicStore(HostSupervisorRecordCodec.encode(initial)), clock)
+        val attempt = repository.begin(ReconciliationTrigger.PROCESS_RESTART) as ReconciliationAdmission.Execute
+
+        val cleared = repository.finish(
+            attempt.token,
+            ReconciliationOutcome.SUCCEEDED,
+            authoritativeRuntimeAbsence = true,
+        )
+
+        assertFalse(cleared.runtimeMayBeLive)
+        assertEquals(5L, cleared.runtimeEvidenceVersion)
     }
 
     @Test
@@ -139,6 +206,74 @@ class HostSupervisorRepositoryTest {
         assertEquals(LifecycleOutcome.FAILED, state.latestTransaction!!.outcome)
         assertEquals(LifecycleErrorCode.PROCESS_DIED, state.latestTransaction!!.errorCode)
         assertEquals(ReconciliationOutcome.ATTEMPTING, state.reconciliation.lastOutcome)
+    }
+
+    @Test
+    fun `interrupted claimed stop becomes sticky cleanup evidence despite desired stopped`() = runBlocking {
+        val clock = AtomicLong(100)
+        val initial = HostSupervisorState.safeDefaults().copy(
+            hostEnabled = true,
+            desiredState = VmDesiredState.STOPPED,
+            latestTransaction = LifecycleTransaction(
+                8, LifecycleOperation.STOP, LifecycleOutcome.PENDING, 90, null, null, true,
+            ),
+        )
+        val repository = repository(FakeAtomicStore(HostSupervisorRecordCodec.encode(initial)), clock)
+
+        val admission = repository.begin(ReconciliationTrigger.PROCESS_RESTART)
+        val state = repository.snapshot()
+
+        assertTrue(admission is ReconciliationAdmission.Execute)
+        assertTrue(state.runtimeMayBeLive)
+        assertEquals(1L, state.runtimeEvidenceVersion)
+        assertEquals(ReconciliationOutcome.ATTEMPTING, state.reconciliation.lastOutcome)
+    }
+
+    @Test
+    fun `interrupted unclaimed force stop still requires fixed-runtime cleanup`() = runBlocking {
+        val initial = HostSupervisorState.safeDefaults().copy(
+            hostEnabled = true,
+            desiredState = VmDesiredState.STOPPED,
+            latestTransaction = LifecycleTransaction(
+                8, LifecycleOperation.FORCE_STOP, LifecycleOutcome.PENDING, 90, null, null,
+            ),
+        )
+        val repository = repository(
+            FakeAtomicStore(HostSupervisorRecordCodec.encode(initial)),
+            AtomicLong(100),
+        )
+
+        val admission = repository.begin(ReconciliationTrigger.PROCESS_RESTART)
+
+        assertTrue(admission is ReconciliationAdmission.Execute)
+        assertTrue(repository.snapshot().runtimeMayBeLive)
+    }
+
+    @Test
+    fun `interrupted reconciliation after completed recover marks runtime possible live`() = runBlocking {
+        val initial = HostSupervisorState.safeDefaults().copy(
+            hostEnabled = true,
+            desiredState = VmDesiredState.RUNNING,
+            runtimeGeneration = 1,
+            latestTransaction = LifecycleTransaction(
+                9, LifecycleOperation.RECOVER, LifecycleOutcome.SUCCEEDED,
+                90, 95, null, true,
+            ),
+            reconciliation = ReconciliationMetadata(
+                1, 0, ReconciliationTrigger.PROCESS_RESTART,
+                ReconciliationOutcome.ATTEMPTING, null,
+            ),
+        )
+        val repository = repository(
+            FakeAtomicStore(HostSupervisorRecordCodec.encode(initial)),
+            AtomicLong(100),
+        )
+
+        repository.begin(ReconciliationTrigger.PROCESS_RESTART)
+
+        val state = repository.snapshot()
+        assertTrue(state.runtimeMayBeLive)
+        assertEquals(1L, state.runtimeEvidenceVersion)
     }
 
     @Test
@@ -215,6 +350,24 @@ class HostSupervisorRepositoryTest {
         val exhausted = repository.begin(ReconciliationTrigger.PROCESS_RESTART) as ReconciliationAdmission.Skip
         assertEquals(ReconciliationOutcome.EXHAUSTED, exhausted.outcome)
         assertEquals(ReconciliationMetadata.MAX_ATTEMPTS, repository.snapshot().reconciliation.consecutiveAttempts)
+    }
+
+    @Test
+    fun `explicit stop failure sticks possible-live until a later definitive stop succeeds`() = runBlocking {
+        val repository = enabledRunningRepository(AtomicLong(1_000))
+        val failedStop = repository.prepare(LifecycleOperation.STOP)
+        assertTrue(repository.claim(failedStop))
+        assertTrue(repository.fail(failedStop, LifecycleErrorCode.RUNTIME_OWNERSHIP))
+        val failed = repository.snapshot()
+        assertTrue(failed.runtimeMayBeLive)
+        assertEquals(1L, failed.runtimeEvidenceVersion)
+
+        val retry = repository.prepare(LifecycleOperation.FORCE_STOP)
+        assertTrue(repository.claim(retry))
+        assertTrue(repository.succeed(retry))
+        val stopped = repository.snapshot()
+        assertFalse(stopped.runtimeMayBeLive)
+        assertEquals(2L, stopped.runtimeEvidenceVersion)
     }
 
     @Test

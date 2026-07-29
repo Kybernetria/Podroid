@@ -23,6 +23,7 @@ import kotlinx.coroutines.launch
 @AndroidEntryPoint
 class BootCompletedReceiver : BroadcastReceiver() {
     @Inject lateinit var supervisor: HostSupervisorRepository
+    @Inject lateinit var retryScheduler: ReconciliationRetryScheduler
 
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
@@ -31,6 +32,11 @@ class BootCompletedReceiver : BroadcastReceiver() {
         scope.launch {
             try {
                 val state = supervisor.snapshot()
+                runCatching {
+                    retryScheduler.apply(ReconciliationRetryDirective.fromPersistedState(state))
+                }.onFailure { failure ->
+                    Log.e(TAG, "Boot retry alarm restoration failed type=${failure.javaClass.simpleName}")
+                }
                 if (HostReconciliationPolicy.shouldStartServiceAtBoot(state)) {
                     ContextCompat.startForegroundService(
                         context,

@@ -15,13 +15,82 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class HostReconcilerTest {
-    @Test fun `service action mapping accepts only boot and sticky null restart`() {
+    @Test fun `service action mapping accepts boot retry and sticky null restart only`() {
         assertEquals(ReconciliationTrigger.BOOT_COMPLETED,
             ReconciliationServiceTriggerPolicy.fromAction(PodroidService.ACTION_RECONCILE_BOOT))
         assertEquals(ReconciliationTrigger.PROCESS_RESTART,
             ReconciliationServiceTriggerPolicy.fromAction(null))
+        assertEquals(ReconciliationTrigger.PROCESS_RESTART,
+            ReconciliationServiceTriggerPolicy.fromAction(PodroidService.ACTION_RECONCILE_RETRY))
         assertNull(ReconciliationServiceTriggerPolicy.fromAction("com.excp.podroid.action.RECONCILE_APP"))
         assertNull(ReconciliationServiceTriggerPolicy.fromAction("unexpected"))
+    }
+
+    @Test fun `true failure followed by delayed false superseded result stays supervised`() {
+        val failed = result(
+            ReconciliationOutcome.FAILED,
+            runtimeMayBeLive = true,
+            evidenceVersion = 1,
+            nextEligibleEpochMs = 6_000,
+        )
+        val delayedSuperseded = result(
+            ReconciliationOutcome.SUPERSEDED,
+            runtimeMayBeLive = false,
+            evidenceVersion = 0,
+        )
+
+        val afterFailure = RuntimeSupervisionVersionPolicy.apply(
+            RuntimeSupervisionSnapshot(false, 0), failed,
+        )
+        val afterDelayed = RuntimeSupervisionVersionPolicy.apply(afterFailure, delayedSuperseded)
+
+        assertTrue(afterDelayed.required)
+        assertEquals(1L, afterDelayed.evidenceVersion)
+        assertFalse(ReconciliationCompletionVersionPolicy.accepts(1, delayedSuperseded))
+        assertEquals(ReconciliationRetryDirective.Schedule(6_000),
+            ReconciliationRetryDirective.from(failed))
+        assertEquals(ReconciliationRetryDirective.NoChange,
+            ReconciliationRetryDirective.from(delayedSuperseded))
+    }
+
+    @Test fun `authoritative newer absence clears supervision and retry`() {
+        val current = RuntimeSupervisionSnapshot(true, 2)
+        val succeeded = result(
+            ReconciliationOutcome.SUCCEEDED,
+            runtimeMayBeLive = false,
+            evidenceVersion = 3,
+            authoritativeRuntimeAbsence = true,
+        )
+        assertEquals(RuntimeSupervisionSnapshot(false, 3),
+            RuntimeSupervisionVersionPolicy.apply(current, succeeded))
+        assertEquals(ReconciliationRetryDirective.Cancel,
+            ReconciliationRetryDirective.from(succeeded))
+        assertEquals(
+            ReconciliationRetryDirective.Cancel,
+            ReconciliationRetryDirective.from(result(
+                ReconciliationOutcome.EXHAUSTED,
+                runtimeMayBeLive = true,
+                evidenceVersion = 3,
+            )),
+        )
+    }
+
+    @Test fun `persisted backoff reconstructs one retry directive after process or boot restart`() {
+        val state = HostSupervisorState.safeDefaults().copy(
+            hostEnabled = true,
+            desiredState = VmDesiredState.RUNNING,
+            reconciliation = ReconciliationMetadata(
+                2,
+                11_000,
+                ReconciliationTrigger.PROCESS_RESTART,
+                ReconciliationOutcome.FAILED,
+                LifecycleErrorCode.IO,
+            ),
+        )
+        assertEquals(
+            ReconciliationRetryDirective.Schedule(11_000),
+            ReconciliationRetryDirective.fromPersistedState(state),
+        )
     }
 
     @Test fun `boot skip does not prepare launch when autostart is false`() = runBlocking {
@@ -127,6 +196,22 @@ class HostReconcilerTest {
         assertFalse(retention.teardown)
     }
 
+    @Test fun `possible-live desired stopped performs cleanup only and clears evidence`() = runBlocking {
+        val fixture = fixture(
+            autostart = false,
+            desired = VmDesiredState.STOPPED,
+            runtimeMayBeLive = true,
+        )
+
+        val result = fixture.reconciler.reconcile(ReconciliationTrigger.PROCESS_RESTART)
+
+        assertEquals(ReconciliationOutcome.SUCCEEDED, result.outcome)
+        assertEquals(1, fixture.manager.fixedRuntimeCleanupCalls)
+        assertEquals(0, fixture.manager.prepareCalls)
+        assertFalse(result.runtimeMayBeLive)
+        assertTrue(result.authoritativeRuntimeAbsence)
+    }
+
     @Test fun `explicit desired stopped never starts`() = runBlocking {
         val fixture = fixture(autostart = true, desired = VmDesiredState.STOPPED)
         val result = fixture.reconciler.reconcile(ReconciliationTrigger.APP_COLD_START)
@@ -134,15 +219,36 @@ class HostReconcilerTest {
         assertEquals(0, fixture.manager.prepareCalls)
     }
 
+    private fun result(
+        outcome: ReconciliationOutcome,
+        runtimeMayBeLive: Boolean,
+        evidenceVersion: Long,
+        nextEligibleEpochMs: Long = 0,
+        authoritativeRuntimeAbsence: Boolean = false,
+        completionVersion: Long = evidenceVersion,
+    ) = HostReconciliationResult(
+        outcome,
+        if (runtimeMayBeLive) ReconciliationServiceDisposition.SUPERVISE_RUNTIME
+        else ReconciliationServiceDisposition.NO_ACTION,
+        runtimeMayBeLive,
+        evidenceVersion,
+        nextEligibleEpochMs,
+        authoritativeRuntimeAbsence,
+        completionVersion,
+    )
+
     private fun fixture(
         autostart: Boolean,
         desired: VmDesiredState = VmDesiredState.RUNNING,
+        runtimeMayBeLive: Boolean = false,
     ): Fixture {
         val clock = AtomicLong(1_000)
         val state = HostSupervisorState.safeDefaults().copy(
             hostEnabled = true,
             desiredState = desired,
             autostart = autostart,
+            runtimeMayBeLive = runtimeMayBeLive,
+            runtimeEvidenceVersion = if (runtimeMayBeLive) 1 else 0,
         )
         val repository = HostSupervisorRepository(
             FakeStore(HostSupervisorRecordCodec.encode(state)),
@@ -176,6 +282,7 @@ class HostReconcilerTest {
         var lastPreparedOperation: LifecycleOperation? = null
         var executeCalls = 0
         var forwardRestoreCalls = 0
+        var fixedRuntimeCleanupCalls = 0
         var executionGate: suspend () -> Unit = {}
         var beforeRecoveryPrepare: suspend () -> Unit = {}
         var failure: Throwable? = null
@@ -189,12 +296,19 @@ class HostReconcilerTest {
         override suspend fun supervisorState(vmId: VmId) = repository.snapshot()
         override suspend fun beginReconciliation(vmId: VmId, trigger: ReconciliationTrigger) =
             repository.begin(trigger)
+        override suspend fun ensureFixedRuntimesStopped(vmId: VmId) {
+            fixedRuntimeCleanupCalls++
+        }
         override suspend fun finishReconciliation(
             vmId: VmId,
             token: ReconciliationAttemptToken,
             outcome: ReconciliationOutcome,
             errorCode: LifecycleErrorCode?,
-        ) = repository.finish(token, outcome, errorCode)
+            runtimeMayBeLive: Boolean,
+            authoritativeRuntimeAbsence: Boolean,
+        ) = repository.finish(
+            token, outcome, errorCode, runtimeMayBeLive, authoritativeRuntimeAbsence,
+        )
         override suspend fun prepareLifecycleCommand(
             vmId: VmId,
             operation: LifecycleOperation,

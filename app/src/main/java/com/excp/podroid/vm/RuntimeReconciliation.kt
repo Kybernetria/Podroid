@@ -49,7 +49,10 @@ internal class RuntimePreflightCoordinator(
         require(avf.backend == RuntimeBackend.AVF)
     }
 
-    suspend fun prepareForLaunch() = mutex.withLock {
+    suspend fun prepareForLaunch() = ensureAllFixedRuntimesStopped()
+
+    /** Definitive fixed-name preflight shared by launch and explicit stop. */
+    suspend fun ensureAllFixedRuntimesStopped() = mutex.withLock {
         var qemuNeedsCleanup: StaleRuntimeEvidence? = null
         for (probe in listOf(qemu, avf)) {
             when (val result = probe.probe()) {
@@ -71,15 +74,21 @@ internal class RuntimePreflightCoordinator(
                             runtimeMayBeLive = true,
                         )
                     }
-                    if (probe.backend == RuntimeBackend.QEMU) {
-                        val stopped = probe.probe()
-                        if (stopped !is RuntimeProbeResult.StaleEndpoints) {
-                            throw RuntimeProbeException(
-                                LifecycleErrorCode.RUNTIME_OWNERSHIP,
-                                runtimeMayBeLive = true,
-                            )
+                    when (val stopped = probe.probe()) {
+                        RuntimeProbeResult.Absent -> Unit
+                        is RuntimeProbeResult.StaleEndpoints -> {
+                            if (probe.backend != RuntimeBackend.QEMU) {
+                                throw RuntimeProbeException(
+                                    LifecycleErrorCode.RUNTIME_OWNERSHIP,
+                                    runtimeMayBeLive = true,
+                                )
+                            }
+                            qemuNeedsCleanup = stopped.evidence
                         }
-                        qemuNeedsCleanup = stopped.evidence
+                        else -> throw RuntimeProbeException(
+                            LifecycleErrorCode.RUNTIME_OWNERSHIP,
+                            runtimeMayBeLive = true,
+                        )
                     }
                 }
             }

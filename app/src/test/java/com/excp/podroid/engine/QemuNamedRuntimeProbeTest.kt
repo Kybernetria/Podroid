@@ -28,6 +28,30 @@ class QemuNamedRuntimeProbeTest {
         assertUncertain(result, LifecycleErrorCode.RUNTIME_OWNERSHIP)
     }
 
+    @Test fun `live classification requires alive owner and a successful authenticated QMP seam`() = runBlocking {
+        val fixture = fixture()
+        fixture.publishOwner()
+        fifo(fixture.paths.qmpSocket)
+        val qmp = FakeQmp(Result.success("running"))
+
+        val result = fixture.probe(qmp).probe()
+
+        assertTrue(result is RuntimeProbeResult.Live)
+        assertEquals(1, qmp.queryCalls)
+    }
+
+    @Test fun `missing owner never queries or quits QMP`() = runBlocking {
+        val fixture = fixture()
+        fifo(fixture.paths.qmpSocket)
+        val qmp = FakeQmp(Result.success("running"))
+
+        val result = fixture.probe(qmp).probe()
+
+        assertUncertain(result, LifecycleErrorCode.RUNTIME_OWNERSHIP)
+        assertEquals(0, qmp.queryCalls)
+        assertEquals(0, qmp.quitCalls)
+    }
+
     @Test fun `PID reuse proves recorded process dead and permits stale classification`() = runBlocking {
         val fixture = fixture()
         fixture.publishOwner()
@@ -79,7 +103,7 @@ class QemuNamedRuntimeProbeTest {
         assertTrue(result is RuntimeProbeResult.StaleEndpoints)
     }
 
-    @Test fun `established EOF malformed and timeout stay uncertain despite dead owner`() = runBlocking {
+    @Test fun `established EOF malformed and timeout stay uncertain with alive owner`() = runBlocking {
         val failures = listOf(
             QmpEndpointFailure(true, IOException("EOF before greeting")) to LifecycleErrorCode.RUNTIME_OWNERSHIP,
             QmpEndpointFailure(true, IOException("malformed QMP")) to LifecycleErrorCode.RUNTIME_OWNERSHIP,
@@ -88,7 +112,6 @@ class QemuNamedRuntimeProbeTest {
         for ((failure, code) in failures) {
             val fixture = fixture()
             fixture.publishOwner()
-            fixture.reader.observation = ProcessIdentityObservation.Dead
             fifo(fixture.paths.qmpSocket)
 
             assertUncertain(fixture.probe(Result.failure(failure)).probe(), code)
@@ -170,7 +193,9 @@ class QemuNamedRuntimeProbeTest {
             store.publish(store.capture(PID, GENERATION))
 
         fun probe(query: Result<String> = Result.failure(IOException("unused"))) =
-            QemuNamedRuntimeProbe(
+            probe(FakeQmp(query))
+
+        fun probe(qmp: QemuRuntimeQmp) = QemuNamedRuntimeProbe(
                 paths.qmpSocket,
                 store,
                 listOf(
@@ -180,7 +205,7 @@ class QemuNamedRuntimeProbeTest {
                     paths.hostSocket,
                     paths.qmpSocket,
                 ),
-                qmp = FakeQmp(query),
+                qmp = qmp,
             )
     }
 
@@ -189,8 +214,17 @@ class QemuNamedRuntimeProbeTest {
     }
 
     private class FakeQmp(private val query: Result<String>) : QemuRuntimeQmp {
-        override suspend fun queryStatus() = query
-        override suspend fun quit(): Result<Unit> = Result.success(Unit)
+        var queryCalls = 0
+        var quitCalls = 0
+        var quitResult: Result<Unit> = Result.success(Unit)
+        override suspend fun queryStatus(owner: QemuRuntimeOwner): Result<String> {
+            queryCalls++
+            return query
+        }
+        override suspend fun quit(owner: QemuRuntimeOwner): Result<Unit> {
+            quitCalls++
+            return quitResult
+        }
     }
 
     private fun fifo(file: File) {

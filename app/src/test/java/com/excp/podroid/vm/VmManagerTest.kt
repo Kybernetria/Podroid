@@ -213,6 +213,39 @@ class VmManagerTest {
     }
 
     @Test
+    fun `explicit stop preflights every fixed runtime even when in process runtime is idle`() = runBlocking {
+        val qemu = CountingProbe(RuntimeBackend.QEMU, RuntimeProbeResult.Absent)
+        val avf = CountingProbe(RuntimeBackend.AVF, RuntimeProbeResult.Absent)
+        val manager = manager(runtimePreflight = RuntimePreflightCoordinator(qemu, avf) {})
+
+        manager.stop(VmId.DEFAULT)
+
+        assertEquals(1, qemu.probeCalls)
+        assertEquals(1, avf.probeCalls)
+    }
+
+    @Test
+    fun `explicit force stop fails closed when fixed runtime ownership is uncertain`() = runBlocking {
+        val qemu = CountingProbe(
+            RuntimeBackend.QEMU,
+            RuntimeProbeResult.Uncertain(
+                LifecycleErrorCode.RUNTIME_OWNERSHIP,
+                runtimeMayBeLive = true,
+            ),
+        )
+        val avf = CountingProbe(RuntimeBackend.AVF, RuntimeProbeResult.Absent)
+        val manager = manager(runtimePreflight = RuntimePreflightCoordinator(qemu, avf) {})
+
+        val failure = runCatching { manager.forceStop(VmId.DEFAULT) }.exceptionOrNull()
+
+        assertTrue(failure is RuntimeProbeException)
+        assertEquals(1, qemu.probeCalls)
+        assertEquals(0, avf.probeCalls)
+        assertEquals(LifecycleOutcome.FAILED,
+            manager.supervisorState(VmId.DEFAULT).latestTransaction?.outcome)
+    }
+
+    @Test
     fun `graceful QEMU stop uses typed powerdown before bounded inherited escalation`() = runBlocking {
         val runtime = FakeRuntime().apply {
             state.value = VmState.Running
@@ -1299,6 +1332,7 @@ class VmManagerTest {
         beforeFinalLaunchAuthorization: suspend (LifecycleTransactionToken) -> Unit = {},
         beforeFinalStopAuthorization: suspend (LifecycleTransactionToken) -> Unit = {},
         beforeCoordinatedStop: suspend () -> Unit = {},
+        runtimePreflight: RuntimePreflightCoordinator? = null,
     ): DefaultVmManager {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default).also(scopes::add)
         return DefaultVmManager(
@@ -1313,6 +1347,7 @@ class VmManagerTest {
             backendStopTimeoutMs = 100,
             forceStopTimeoutMs = 100,
             qmpTimeoutMs = 100,
+            runtimePreflight = runtimePreflight,
             beforeFinalLaunchAuthorization = beforeFinalLaunchAuthorization,
             beforeFinalStopAuthorization = beforeFinalStopAuthorization,
             beforeCoordinatedStop = beforeCoordinatedStop,
@@ -1424,6 +1459,20 @@ class VmManagerTest {
             )
             return true
         }
+    }
+
+    private class CountingProbe(
+        override val backend: RuntimeBackend,
+        var result: RuntimeProbeResult,
+    ) : NamedRuntimeProbe {
+        var probeCalls = 0
+        var stopCalls = 0
+        override suspend fun probe(): RuntimeProbeResult {
+            probeCalls++
+            return result
+        }
+        override suspend fun stopLiveRuntime(): Boolean { stopCalls++; return true }
+        override suspend fun awaitStopped(): Boolean = true
     }
 
     private class FakeRuntime : ManagedVmRuntime {

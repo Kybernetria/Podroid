@@ -75,10 +75,28 @@ internal class QmpEndpointFailure(
     cause: Throwable,
 ) : IOException("QMP endpoint failure", cause)
 
+internal data class LocalSocketPeerIdentity(val pid: Int, val uid: Int)
+
+internal fun interface LocalSocketPeerCredentialReader {
+    fun read(socket: LocalSocket): LocalSocketPeerIdentity
+}
+
+internal object AndroidLocalSocketPeerCredentialReader : LocalSocketPeerCredentialReader {
+    override fun read(socket: LocalSocket): LocalSocketPeerIdentity = socket.peerCredentials.let {
+        LocalSocketPeerIdentity(it.pid, it.uid)
+    }
+}
+
+internal fun interface QmpPeerVerifier {
+    @Throws(IOException::class)
+    fun verify(socket: LocalSocket)
+}
+
 internal class QmpClient(
     private val socketPath: String,
     private val timeoutMs: Long = SOCKET_TIMEOUT_MS,
     private val nanoTime: () -> Long = System::nanoTime,
+    private val peerVerifier: QmpPeerVerifier? = null,
 ) : QmpController {
 
     companion object {
@@ -164,6 +182,9 @@ internal class QmpClient(
                 budget.remainingTimeoutMs(),
             )
             connectionEstablished = true
+            // Authenticate before reading or writing any QMP bytes. In
+            // particular, a mismatched peer never receives typed quit.
+            peerVerifier?.verify(socket)
             val input = socket.inputStream
             val output = socket.outputStream
 

@@ -36,6 +36,7 @@ import com.excp.podroid.engine.usb.UsbPassthroughManager
 import com.excp.podroid.vm.LifecycleErrorCode
 import com.excp.podroid.vm.LifecycleOperation
 import com.excp.podroid.vm.LifecycleTransactionToken
+import com.excp.podroid.vm.HostSupervisorState
 import com.excp.podroid.vm.VmId
 import com.excp.podroid.vm.VmManager
 import com.excp.podroid.vm.VmPaths
@@ -56,6 +57,7 @@ class PodroidService : Service() {
     @Inject lateinit var settingsRepository: SettingsRepository
     @Inject lateinit var usbPassthroughManager: UsbPassthroughManager
     @Inject lateinit var hostReconciler: HostReconciler
+    @Inject lateinit var reconciliationRetryScheduler: ReconciliationRetryScheduler
     @Inject lateinit var notificationPoster: com.excp.podroid.engine.hostbridge.AndroidNotificationPoster
     @Inject lateinit var headlessModeManager: com.excp.podroid.engine.hostbridge.HeadlessModeManager
     private var hostRequestServer: com.excp.podroid.engine.hostbridge.HostRequestServer? = null
@@ -76,6 +78,9 @@ class PodroidService : Service() {
     private val reconciliationActive = kotlinx.coroutines.flow.MutableStateFlow(false)
     /** Keeps foreground/WakeLock ownership when only an out-of-process runtime may remain live. */
     private val orphanSupervisionRequired = kotlinx.coroutines.flow.MutableStateFlow(false)
+    /** Monotonic persisted evidence version rejects delayed false completions. */
+    private var appliedRuntimeEvidenceVersion = -1L
+    private var appliedReconciliationCompletionVersion = -1L
     /** Main-thread count prevents a duplicate delivery from disarming an older run. */
     private var activeReconciliationDeliveries = 0
     private val serviceDispatchMutex = Mutex()
@@ -192,7 +197,7 @@ class PodroidService : Service() {
                     }
                 }
             }
-            ACTION_RECONCILE_BOOT, null -> {
+            ACTION_RECONCILE_BOOT, ACTION_RECONCILE_RETRY, null -> {
                 enterForegroundStartWindow()
                 acquireWakeLock()
                 activeReconciliationDeliveries++
@@ -200,18 +205,20 @@ class PodroidService : Service() {
                 startSupervision()
                 val trigger = checkNotNull(ReconciliationServiceTriggerPolicy.fromAction(action))
                 serviceScope.launch(Dispatchers.IO) {
+                    var persistedAfterFailure: HostSupervisorState? = null
                     val result = try {
                         Result.success(hostReconciler.reconcile(trigger))
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (failure: Throwable) {
+                        persistedAfterFailure = runCatching {
+                            vmManager.supervisorState(VmId.DEFAULT)
+                        }.getOrNull()
                         Result.failure(failure)
                     }
                     withContext(NonCancellable + Dispatchers.Main.immediate) {
                         activeReconciliationDeliveries = (activeReconciliationDeliveries - 1).coerceAtLeast(0)
-                        result.getOrNull()?.let { completed ->
-                            orphanSupervisionRequired.value = completed.runtimeMayBeLive
-                        }
+                        result.getOrNull()?.let(::applyReconciliationCompletion)
                         reconciliationActive.value = activeReconciliationDeliveries > 0
                         result.onSuccess { completed ->
                             Log.i(
@@ -227,6 +234,22 @@ class PodroidService : Service() {
                             }
                         }.onFailure { failure ->
                             Log.e(TAG, "Reconciliation failed type=${failure.javaClass.simpleName}")
+                            val persisted = persistedAfterFailure
+                            if (persisted != null) {
+                                if (persisted.runtimeMayBeLive) {
+                                    applyAuthoritativeRuntimeEvidence(
+                                        true,
+                                        persisted.runtimeEvidenceVersion,
+                                    )
+                                }
+                                updateRetryAlarm(
+                                    ReconciliationRetryDirective.fromPersistedState(persisted),
+                                )
+                            } else {
+                                // Persistence is unavailable, so absence cannot
+                                // be proved and foreground supervision stays up.
+                                orphanSupervisionRequired.value = true
+                            }
                             if (currentLifecycleDecision().teardown) teardown()
                         }
                     }
@@ -309,6 +332,11 @@ class PodroidService : Service() {
                     if (!queuedDuringStop && launch == null) {
                         serviceScope.launch(Dispatchers.IO) {
                             runCatching { vmManager.executeAccepted(VmId.DEFAULT, command) }
+                                .onSuccess { succeeded ->
+                                    if (succeeded) withContext(Dispatchers.Main.immediate) {
+                                        updateRetryAlarm(ReconciliationRetryDirective.Cancel)
+                                    }
+                                }
                                 .onFailure { Log.e(TAG, "VM start command failed", it) }
                         }
                     }
@@ -369,6 +397,9 @@ class PodroidService : Service() {
         },
         prepare = { generation ->
             vmManager.prepareLifecycleCommand(VmId.DEFAULT, operation, generation).also {
+                if (operation == LifecycleOperation.STOP || operation == LifecycleOperation.FORCE_STOP) {
+                    updateRetryAlarm(ReconciliationRetryDirective.Cancel)
+                }
                 if (claimBeforeDispatch) {
                     check(vmManager.acceptPrepared(VmId.DEFAULT, it)) {
                         "Fresh durable lifecycle command could not be claimed"
@@ -563,7 +594,19 @@ class PodroidService : Service() {
             managerStop.await()
         }
         stopResult.onFailure { Log.e(TAG, failureLog, it) }
+        val stoppedSupervisorState = runCatching {
+            vmManager.supervisorState(VmId.DEFAULT)
+        }.getOrNull()
         withContext(NonCancellable + Dispatchers.Main.immediate) {
+            stoppedSupervisorState?.let { state ->
+                if (state.runtimeMayBeLive || stopResult.isSuccess) {
+                    applyAuthoritativeRuntimeEvidence(
+                        state.runtimeMayBeLive,
+                        state.runtimeEvidenceVersion,
+                    )
+                }
+                updateRetryAlarm(ReconciliationRetryDirective.Cancel)
+            }
             serviceDispatchMutex.withLock {
                 if (stopResult.isFailure) {
                     queuedLaunchCommand?.let { queued ->
@@ -720,6 +763,38 @@ class PodroidService : Service() {
         }
     }
 
+    private fun applyReconciliationCompletion(completed: HostReconciliationResult) {
+        if (!ReconciliationCompletionVersionPolicy.accepts(
+                appliedReconciliationCompletionVersion,
+                completed,
+            )
+        ) return
+        appliedReconciliationCompletionVersion = completed.completionVersion
+        val applied = RuntimeSupervisionVersionPolicy.apply(
+            RuntimeSupervisionSnapshot(
+                orphanSupervisionRequired.value,
+                appliedRuntimeEvidenceVersion,
+            ),
+            completed,
+        )
+        appliedRuntimeEvidenceVersion = applied.evidenceVersion
+        orphanSupervisionRequired.value = applied.required
+        updateRetryAlarm(ReconciliationRetryDirective.from(completed))
+    }
+
+    private fun updateRetryAlarm(directive: ReconciliationRetryDirective) {
+        runCatching { reconciliationRetryScheduler.apply(directive) }
+            .onFailure { failure ->
+                Log.e(TAG, "Reconciliation retry alarm update failed type=${failure.javaClass.simpleName}")
+            }
+    }
+
+    private fun applyAuthoritativeRuntimeEvidence(mayBeLive: Boolean, version: Long) {
+        if (version < appliedRuntimeEvidenceVersion) return
+        appliedRuntimeEvidenceVersion = version
+        orphanSupervisionRequired.value = mayBeLive
+    }
+
     private fun currentLifecycleDecision(): VmServiceLifecycleDecision =
         VmServiceLifecyclePolicy.decide(
             vmManager.lifecycle(VmId.DEFAULT).value,
@@ -821,8 +896,9 @@ class PodroidService : Service() {
         lateinit var owner: ServiceLaunchOwner
         val job = serviceScope.launch(start = CoroutineStart.LAZY) {
             var failure: Throwable? = null
+            var completed = false
             try {
-                withContext(Dispatchers.IO) {
+                completed = withContext(Dispatchers.IO) {
                     vmManager.executeAccepted(VmId.DEFAULT, owner.command)
                 }
             } catch (cancelled: CancellationException) {
@@ -832,6 +908,7 @@ class PodroidService : Service() {
                 Log.e(TAG, "VM failed to execute prepared launch", caught)
             } finally {
                 withContext(NonCancellable + Dispatchers.Main.immediate) {
+                    if (completed) updateRetryAlarm(ReconciliationRetryDirective.Cancel)
                     if (launchCoordinator.completeLaunch(owner.generation)) {
                         val decision = currentLifecycleDecision()
                         if (decision.teardown) teardown()
@@ -978,6 +1055,7 @@ class PodroidService : Service() {
         const val ACTION_STOP    = "com.excp.podroid.action.STOP"
         const val ACTION_RESTART = "com.excp.podroid.action.RESTART"
         const val ACTION_RECONCILE_BOOT = "com.excp.podroid.action.RECONCILE_BOOT"
+        const val ACTION_RECONCILE_RETRY = "com.excp.podroid.action.RECONCILE_RETRY"
 
         internal fun reconciliationIntent(context: Context, action: String) =
             Intent(context, PodroidService::class.java).setAction(action)
