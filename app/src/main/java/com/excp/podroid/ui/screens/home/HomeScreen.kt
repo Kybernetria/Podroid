@@ -178,7 +178,7 @@ fun HomeScreen(
                             .verticalScroll(rememberScrollState()),
                     ) {
                         if (showAvfHint) {
-                            AvfHintBanner(onDismiss = { viewModel.dismissAvfHint() })
+                            HardwareAccelerationHintBanner(onDismiss = { viewModel.dismissAvfHint() })
                         }
                         HomeStatusBlock(
                             isStarting, isRunning, isStopping, vmState, bootStage, meta, uptimeLabel,
@@ -223,7 +223,7 @@ fun HomeScreen(
                 ) {
                     Spacer(Modifier.height(PodroidTokens.Spacing.XL))
                     if (showAvfHint) {
-                        AvfHintBanner(onDismiss = { viewModel.dismissAvfHint() })
+                        HardwareAccelerationHintBanner(onDismiss = { viewModel.dismissAvfHint() })
                     }
                     HomeStatusBlock(
                         isStarting = isStarting,
@@ -262,7 +262,7 @@ fun HomeScreen(
 }
 
 @Composable
-private fun AvfHintBanner(onDismiss: () -> Unit) {
+private fun HardwareAccelerationHintBanner(onDismiss: () -> Unit) {
     Card(
         modifier = Modifier
             .fillMaxWidth()

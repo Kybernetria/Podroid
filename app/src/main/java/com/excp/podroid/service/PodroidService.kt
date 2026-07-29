@@ -83,23 +83,27 @@ class PodroidService : Service() {
             manager = vmManager,
             lifecycleCommands = object : VmServiceLifecycleCommands {
                 override fun startForeground() {
+                    val generation = commandOrder.reserve()
                     ContextCompat.startForegroundService(
                         this@PodroidService,
-                        Intent(this@PodroidService, PodroidService::class.java).apply { action = ACTION_START },
+                        lifecycleIntent(ACTION_START, generation),
                     )
                 }
 
                 override fun stop(force: Boolean) {
-                    requestServiceStop(
-                        failureLog = if (force) "VM force stop failed" else "VM graceful stop failed",
-                        force = force,
-                    )
+                    commandOrder.executeDirect {
+                        requestServiceStop(
+                            failureLog = if (force) "VM force stop failed" else "VM graceful stop failed",
+                            force = force,
+                        )
+                    }
                 }
 
                 override fun restart() {
+                    val generation = commandOrder.reserve()
                     ContextCompat.startForegroundService(
                         this@PodroidService,
-                        Intent(this@PodroidService, PodroidService::class.java).apply { action = ACTION_RESTART },
+                        lifecycleIntent(ACTION_RESTART, generation),
                     )
                 }
             },
@@ -141,33 +145,32 @@ class PodroidService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_START -> {
+        val action = intent?.action
+        when (action) {
+            ACTION_START, ACTION_RESTART -> {
+                // Android requires this for every delivered foreground-service
+                // start, even when its reserved command has since gone stale.
                 enterForegroundStartWindow()
-                // STOPPING owns the current generation, but an ACTION_START in
-                // that window is durable and idempotent. completeStop performs
-                // the atomic handoff to exactly one fresh lazy launch.
-                val queuedDuringStop = launchCoordinator.queueStartDuringStop()
-                val startDecision = VmServiceStartPolicy.decide(
-                    managerBusy = vmManager.busy(VmId.DEFAULT).value,
-                    pendingStartOwned = launchCoordinator.ownershipActive.value,
-                )
-                val launch = if (!queuedDuringStop && startDecision.launchNewGeneration) {
-                    prepareLaunch()
-                } else {
-                    null
+                val delivery = commandOrder.deliverAndExecute(intent.commandGenerationOrNull()) {
+                    if (action == ACTION_START) {
+                        executeStartCommand()
+                    } else {
+                        acquireWakeLock()
+                        startSupervision()
+                        requestServiceRestart("VM restart stop failed")
+                    }
                 }
-                if (startDecision.acquireWakeLock) acquireWakeLock()
-                if (startDecision.armSupervision) startSupervision()
-                launch?.owner?.job?.start()
+                if (!delivery.execute) {
+                    logStaleCommand(action, delivery)
+                    reconcileAfterStaleForegroundDelivery()
+                }
             }
-            ACTION_RESTART -> {
-                enterForegroundStartWindow()
-                acquireWakeLock()
-                startSupervision()
-                requestServiceRestart("VM restart stop failed")
+            ACTION_STOP -> {
+                val delivery = commandOrder.deliverAndExecute(intent.commandGenerationOrNull()) {
+                    requestServiceStop("VM graceful stop failed", force = false)
+                }
+                if (!delivery.execute) logStaleCommand(action, delivery)
             }
-            ACTION_STOP -> requestServiceStop("VM graceful stop failed", force = false)
             else -> {
                 // Null/unrecognized action (e.g. a system redelivery): we never
                 // called startForeground for this start, so just stop to avoid a
@@ -177,6 +180,51 @@ class PodroidService : Service() {
         }
         return START_NOT_STICKY
     }
+
+    private fun executeStartCommand() {
+        // STOPPING owns the current launch generation, but an ordered start in
+        // that window is durable and idempotent. completeStop performs the
+        // atomic handoff to exactly one fresh lazy launch.
+        val queuedDuringStop = launchCoordinator.queueStartDuringStop()
+        val startDecision = VmServiceStartPolicy.decide(
+            managerBusy = vmManager.busy(VmId.DEFAULT).value,
+            pendingStartOwned = launchCoordinator.ownershipActive.value,
+        )
+        val launch = if (!queuedDuringStop && startDecision.launchNewGeneration) {
+            prepareLaunch()
+        } else {
+            null
+        }
+        if (startDecision.acquireWakeLock) acquireWakeLock()
+        if (startDecision.armSupervision) startSupervision()
+        launch?.owner?.job?.start()
+    }
+
+    private fun logStaleCommand(source: String, delivery: ServiceCommandOrder.Delivery) {
+        Log.i(
+            TAG,
+            "Ignoring stale service command source=$source generation=${delivery.generation} " +
+                "newest=${delivery.newestGeneration}",
+        )
+    }
+
+    private fun reconcileAfterStaleForegroundDelivery() {
+        if (currentLifecycleDecision().teardown) {
+            teardown()
+        } else {
+            acquireWakeLock()
+            startSupervision()
+        }
+    }
+
+    private fun lifecycleIntent(action: String, generation: Long): Intent =
+        Intent(this, PodroidService::class.java).apply {
+            this.action = action
+            putExtra(EXTRA_COMMAND_GENERATION, generation)
+        }
+
+    private fun Intent.commandGenerationOrNull(): Long? =
+        if (hasExtra(EXTRA_COMMAND_GENERATION)) getLongExtra(EXTRA_COMMAND_GENERATION, 0L) else null
 
     private fun enterForegroundStartWindow() {
         val fgType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -211,9 +259,11 @@ class PodroidService : Service() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        // App swiped from recents uses the same generation invalidation, launch
-        // cancellation/join, and bounded manager stop as the notification action.
-        requestServiceStop("Task-removal graceful stop failed", force = false)
+        // Task removal is unsequenced legacy delivery, so it atomically becomes
+        // newest before using the same bounded stop path as notification Stop.
+        commandOrder.deliverAndExecute(reservedGeneration = null) {
+            requestServiceStop("Task-removal graceful stop failed", force = false)
+        }
     }
 
     private fun requestServiceStop(failureLog: String, force: Boolean) {
@@ -628,6 +678,12 @@ class PodroidService : Service() {
         private const val CHANNEL_ID = "podroid_service"
         private const val NOTIFICATION_ID = 1001
         private const val SERVICE_LAUNCH_JOIN_TIMEOUT_MS = 8_000L
+        private const val EXTRA_COMMAND_GENERATION =
+            "com.excp.podroid.extra.SERVICE_COMMAND_GENERATION"
+
+        // Process-lifetime so a delayed explicit Intent remains stale even if
+        // Android recreates the Service object before delivering it.
+        private val commandOrder = ServiceCommandOrder()
 
         const val ACTION_START   = "com.excp.podroid.action.START"
         const val ACTION_STOP    = "com.excp.podroid.action.STOP"

@@ -12,6 +12,9 @@ import com.excp.podroid.data.repository.UpdateRepository
 import com.excp.podroid.service.VmServiceClient
 import com.excp.podroid.service.VmUiState
 import com.excp.podroid.util.NetworkUtils
+import com.excp.podroid.vm.EngineSelection
+import com.excp.podroid.vm.VmFailureAdvice
+import com.excp.podroid.vm.vmFailureAdvice
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.delay
@@ -140,12 +143,12 @@ class HomeViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     /** Advice for the failure surface, based on the current vCPU setting. */
-    val avfFailureAdvice: StateFlow<com.excp.podroid.vm.VmFailureAdvice> =
+    val avfFailureAdvice: StateFlow<VmFailureAdvice> =
         settingsRepository.vmCpus
-            .map { com.excp.podroid.vm.vmFailureAdvice(it) }
+            .map(::vmFailureAdvice)
             .stateIn(
                 viewModelScope, SharingStarted.Eagerly,
-                com.excp.podroid.vm.VmFailureAdvice.SWITCH_TO_QEMU,
+                VmFailureAdvice.SWITCH_TO_QEMU,
             )
 
     fun useOneCoreAndRetry() {
@@ -157,7 +160,7 @@ class HomeViewModel @Inject constructor(
 
     fun switchToQemuAndRetry() {
         viewModelScope.launch {
-            settingsRepository.setEngineSelection(com.excp.podroid.vm.EngineSelection.QEMU)
+            settingsRepository.setEngineSelection(EngineSelection.QEMU)
             restartVm()
         }
     }

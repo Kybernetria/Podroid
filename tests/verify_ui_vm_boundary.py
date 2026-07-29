@@ -7,29 +7,122 @@ import re
 import sys
 from pathlib import Path
 
-FORBIDDEN_ENGINE_IMPORT = re.compile(r"^\s*import\s+com\.excp\.podroid\.engine(?:\.|$)", re.MULTILINE)
-FORBIDDEN_PATTERNS = {
-    "static PodroidService lifecycle call": re.compile(r"\bPodroidService\.(?:start|stop|restart)\s*\("),
+# UI may depend on the Binder client and immutable/request DTOs only. Adding a
+# boundary import requires an explicit review here rather than silently widening
+# access to an entire implementation package.
+ALLOWED_BOUNDARY_IMPORTS = {
+    "com.excp.podroid.service.VmBackendProbe",
+    "com.excp.podroid.service.VmBindingState",
+    "com.excp.podroid.service.VmServiceClient",
+    "com.excp.podroid.service.VmUiState",
+    "com.excp.podroid.vm.ConsoleLogRequest",
+    "com.excp.podroid.vm.EngineSelection",
+    "com.excp.podroid.vm.SensitiveConsolePolicy",
+    "com.excp.podroid.vm.VmDiagnosticsRequest",
+    "com.excp.podroid.vm.VmFailureAdvice",
+    "com.excp.podroid.vm.VmRemovePolicy",
+    "com.excp.podroid.vm.vmFailureAdvice",
+}
+BOUNDARY_IMPORT_PREFIXES = (
+    "com.excp.podroid.engine",
+    "com.excp.podroid.service",
+    "com.excp.podroid.vm",
+)
+IMPORT = re.compile(
+    r"^\s*import\s+(com\.excp\.podroid\.(?:engine|service|vm)(?:\.(?:[A-Za-z_]\w*|\*))+)(?:\s+as\s+\w+)?\s*$",
+    re.MULTILINE,
+)
+BOUNDARY_REFERENCE = re.compile(
+    r"\bcom\.excp\.podroid\.(?:engine(?:\.[A-Za-z_]\w*)*|(?:service|vm)\.[A-Za-z_]\w*)"
+)
+
+# These patterns inspect executable symbols with comments and strings removed.
+FORBIDDEN_SYMBOLS = {
+    "service implementation reference": re.compile(r"\bPodroidService\b"),
     "direct VmManager dependency": re.compile(r"\bVmManager\b"),
-    "direct VmPaths dependency": re.compile(r"\bVmPaths\b|\bvmPaths\b"),
-    "direct VM state-file access": re.compile(r"\b(?:storageImage|consoleLog|instanceDirectory)\b|instances/default"),
-    "direct backend capability": re.compile(r"\b(?:VmEngine|QmpClient|QemuEngine|AvfEngine|qmpController)\b"),
+    "direct VmPaths dependency": re.compile(r"\b(?:VmPaths|vmPaths)\b"),
+    "fully qualified engine reference": re.compile(r"\bcom\.excp\.podroid\.engine(?:\.[A-Za-z_]\w*)+"),
+    "direct engine capability": re.compile(r"\bVmEngine\b"),
+    "backend capability type": re.compile(r"\b(?:Qmp|Qemu|Avf)[A-Za-z0-9_]*\b"),
+    "direct service lifecycle API": re.compile(
+        r"\b(?:bindService|unbindService|startForegroundService|startService|stopService)\s*\("
+        r"|\bPendingIntent\s*\.\s*getService\s*\("
+        r"|\bIntent\s*\([^\n;]*\b[A-Za-z_]\w*Service\s*::\s*class\.java"
+    ),
+    "direct VM state member": re.compile(
+        r"\b(?:storageImage|consoleLog|instanceDirectory|rawKernel|qmpSocket|terminalSocket)\b"
+    ),
     "application-data reset bypass": re.compile(r"\bclearApplicationUserData\s*\("),
 }
+
+# These patterns intentionally retain string literals. Otherwise constructions
+# such as filesDir.resolve("instances").resolve("default") evade the check.
+FORBIDDEN_PATHS = {
+    "internal app-data path construction": re.compile(
+        r"\b(?:filesDir|dataDir|noBackupFilesDir)\b|\bgetDir\s*\(|/data/(?:data|user)/"
+    ),
+    "path resolve bypass": re.compile(r"\bresolve(?:Sibling)?\s*\("),
+    "VM path literal": re.compile(
+        r"[\"'][^\"']*(?:instances(?:[/\\]default)?|default[/\\](?:storage|console)|storage\.img|"
+        r"console\.log|alpine-rootfs\.squashfs|vmlinuz-virt|initrd\.img|"
+        r"(?:qmp|terminal|ctrl|serial|host)\.sock)[^\"']*[\"']"
+    ),
+    "embedded default instance path": re.compile(r"instances\s*/\s*default"),
+}
+
+# The one reviewed UI-owned app-data file. It is a diagnostic export, not VM
+# state; all VM log content reaches it through VmServiceClient DTOs.
+ALLOWED_PATH_EXPRESSIONS = (
+    re.compile(r"\bFile\s*\(\s*context\.filesDir\s*,\s*[\"']log\.txt[\"']\s*\)"),
+)
+ALLOWED_PATH_EXPRESSIONS_BY_SUFFIX = {
+    # Reviewed UI asset extraction; assetPath is selected from this theme
+    # module's fixed font asset names and never from VM identity or state.
+    "theme/PodroidTokens.kt": (
+        re.compile(r"\bFile\s*\(\s*context\.filesDir\s*,\s*assetPath\s*\)"),
+    ),
+}
+
+
+def _without_comments(text: str) -> str:
+    return re.sub(r"/\*.*?\*/|//[^\n]*", "", text, flags=re.S)
+
+
+def _without_comments_or_strings(text: str) -> str:
+    return re.sub(
+        r'/\*.*?\*/|//[^\n]*|""".*?"""|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
+        "",
+        text,
+        flags=re.S,
+    )
 
 
 def verify(root: Path) -> list[str]:
     failures: list[str] = []
     for path in sorted(root.rglob("*.kt")):
         text = path.read_text(encoding="utf-8")
-        if FORBIDDEN_ENGINE_IMPORT.search(text):
-            failures.append(f"{path}: UI must not import engine packages")
-        # Remove comments and strings before token checks to avoid diagnostic
-        # prose/log tags becoming false positives. Kotlin raw strings are
-        # included; this is deliberately conservative rather than a full parser.
-        code = re.sub(r'/\*.*?\*/|//[^\n]*|""".*?"""|"(?:\\.|[^"\\])*"', "", text, flags=re.S)
-        for label, pattern in FORBIDDEN_PATTERNS.items():
-            if pattern.search(code):
+        for imported in IMPORT.findall(text):
+            if imported.startswith(BOUNDARY_IMPORT_PREFIXES) and imported not in ALLOWED_BOUNDARY_IMPORTS:
+                failures.append(f"{path}: boundary import is not allowlisted: {imported}")
+
+        symbols = _without_comments_or_strings(text)
+        for reference in BOUNDARY_REFERENCE.findall(symbols):
+            if reference.startswith("com.excp.podroid.engine") or reference not in ALLOWED_BOUNDARY_IMPORTS:
+                failures.append(f"{path}: boundary reference is not allowlisted: {reference}")
+        for label, pattern in FORBIDDEN_SYMBOLS.items():
+            if pattern.search(symbols):
+                failures.append(f"{path}: {label}")
+
+        paths = _without_comments(text)
+        for allowed in ALLOWED_PATH_EXPRESSIONS:
+            paths = allowed.sub("", paths)
+        normalized_path = path.as_posix()
+        for suffix, expressions in ALLOWED_PATH_EXPRESSIONS_BY_SUFFIX.items():
+            if normalized_path.endswith(suffix):
+                for allowed in expressions:
+                    paths = allowed.sub("", paths)
+        for label, pattern in FORBIDDEN_PATHS.items():
+            if pattern.search(paths):
                 failures.append(f"{path}: {label}")
     return failures
 
@@ -46,6 +139,7 @@ def main() -> int:
         return 1
     print("UI VM boundary verification passed")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

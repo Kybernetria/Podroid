@@ -25,6 +25,11 @@ import com.excp.podroid.vm.VmAtomicFile
 import com.excp.podroid.vm.VmPathSecurity
 import com.excp.podroid.vm.VmPaths
 import java.io.File
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** One-line entries in the diagnostic report; UI just joins them. */
 data class AvfReport(
@@ -135,32 +140,45 @@ object AvfDiagnostics {
     }
 
     /**
-     * Attempts a real minimal-VM creation using our existing alpine kernel
-     * + initrd. Returns a human-readable result string. Blocks for a few
-     * seconds. Call off the UI thread.
-     *
-     * NOTE: this only validates that *creation* + *run* are accepted by the
-     * framework — it does not stream the console or wait for guest boot.
-     * The VM is stopped/deleted immediately.
+     * Attempts a real minimal-VM creation using our existing Alpine kernel and
+     * initrd. All file/reflection work is forced onto IO, the attempt has a
+     * deadline, and every path after creation attempts bounded stop and delete.
      */
-    suspend fun runSmokeTest(context: Context, vmPaths: VmPaths): String {
+    suspend fun runSmokeTest(context: Context, vmPaths: VmPaths): String =
+        withContext(Dispatchers.IO) {
+            val result = try {
+                withTimeoutOrNull(TOTAL_SMOKE_TIMEOUT_MS) {
+                    runSmokeTestOnIo(context, vmPaths)
+                } ?: "FAILED: AVF smoke test exceeded total ${TOTAL_SMOKE_TIMEOUT_MS}ms deadline"
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                failureResult(failure)
+            }
+            boundSmokeTestResult(result)
+        }
+
+    internal fun boundSmokeTestResult(result: String): String = result.take(MAX_SMOKE_RESULT_CHARS)
+
+    private suspend fun runSmokeTestOnIo(context: Context, vmPaths: VmPaths): String {
         val application = context.applicationContext as? PodroidApplication
             ?: return "FAILED: Podroid application readiness gate unavailable"
         try {
             application.awaitAssetsReady()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (failure: Throwable) {
-            return "FAILED: default VM migration/assets unavailable: " +
-                (failure.message ?: failure.javaClass.simpleName)
+            return "FAILED: default VM migration/assets unavailable: ${failureSummary(failure)}"
         }
         val pathSecurity = VmPathSecurity(vmPaths)
         try {
             pathSecurity.validateForLaunch()
         } catch (failure: Throwable) {
-            return "FAILED: unsafe default VM paths: ${failure.message ?: failure.javaClass.simpleName}"
+            return "FAILED: unsafe default VM paths: ${failureSummary(failure)}"
         }
 
-        val pre = probe(context)
-        if (!pre.featureSupported)   return "skipped: feature flag not present (device does not ship AVF)"
+        val pre = runInterruptible(Dispatchers.IO) { probe(context) }
+        if (!pre.featureSupported) return "skipped: feature flag not present (device does not ship AVF)"
         if (!pre.managePermissionGranted) return "skipped: MANAGE_VIRTUAL_MACHINE not granted (run: adb shell pm grant ${context.packageName} $PERM_MANAGE)"
         if (!pre.customPermissionGranted) return "skipped: USE_CUSTOM_VIRTUAL_MACHINE not granted (run: adb shell pm grant ${context.packageName} $PERM_CUSTOM)"
         if (!pre.managerClassPresent) return "FAILED: $CLS_MANAGER not on the boot classpath — system stub missing"
@@ -171,59 +189,74 @@ object AvfDiagnostics {
         if (!initrd.exists()) return "FAILED: initrd not extracted yet at ${initrd.absolutePath}"
 
         if (AvfCapabilities.choose(pre.capabilitiesRaw) is AvfCapabilities.ProtectedVmChoice.Unsupported) {
-            return "not applicable on this device: the hypervisor only supports protected VMs " +
-                "(caps=${pre.capabilitiesDecoded}), and Podroid's custom Linux kernel can run only as a " +
-                "non-protected VM. This is expected, not a failure: Podroid automatically uses the QEMU " +
-                "backend here."
+            return protectedVmNotApplicable("caps=${pre.capabilitiesDecoded}")
         }
 
-        return try {
-            val vmm = getVirtualizationManager(context)
-                ?: return "FAILED: VirtualMachineManager system service returned null"
+        val vmm = runInterruptible(Dispatchers.IO) { getVirtualizationManager(context) }
+            ?: return "FAILED: VirtualMachineManager system service returned null"
 
-            // crosvm needs the raw ARM64 Image, not the gzip vmlinuz — decompress
-            // exactly like AvfEngine.ensureRawKernel (and reuse its cached .raw).
-            // Without this, crosvm fails to load the kernel ("invalid magic
-            // number") the moment it gets past arg parsing.
+        // crosvm needs the raw ARM64 Image, not gzip vmlinuz. Reuse the same
+        // confined cache as AvfEngine; preparation happens before VM creation.
+        val config = runInterruptible(Dispatchers.IO) {
             val kernel = ensureRawKernel(kernelSrc, vmPaths.rawKernel, pathSecurity)
             val customCfg = buildCustomImageConfig(kernel.absolutePath, initrd.absolutePath)
-            val config = buildVirtualMachineConfig(vmm, context, customCfg)
+            buildVirtualMachineConfig(vmm, context, customCfg)
+        }
+        val name = "podroid-avf-smoke"
 
-            val name = "podroid-avf-smoke"
-            val vm = invokeOrCreate(vmm, name, config)
-
-            // Start + immediately stop. We're proving the framework accepts us,
-            // not running a workload.
-            runCatching {
+        val execution = AvfSmokeTestExecutor().execute(
+            create = { invokeOrCreate(vmm, name, config) },
+            run = { vm ->
                 pathSecurity.validateForLaunch()
                 vm.javaClass.getMethod("run").invoke(vm)
-            }.onFailure { e ->
-                deleteSafely(vmm, name)
-                return "FAILED at vm.run(): ${e.cause?.javaClass?.simpleName ?: e.javaClass.simpleName}: ${e.cause?.message ?: e.message}"
-            }
+            },
+            stop = { vm -> vm.javaClass.getMethod("stop").invoke(vm) },
+            delete = { vmm.javaClass.getMethod("delete", String::class.java).invoke(vmm, name) },
+        )
 
-            // Give the VM 1.5s to actually start (we just want to know whether
-            // the framework rejected us — usually fails synchronously).
-            Thread.sleep(1500)
-
-            runCatching { vm.javaClass.getMethod("stop").invoke(vm) }
-            deleteSafely(vmm, name)
-
-            "SUCCESS: AVF accepted our config, VM started + stopped cleanly. The dev-grant path works on this device."
-        } catch (e: Throwable) {
-            val cause = e.cause ?: e
-            if (cause is UnsupportedOperationException &&
-                cause.message?.contains("protected", ignoreCase = true) == true) {
-                // Device is protected-only but getCapabilities() reported 0, so the
-                // framework rejected our non-protected VM at build/run instead. Same
-                // expected outcome as the early check above, not a failure.
-                "not applicable on this device: AVF rejected a non-protected VM " +
-                    "(${cause.message}). Podroid's custom Linux kernel can run only as a non-protected " +
-                    "VM. This is expected, not a failure: Podroid automatically uses the QEMU backend here."
-            } else {
-                "FAILED: ${cause.javaClass.simpleName}: ${cause.message}"
-            }
+        val cleanupFailures = buildList {
+            execution.stopFailure?.let { add("stop=${failureSummary(it)}") }
+            execution.deleteFailure?.let { add("delete=${failureSummary(it)}") }
         }
+        if (execution.timedOut) {
+            return "FAILED: AVF smoke test exceeded ${AvfSmokeTestExecutor.DEFAULT_OPERATION_TIMEOUT_MS}ms" +
+                cleanupFailures.joinToString(prefix = if (cleanupFailures.isEmpty()) "" else "; cleanup: ")
+        }
+        execution.failure?.let { failure ->
+            val cause = failure.cause ?: failure
+            if (cause is UnsupportedOperationException &&
+                cause.message?.contains("protected", ignoreCase = true) == true
+            ) {
+                return protectedVmNotApplicable(failureSummary(cause))
+            }
+            return "FAILED at VM create/run: ${failureSummary(failure)}" +
+                cleanupFailures.joinToString(prefix = if (cleanupFailures.isEmpty()) "" else "; cleanup: ")
+        }
+        if (cleanupFailures.isNotEmpty()) {
+            return cleanupFailures.joinToString(prefix = "FAILED during AVF smoke cleanup: ")
+        }
+        return "SUCCESS: AVF accepted our config, VM started + stopped cleanly. The dev-grant path works on this device."
+    }
+
+    private fun protectedVmNotApplicable(detail: String): String =
+        "not applicable on this device: AVF rejected a non-protected VM ($detail). " +
+            "Podroid's custom Linux kernel can run only as a non-protected VM. This is expected, " +
+            "not a failure: Podroid automatically uses the QEMU backend here."
+
+    private fun failureResult(failure: Throwable): String {
+        val cause = failure.cause ?: failure
+        return if (cause is UnsupportedOperationException &&
+            cause.message?.contains("protected", ignoreCase = true) == true
+        ) {
+            protectedVmNotApplicable(failureSummary(cause))
+        } else {
+            "FAILED: ${failureSummary(failure)}"
+        }
+    }
+
+    private fun failureSummary(failure: Throwable): String {
+        val cause = failure.cause ?: failure
+        return "${cause.javaClass.simpleName}: ${cause.message ?: "no detail"}"
     }
 
     private fun getVirtualizationManager(context: Context): Any? {
@@ -308,7 +341,6 @@ object AvfDiagnostics {
         } ?: error("getOrCreate returned null")
     }
 
-    private fun deleteSafely(vmm: Any, name: String) {
-        runCatching { vmm.javaClass.getMethod("delete", String::class.java).invoke(vmm, name) }
-    }
+    private const val MAX_SMOKE_RESULT_CHARS = 4 * 1024
+    private const val TOTAL_SMOKE_TIMEOUT_MS = 15_000L
 }
