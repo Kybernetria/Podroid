@@ -3,6 +3,7 @@ set -eu
 ROOTFS=/work/rootfs
 MINIMAL_PACKAGES=/work/minimal-packages.txt
 RESOLVED_PACKAGES_LOCK=/work/resolved-packages.lock
+RUNLEVELS_LOCK=/work/runlevels.lock
 MAX_EXPLICIT_PACKAGES=32
 MAX_RESOLVED_PACKAGES=128
 
@@ -129,20 +130,67 @@ Kernel \r on \m (\l)
 
 EOF
 
-# Set runlevels via direct symlinks: the x86_64 builder cannot chroot into the
-# AArch64 image to invoke rc-update. No appliance/container/X11 services belong
-# in this minimal guest runlevel.
-mkdir -p "$ROOTFS/etc/runlevels/default" "$ROOTFS/etc/runlevels/boot"
-for svc in podroid-migrate podroid-bootstrap podroid-network podroid-resize dropbear podroid-vsock podroid-downloads podroid-hostd podroid-ready; do
-    [ -e "$ROOTFS/etc/init.d/$svc" ] || {
-        echo "required init script missing: $svc" >&2
+# Reconstruct every runlevel executed by inittab from the reviewed source lock.
+# Removing apk's runlevel tree first makes package drift unable to add an
+# implicit boot or shutdown service. The x86_64 builder cannot chroot into the
+# AArch64 image to invoke rc-update.
+rm -rf "$ROOTFS/etc/runlevels"
+mkdir -p "$ROOTFS/etc/runlevels/sysinit" "$ROOTFS/etc/runlevels/boot" \
+         "$ROOTFS/etc/runlevels/default" "$ROOTFS/etc/runlevels/shutdown"
+seen_sysinit=0
+seen_boot=0
+seen_default=0
+seen_shutdown=0
+empty_sysinit=0
+empty_boot=0
+empty_default=0
+empty_shutdown=0
+while IFS=' ' read -r runlevel entry target extra || [ -n "${runlevel:-}" ]; do
+    case "${runlevel:-}" in
+        ''|'#'*) continue ;;
+        sysinit) seen_sysinit=1 ;;
+        boot) seen_boot=1 ;;
+        default) seen_default=1 ;;
+        shutdown) seen_shutdown=1 ;;
+        *) echo "unknown reviewed runlevel: $runlevel" >&2; exit 1 ;;
+    esac
+    [ -z "${extra:-}" ] || { echo "malformed runlevel lock entry" >&2; exit 1; }
+    if [ "$entry" = - ] && [ "$target" = - ]; then
+        case "$runlevel" in
+            sysinit) [ "$empty_sysinit" = 0 ] || { echo "duplicate empty runlevel declaration: $runlevel" >&2; exit 1; }; empty_sysinit=1 ;;
+            boot) [ "$empty_boot" = 0 ] || { echo "duplicate empty runlevel declaration: $runlevel" >&2; exit 1; }; empty_boot=1 ;;
+            default) [ "$empty_default" = 0 ] || { echo "duplicate empty runlevel declaration: $runlevel" >&2; exit 1; }; empty_default=1 ;;
+            shutdown) [ "$empty_shutdown" = 0 ] || { echo "duplicate empty runlevel declaration: $runlevel" >&2; exit 1; }; empty_shutdown=1 ;;
+        esac
+        continue
+    fi
+    case "$runlevel" in
+        sysinit) [ "$empty_sysinit" = 0 ] ;;
+        boot) [ "$empty_boot" = 0 ] ;;
+        default) [ "$empty_default" = 0 ] ;;
+        shutdown) [ "$empty_shutdown" = 0 ] ;;
+    esac || { echo "runlevel mixes empty and populated declarations: $runlevel" >&2; exit 1; }
+    case "$entry:$target" in
+        *[!a-zA-Z0-9_.+-]*:*|*:*[!a-zA-Z0-9_./+-]*)
+            echo "malformed runlevel entry: $runlevel $entry $target" >&2
+            exit 1
+            ;;
+    esac
+    [ "$target" = "/etc/init.d/$entry" ] || {
+        echo "runlevel target is not its exact init script: $runlevel $entry" >&2
         exit 1
     }
-    ln -sf "/etc/init.d/$svc" "$ROOTFS/etc/runlevels/default/$svc"
-done
-
-# Initramfs and Podroid services own these responsibilities; remove noisy stock
-# defaults from the image runlevels.
-for svc in hwclock swclock urandom networking sysctl bootmisc syslog; do
-    rm -f "$ROOTFS/etc/runlevels/boot/$svc" "$ROOTFS/etc/runlevels/default/$svc"
-done
+    [ -f "$ROOTFS/etc/init.d/$entry" ] && [ ! -L "$ROOTFS/etc/init.d/$entry" ] || {
+        echo "required regular init script missing: $entry" >&2
+        exit 1
+    }
+    [ ! -e "$ROOTFS/etc/runlevels/$runlevel/$entry" ] || {
+        echo "duplicate runlevel entry: $runlevel $entry" >&2
+        exit 1
+    }
+    ln -s "$target" "$ROOTFS/etc/runlevels/$runlevel/$entry"
+done < "$RUNLEVELS_LOCK"
+[ "$seen_sysinit$seen_boot$seen_default$seen_shutdown" = 1111 ] || {
+    echo "runlevel lock does not declare every inittab runlevel" >&2
+    exit 1
+}

@@ -52,7 +52,7 @@
       <p class="lead">What Podroid is genuinely good for, what it does with caveats, and what to avoid - with honest notes on TCG performance throughout.</p>
 
       <h2>Self-hosting via containers</h2>
-      <p>Rootless Podman, Docker and LXC are all ready the moment the VM boots: Podman needs no daemon, and the Docker and LXC services are enabled in the default runlevel, so they start automatically. You can run any ARM64 container image from Docker Hub or GHCR.</p>
+      <p>No orchestrator is bundled or enabled at boot. The guest kernel provides the prerequisites for you to install and configure Podman, Docker, LXC, or another orchestrator later. The examples below apply only after that guest-owned provisioning.</p>
       <p>Port forwarding rules (see <a href="networking.html">Networking &amp; ports</a>) expose guest ports on the phone's real IP. Use a host port above 1024 for anything you expose, because an unprivileged Android app cannot bind host ports below 1024.</p>
       <pre><code><span class="c"># Pi-hole (DNS + ad-blocking)</span>
 <span class="p">$</span> podman run -d --name pihole \
@@ -112,7 +112,7 @@
       </div>
 
       <h2>GUI Linux apps</h2>
-      <p>The in-app X11 viewer connects to an Xvnc display in the guest. Install a desktop environment or individual X11 apps and they appear directly in the viewer with touch, external keyboard and mouse, and audio forwarding.</p>
+      <p>The minimal guest does not bundle Xvnc, PulseAudio, desktop/font packages, display defaults, listeners, or display/audio forwards. The inherited Android viewer therefore has no endpoint. These package examples alone are not sufficient; using the viewer requires manual installation and secure configuration of a compatible RFB endpoint and explicit forwarding.</p>
       <pre><code><span class="c"># Install XFCE and common accessories</span>
 <span class="p">$</span> apk add xfce4 xfce4-terminal mousepad ristretto xfce4-taskmanager
 
@@ -121,7 +121,7 @@
 
 <span class="c"># Install GIMP</span>
 <span class="p">$</span> apk add gimp</code></pre>
-      <p>See <a href="desktop.html">Desktops &amp; X11 viewer</a> for how to start and configure the Xvnc session. Note that only X11 desktop sessions render correctly; Wayland sessions (GNOME on Wayland, Plasma Wayland, sway) do not render in the viewer - see <a href="limitations.html">Limitations</a>.</p>
+      <p>See <a href="desktop.html">Desktops &amp; X11 viewer</a> for the current endpoint status and manual-provisioning caveats.</p>
 
       <h2>Learning Linux and containers</h2>
       <p>Podroid gives you a real Linux kernel with cgroup v2, network namespaces, overlayfs, netfilter/nftables, and OpenRC - all on hardware you already own. Nothing is simulated or mocked; the same kernel features that production servers use are present and explorable.</p>
@@ -157,9 +157,9 @@
 
       <h2>What works poorly</h2>
       <ul>
-        <li><strong>Wayland desktops</strong> - GNOME Wayland, Plasma Wayland, sway, and Hyprland do not render in the X11 viewer. Use XFCE or another X11 session instead.</li>
+        <li><strong>Bundled GUI access</strong> - there is no guest X11/VNC/audio endpoint. The retained Android viewer cannot display a desktop until a compatible endpoint is manually installed, secured, and forwarded.</li>
         <li><strong>Heavy compilation on TCG</strong> - building LLVM, the Linux kernel, or large Rust crates inside the VM is feasible but very slow (hours, not minutes). Cross-compile on a real machine and copy the result over SSH.</li>
-        <li><strong>x86 Docker images</strong> - pulling an <code>linux/amd64</code> image runs it under double emulation (QEMU TCG emulating ARM64 guest, which then runs QEMU user-mode emulating x86). Expect 50-100x slowdown. Always prefer <code>linux/arm64</code> images.</li>
+        <li><strong>x86 OCI images</strong> - after provisioning a runtime, running a <code>linux/amd64</code> image adds another emulation layer and is extremely slow. Prefer <code>linux/arm64</code> images.</li>
         <li><strong>UDP port forwarding on AVF</strong> - UDP rules are silently ignored on the AVF backend; switch to QEMU if you need UDP (e.g. a game server or DNS resolver serving LAN clients).</li>
         <li><strong>A full desktop environment at 512 MB RAM</strong> - XFCE with a browser open will page heavily into ZRAM swap at 512 MB. Set RAM to 1 GB or more in Settings if you plan to run a desktop regularly.</li>
       </ul>

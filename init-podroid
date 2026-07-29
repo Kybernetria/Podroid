@@ -67,19 +67,18 @@ echo "Mounting system..." > /dev/console
 mount -t squashfs -o ro /dev/vdb /mnt/lower \
     || { echo "FATAL: squashfs (/dev/vdb) mount failed" > /dev/console; ls -l /dev/vd* > /dev/console 2>&1; exec sh; }
 
-mkdir -p /mnt/persist/upper /mnt/persist/work /mnt/persist/.podroid \
+mkdir -p /mnt/persist/upper /mnt/persist/work \
     || { echo "FATAL: mkdir overlay upper/work failed" > /dev/console; exec sh; }
 
 # One-time legacy-overlay normalization: older versions mounted the overlay with
 # metacopy=on,redirect_dir=on,index=on, which bind the upper to the OLD lower.
-# We now use a PLAIN overlay (below), so before stacking we strip that legacy
-# metadata from the upper using the normalizer shipped in the (new) squashfs.
-# No-op on a fresh or already-normalized upper. Guarded so it runs at most once.
-if [ ! -f /mnt/persist/.podroid/normalized ]; then
-    echo "Normalizing overlay (one-time)..." > /dev/console
-    /mnt/lower/usr/local/bin/podroid-overlay-normalize /mnt/persist/upper /mnt/persist/work > /dev/console 2>&1 || true
-    : > /mnt/persist/.podroid/normalized
-fi
+# The immutable helper validates the marker with no-follow operations, performs
+# all cleanup, and atomically creates the marker only after complete success.
+# Any failure leaves the replacement lower unstacked and drops to recovery so a
+# later boot can retry against the same preserved upper.
+echo "Checking legacy overlay normalization..." > /dev/console
+/mnt/lower/usr/local/bin/podroid-overlay-normalize /mnt/persist > /dev/console 2>&1 \
+    || { echo "FATAL: overlay normalization failed; replacement system not mounted" > /dev/console; exec sh; }
 
 echo "Stacking overlay..." > /dev/console
 # PLAIN overlay (no metacopy/redirect_dir/index): tolerates a swapped lower, so a

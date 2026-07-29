@@ -104,8 +104,8 @@
         <li><strong>Backup</strong> and <strong>Status</strong> buttons - see <a href="use-cases.html">Use cases</a> for what each does</li>
       </ul>
 
-      <h2>Terminal and X11 viewer</h2>
-      <p>Tap the terminal icon from the home screen to open a full VT100 terminal connected to the VM shell. Inside the terminal, tap the monitor icon in the top bar to open the X11 viewer - needed for GUI Linux apps and desktop environments.</p>
+      <h2>Terminal and inherited X11 viewer</h2>
+      <p>Tap the terminal icon from the home screen to open a full VT100 terminal connected to the VM shell. The inherited Android X11 viewer remains visible, but the minimal guest bundles no Xvnc, PulseAudio, desktop/fonts, listener, or automatic display/audio forward, so it has no guest endpoint unless you provision one manually.</p>
 
       <h2>Local guest console</h2>
       <p>The in-app terminal is an app-owned console connected directly to the Linux guest over QEMU virtio-console or the AVF console transport. Its dedicated getty automatically opens a guest-root session. This is not remote authentication and it is not an Android shell.</p>

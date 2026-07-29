@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Overview · Podroid docs</title>
-  <meta name="description" content="Podroid documentation: run Linux containers and a Linux desktop on Android with no root, via a real Alpine VM on QEMU or AVF/pKVM." />
+  <meta name="description" content="Podroid documentation: run a minimal, persistent Alpine VM on Android with no root, via QEMU or AVF/pKVM, and provision optional workloads later." />
   <link rel="icon" type="image/png" href="../logo.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -49,9 +49,9 @@
 
     <main class="content">
       <h1>Podroid documentation</h1>
-      <p class="lead">Podroid runs real Linux - Podman, Docker, LXC, and a Linux desktop - on an Android phone, with no root and no custom recovery. It boots an Alpine Linux VM with a custom Linux 7.0.10 kernel inside the app.</p>
+      <p class="lead">Podroid runs a real, minimal Alpine Linux VM on an Android phone, with no root and no custom recovery. The guest is a persistent foundation for shell use and later guest-owned workload provisioning.</p>
 
-      <p>There are two ways the VM runs. By default it uses <strong>QEMU</strong> with software CPU emulation (TCG), which works on any ARM64 Android 8+ device. On recent Pixel devices that ship pKVM, Podroid can instead use the <strong>Android Virtualization Framework (AVF)</strong> for near-native speed. Either way you get the same Alpine guest, the same terminal, and the same in-app X11 viewer for GUI apps.</p>
+      <p>There are two ways the VM runs. By default it uses <strong>QEMU</strong> with software CPU emulation (TCG), which works on any ARM64 Android 8+ device. On supported devices that ship pKVM, Podroid can instead use the <strong>Android Virtualization Framework (AVF)</strong> for near-native speed. Either way you get the same minimal Alpine guest and terminal.</p>
 
       <div class="callout note">
         <span class="label">No root required</span>
@@ -60,9 +60,9 @@
 
       <h2>What you can do with it</h2>
       <ul>
-        <li><strong>Run containers</strong> - rootless Podman is wired up out of the box; Docker and LXC are pre-installed. Self-host Pi-hole, Gitea, code-server, Vaultwarden and more.</li>
-        <li><strong>A real Linux shell</strong> - a full Alpine system with <code>apk</code> package management that persists across reboots. SSH in from your laptop on the same Wi-Fi.</li>
-        <li><strong>GUI Linux apps</strong> - install a desktop or single X11 apps and view them in the app, with touch, trackpad, external keyboard and mouse, and audio.</li>
+        <li><strong>Provision an orchestrator later</strong> - the kernel includes container prerequisites, while Docker, Podman, LXC and their networking stacks remain opt-in guest packages.</li>
+        <li><strong>A real Linux shell</strong> - a minimal Alpine system with <code>apk</code> package management that persists across reboots. Provision a public key to SSH from your laptop.</li>
+        <li><strong>Choose your own workloads</strong> - no Xvnc, PulseAudio, desktop or guest font packages are bundled, and no display/audio listener or forward is created.</li>
         <li><strong>Learn Linux &amp; containers</strong> - cgroups, namespaces, overlayfs, netfilter, OpenRC services - all on a device you already own.</li>
       </ul>
 

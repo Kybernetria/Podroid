@@ -46,6 +46,7 @@ ENV ALPINE_VERSION=${ALPINE_RELEASE}
 COPY files /work/files
 COPY minimal-packages.txt /work/minimal-packages.txt
 COPY resolved-packages.lock /work/resolved-packages.lock
+COPY runlevels.lock /work/runlevels.lock
 COPY build-rootfs.sh /work/build-rootfs.sh
 COPY generate-root-password-hash.sh /work/generate-root-password-hash.sh
 RUN chmod +x /work/build-rootfs.sh /work/generate-root-password-hash.sh \

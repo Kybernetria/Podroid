@@ -49,7 +49,7 @@
 
     <main class="content">
       <h1>Networking &amp; port forwarding</h1>
-      <p class="lead">The Alpine guest has full outbound internet access from first boot. Inbound access - SSH, VNC, container services - works through port forwarding, with a few rules injected automatically and the rest configured in Settings.</p>
+      <p class="lead">The Alpine guest has outbound internet access from first boot. Inbound access uses explicit port forwarding. The minimal image creates no VNC or audio listener/forward.</p>
 
       <h2>Guest network: SLIRP user-mode</h2>
       <p>On the QEMU backend the guest network is provided by <strong>SLIRP</strong>, a userspace TCP/IP stack embedded inside QEMU. No root, no kernel TUN/TAP device, and no host-side network interface are involved. From inside the guest the network looks like a small NAT:</p>
@@ -73,8 +73,8 @@
         <p>On the AVF backend the guest receives its IP from Android's built-in tethering via DHCP (udhcpc), rather than a static SLIRP address. The default route and DNS are assigned by the Android network stack. Inbound connectivity still works through port forwarding as described below, but the transport is vsock rather than SLIRP hostfwd.</p>
       </div>
 
-      <h2>Implicit port forwards</h2>
-      <p>Three port forwards are injected automatically every time the VM starts. They never appear in the port-forward UI and cannot be removed from there:</p>
+      <h2>Implicit user-facing port forward</h2>
+      <p>Only the optional SSH rule is added for user-facing inbound access. It does not appear in the port-forward UI:</p>
 
       <table>
         <thead>
@@ -88,31 +88,17 @@
             <td>TCP</td>
             <td>When SSH is enabled in Settings</td>
           </tr>
-          <tr>
-            <td>X11 / VNC (Xvnc)</td>
-            <td><code>5900</code></td>
-            <td><code>5900</code></td>
-            <td>TCP</td>
-            <td>Always (backs the in-app screen viewer)</td>
-          </tr>
-          <tr>
-            <td>PulseAudio</td>
-            <td><code>4713</code></td>
-            <td><code>4713</code></td>
-            <td>TCP</td>
-            <td>Always (backs the in-app audio stream)</td>
-          </tr>
         </tbody>
       </table>
 
-      <p>The SSH forward is conditional: if you turn SSH off in Settings, the 9922&rarr;22 rule is not added and dropbear does not start inside the guest. The VNC and PulseAudio forwards are unconditional because the in-app X11 viewer depends on them.</p>
+      <p>If SSH is off, the 9922&rarr;22 rule is not added and Dropbear does not start. The inherited Android X11 viewer has no bundled guest endpoint: Xvnc and PulseAudio are absent, and Podroid creates no port 5900/4713 listener or automatic forward. Any endpoint installed later needs an explicit, user-owned rule.</p>
 
       <h2>Adding your own rules</h2>
       <p>Open <strong>Settings &rarr; Port forwards &rarr; Add</strong>. Enter a host port (on the Android device), a VM port (inside the guest), and pick TCP, UDP, or Both. On the QEMU backend rules apply live via the QMP protocol - no VM restart is needed. Rules are persisted across reboots.</p>
 
-      <p>A typical setup for a container service listening on guest port 8080:</p>
+      <p>After you install and configure an orchestrator, a service listening on guest port 8080 could be exposed like this:</p>
 
-      <pre><code><span class="c"># Inside the guest: start your service on port 8080</span>
+      <pre><code><span class="c"># Example only after provisioning Podman inside the guest</span>
 podman run -d -p 8080:80 nginx
 
 <span class="c"># In Settings -> Port forwards -> Add:
@@ -180,9 +166,6 @@ podroid-server status</code></pre>
       <pre><code><span class="c"># SSH from a laptop on the same Wi-Fi, after provisioning its public key</span>
 <span class="p">$</span> ssh root@&lt;phone-ip&gt; -p 9922
 
-<span class="c"># VNC from any viewer</span>
-<span class="p">$</span> vncviewer &lt;phone-ip&gt;:5900
-
 <span class="c"># HTTP service forwarded to host port 8080</span>
 <span class="p">$</span> curl http://&lt;phone-ip&gt;:8080</code></pre>
 
@@ -201,7 +184,7 @@ podroid-server status</code></pre>
 
       <div class="callout warn">
         <span class="label">Workaround</span>
-        <p>Forward to a high host port instead of the standard one: map host <code>8080</code> to guest <code>80</code>, and host <code>8443</code> to guest <code>443</code>. A daemon running as guest-root can still listen on 80 or 443. A <strong>rootless Podman or Docker</strong> container is the exception: its published port is also subject to the &ge;1024 limit inside the guest, so publish to a high guest port too - e.g. a Pi-hole DNS container on guest <code>5353/udp</code>, forwarded to host <code>5353</code>, with LAN clients pointed at <code>&lt;phone-ip&gt;:5353</code>.</p>
+        <p>Forward to a high host port instead of the standard one: map host <code>8080</code> to guest <code>80</code>, and host <code>8443</code> to guest <code>443</code>. A daemon running as guest-root can still listen on 80 or 443. If you later install a rootless orchestrator, its published ports may also need to be at least 1024 inside the guest.</p>
       </div>
 
       <pre><code><span class="c"># Forward a web server on guest :80 to a high host port</span>
@@ -216,7 +199,7 @@ podroid-server status</code></pre>
       <div class="callout note">
         <span class="label">UDP on AVF</span>
         <p>UDP forwarding works on both backends. Because vsock is a stream transport, each inbound UDP datagram is length-framed and carried over a per-client vsock connection, then delivered to the guest as a real UDP datagram - so a guest DNS server such as Pi-hole is reachable over UDP. Idle flows are reaped automatically, and the number of concurrent client flows is capped to bound resource use.</p>
-        <p>The privileged-port limit applies at both ends: an unprivileged Android app can't bind a host port below 1024, and rootless Podman can't publish a privileged port inside the guest either. So run a DNS server like Pi-hole on a high port - for example host <code>5353/udp</code> to guest <code>5353/udp</code> - and point clients at <code>&lt;phone-ip&gt;:5353</code>.</p>
+        <p>The privileged-port limit applies on Android and may also apply to a rootless orchestrator installed later. Use high ports at both ends when required - for example host <code>5353/udp</code> to guest <code>5353/udp</code>.</p>
       </div>
 
       <div class="pagenav">

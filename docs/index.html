@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Podroid: Linux containers on Android, no root required</title>
-  <meta name="description" content="Podroid runs Podman, Docker, and LXC on Android in a real Alpine Linux VM with a custom Linux 7.0.10 kernel - via QEMU on any ARM64 device, or hardware-accelerated AVF (pKVM) on supported Pixels - plus an in-app X11 desktop for GUI apps. No root, no custom recovery." />
+  <meta name="description" content="Podroid runs a minimal Alpine Linux VM on Android as a persistent, orchestrator-ready foundation - via QEMU on any ARM64 device or AVF (pKVM) on supported Pixels. No root or custom recovery." />
   <meta property="og:title" content="Podroid: Linux containers on Android, no root required" />
-  <meta property="og:description" content="Spin up a real Alpine Linux VM with a full Podman runtime on any Android 8+ ARM64 device. QEMU software emulation everywhere, or near-native AVF (pKVM) acceleration on supported Pixels. No root, no Magisk." />
+  <meta property="og:description" content="Spin up a real minimal Alpine Linux VM on Android 8+ ARM64. Install the workload software you choose later; no container runtime or desktop stack is bundled." />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://extv.github.io/Podroid/" />
   <meta property="og:image" content="https://extv.github.io/Podroid/logo.png" />
@@ -566,9 +566,9 @@
 <section id="hero">
   <h1>Linux containers on Android.<br /><em>No root required.</em></h1>
   <p class="hero-sub">
-    Podroid spins up a real Alpine Linux VM using QEMU and a custom&nbsp;kernel.<br />
-    Run <strong>Podman</strong>, <strong>Docker</strong>, and <strong>LXC</strong> with a polished built-in terminal,<br />
-    or open the in-app <strong>X11 viewer</strong> for GUI apps. Install the APK, tap Start, go.
+    Podroid spins up a real, minimal Alpine Linux VM using QEMU or AVF and a custom&nbsp;kernel.<br />
+    Start with a persistent shell and install only the workload software you choose.<br />
+    Container runtimes and desktop/audio stacks are not bundled.
   </p>
   <div class="hero-actions">
     <a href="https://github.com/ExTV/Podroid/releases" class="btn btn-primary">
@@ -600,8 +600,8 @@
         <div class="feature-icon">
           <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/><line x1="12" y1="12" x2="12" y2="16"/><line x1="10" y1="14" x2="14" y2="14"/></svg>
         </div>
-        <h3>Podman, Docker, LXC</h3>
-        <p>All three major container engines work zero-config. Native kernel <code>overlay2</code> for Docker, <code>fuse-overlayfs</code> for rootless Podman, and a pre-configured <code>lxcbr0</code> bridge for LXC. Pull any OCI image and run it.</p>
+        <h3>Orchestrator-ready foundation</h3>
+        <p>The kernel includes namespaces, cgroup v2, overlayfs, bridge, veth, TUN/FUSE, and netfilter prerequisites for later guest-owned orchestration. Podman, Docker, and LXC are not pre-installed or auto-started.</p>
       </div>
 
       <div class="feature-card">
@@ -609,7 +609,7 @@
           <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>
         </div>
         <h3>Custom Linux 7.0.10 Kernel</h3>
-        <p>Compiled from scratch with netfilter, bridge, overlayfs, veth, IPVS, VXLAN, IPsec, cgroup v2, and binfmt_misc all built-in. Docker's <code>check-config.sh</code> reports zero fixable complaints.</p>
+        <p>Compiled from scratch with netfilter, bridge, overlayfs, veth, IPVS, VXLAN, IPsec, cgroup v2, and binfmt_misc built in for a capable minimal Linux guest.</p>
       </div>
 
       <div class="feature-card">
@@ -656,8 +656,8 @@
         <div class="feature-icon">
           <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
         </div>
-        <h3>In-app X11 Desktop</h3>
-        <p>Tap the monitor icon in the terminal and an in-app viewer opens, talking RFB to <code>Xvnc</code> inside the VM. Touch becomes mouse, soft-keyboard becomes keyboard, and PCM audio streams from PulseAudio. Run <code>firefox</code>, <code>xterm</code>, anything from Alpine.</p>
+        <h3>Legacy viewer retained</h3>
+        <p>The inherited Android X11/VNC viewer remains during staged refactoring, but the minimal guest supplies no Xvnc, PulseAudio, desktop, fonts, display environment, listener, or automatic display/audio forward. It has no bundled guest endpoint.</p>
       </div>
 
       <div class="feature-card">
@@ -712,7 +712,7 @@
   <div class="container">
     <p class="section-label">Comparison</p>
     <h2>How Podroid stacks up</h2>
-    <p class="section-sub">Termux gives you a Linux shell. Google Terminal gives you a VM with optional manual container setup. Podroid ships three container engines out of the box.</p>
+    <p class="section-sub">Podroid provides a persistent Alpine VM on QEMU or AVF. Container orchestration is optional software that you provision inside the guest later.</p>
 
     <div class="table-wrap">
       <table>
@@ -748,7 +748,7 @@
           </tr>
           <tr>
             <td class="row-label">Real container runtime</td>
-            <td class="col-podroid"><span class="check">✓ Podman + Docker + LXC</span></td>
+            <td class="col-podroid"><span class="partial">manual provisioning</span></td>
             <td><span class="cross">✗</span></td>
             <td><span class="partial">manual setup</span></td>
           </tr>
@@ -759,8 +759,8 @@
             <td><span class="check">✓ AVF</span></td>
           </tr>
           <tr>
-            <td class="row-label">Docker Hub images</td>
-            <td class="col-podroid"><span class="check">✓</span></td>
+            <td class="row-label">OCI images</td>
+            <td class="col-podroid"><span class="partial">after runtime setup</span></td>
             <td><span class="cross">✗</span></td>
             <td><span class="partial">manual setup</span></td>
           </tr>
@@ -832,9 +832,9 @@
             │   │   /sbin/init (busybox)           │    │
             │   │   OpenRC (PID 1)                 │    │
             │   │  ┌──────────┐  ┌──────────────┐  │    │
-            │   │  │ Podman + │  │ Linux 7.0.10 │  │    │
-            └──►│  │  Docker  │  │   (custom)   │  │◄───┘
-   boot stages  │  │ + LXC    │  └──────────────┘  │  libpodroid-bridge.so
+            │   │  │ Minimal  │  │ Linux 7.0.10 │  │    │
+            └──►│  │  Alpine  │  │   (custom)   │  │◄───┘
+   boot stages  │  │   base   │  └──────────────┘  │  libpodroid-bridge.so
                 │  └──────────┘                    │  PTY ↔ virtio-console
                 │                                  │
                 │  /dev/vda  ext4 overlay (rw)     │
@@ -866,7 +866,7 @@ qmp.sock               →  runtime port-forward control</div>
         <div class="step-num">3</div>
         <div class="step-body">
           <h4>OpenRC services start</h4>
-          <p>Cgroup v2, network, Docker bind-mount, <code>lxcbr0</code> bridge, MASQUERADE NAT, sysctls, and Dropbear SSH all come up automatically.</p>
+          <p>The reviewed minimal services bring up cgroup v2, networking, the guest-to-Android bridge, optional public-key Dropbear SSH, and workload prerequisites. No container or desktop service is started.</p>
         </div>
       </div>
       <div class="step">
@@ -907,24 +907,20 @@ qmp.sock               →  runtime port-forward control</div>
         </div>
         <div class="qs-step">
           <div class="qs-step-num">5</div>
-          <p><strong>Run containers.</strong> Any image from Docker Hub works out of the box.</p>
+          <p><strong>Provision what you need.</strong> Use Alpine's package manager to add an orchestrator or other workload later.</p>
         </div>
       </div>
 
-      <div class="code-block"><span class="c-comment"># Podman: rootless, works out of the box</span>
-<span class="c-prompt"># </span><span class="c-cmd">podman run --rm alpine echo hi</span>
+      <div class="code-block"><span class="c-comment"># Inspect available Alpine packages</span>
+<span class="c-prompt"># </span><span class="c-cmd">apk update &amp;&amp; apk search podman</span>
 
-<span class="c-comment"># Docker: pre-installed, auto-started</span>
-<span class="c-prompt"># </span><span class="c-cmd">docker run -d -p 8080:80 nginx</span>
+<span class="c-comment"># Install and configure only the runtime you choose</span>
+<span class="c-prompt"># </span><span class="c-cmd">apk add podman</span>
 
-<span class="c-comment"># LXC: pre-installed, bridge ready</span>
-<span class="c-prompt"># </span><span class="c-cmd">lxc-create -t alpine -n test</span>
-<span class="c-prompt"># </span><span class="c-cmd">lxc-start -n test</span>
+<span class="c-comment"># No Xvnc, PulseAudio, desktop, or guest fonts are bundled</span>
+<span class="c-prompt"># </span><span class="c-cmd">cat /etc/podroid/system-version</span>
 
-<span class="c-comment"># GUI apps: tap the monitor icon</span>
-<span class="c-prompt"># </span><span class="c-cmd">apk add firefox &amp;&amp; firefox &amp;</span>
-
-<span class="c-comment"># SSH (enable in Settings)</span>
+<span class="c-comment"># SSH (enable in Settings and provision your public key)</span>
 <span class="c-prompt">$ </span><span class="c-cmd">ssh root@&lt;phone-ip&gt; -p 9922</span></div>
     </div>
   </div>
@@ -949,14 +945,14 @@ qmp.sock               →  runtime port-forward control</div>
       <details>
         <summary>Why not just use Termux + proot?</summary>
         <div class="faq-answer">
-          Termux is great for a Linux shell, but it runs on Android's host kernel. That kernel doesn't have the namespaces, cgroups, or netfilter rules needed for real containers. <code>proot</code> is a chroot emulation; containers built for Docker, Podman, or LXC won't work reliably. Podroid runs a real VM with its own custom kernel, so every OCI image from Docker Hub just works.
+          Termux is great for a Linux shell, but it runs on Android's host kernel. <code>proot</code> is a userspace filesystem/process translation rather than a VM. Podroid supplies an isolated guest with its own kernel and container prerequisites; install and configure the orchestrator you choose before running OCI workloads.
         </div>
       </details>
 
       <details>
         <summary>How is this different from Google Terminal / AVF?</summary>
         <div class="faq-answer">
-          Google's Terminal app uses Android Virtualization Framework (AVF), a system-level hypervisor available only on recent Pixel devices. It gives you a Debian VM but no container runtime and limited configurability. Podroid runs on <em>any</em> ARM64 Android 8+ device via QEMU TCG (software emulation), and on a Pixel that ships pKVM it can use AVF too for near-native speed - the same Alpine guest either way. It ships with three container engines, port forwarding, SSH, an in-app X11 desktop, and a configurable terminal.
+          Google's Terminal app uses Android Virtualization Framework (AVF), a system-level hypervisor available only on supported devices. Podroid runs on <em>any</em> ARM64 Android 8+ device via QEMU TCG and can use AVF where available. It ships the same minimal Alpine guest, terminal, port forwarding, and optional public-key SSH on either backend; orchestrators are installed later by the guest owner.
         </div>
       </details>
 
@@ -984,7 +980,7 @@ qmp.sock               →  runtime port-forward control</div>
       <details>
         <summary>Can I run GUI apps like Firefox?</summary>
         <div class="faq-answer">
-          Yes. Tap the monitor icon in the terminal's top bar to open the in-app X11 viewer. It speaks RFB 3.8 to <code>Xvnc</code> running inside the VM and streams audio from PulseAudio. Then just <code>apk add firefox</code> (or anything else from the Alpine repos) and launch it from the shell. Touch becomes mouse, the soft-keyboard becomes keyboard, and the picture letterboxes to your phone's aspect ratio.
+          Not from the minimal guest as shipped. The inherited Android viewer remains visible, but there is no bundled Xvnc or PulseAudio server, desktop/font package, display/audio listener, or automatic forward for it to connect to. A guest owner may provision and secure a compatible endpoint later, but that is manual configuration.
         </div>
       </details>
 
@@ -1005,7 +1001,7 @@ qmp.sock               →  runtime port-forward control</div>
       <details>
         <summary>How much storage does it use?</summary>
         <div class="faq-answer">
-          The APK is ~200 MB (QEMU + kernel + initramfs + Alpine squashfs + fonts). On first launch you choose a VM disk size between 2 GB and 64 GB; this is a sparse <code>storage.img</code> that only grows as you pull images and install packages.
+          The APK contains QEMU, the kernel, initramfs, minimal Alpine squashfs, and Android terminal UI assets; guest desktop/font packages are not included. On first launch you choose a VM disk size between 2 GB and 64 GB. The sparse <code>storage.img</code> grows as you install packages and create data.
         </div>
       </details>
 
@@ -1024,7 +1020,7 @@ qmp.sock               →  runtime port-forward control</div>
 <footer>
   <p>
     Podroid · <a href="https://github.com/ExTV/Podroid">github.com/ExTV/Podroid</a> · GPLv2 ·
-    Built on <a href="https://www.qemu.org">QEMU</a>, <a href="https://podman.io">Podman</a>, <a href="https://alpinelinux.org">Alpine</a>, <a href="https://github.com/termux/termux-app">Termux</a>
+    Built on <a href="https://www.qemu.org">QEMU</a>, <a href="https://alpinelinux.org">Alpine</a>, and <a href="https://github.com/termux/termux-app">Termux</a>
   </p>
 </footer>
 

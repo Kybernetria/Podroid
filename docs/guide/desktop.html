@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Desktops &amp; the X11 viewer · Podroid docs</title>
-  <meta name="description" content="Run an X11 Linux desktop inside Podroid and view it with the built-in VNC viewer. Covers setup-desktop, supported DEs, viewer settings, and known limitations." />
+  <meta name="description" content="Status of Podroid's inherited Android X11 viewer: the minimal guest bundles no Xvnc, PulseAudio, desktop, fonts, listeners, or automatic display/audio forwards." />
   <link rel="icon" type="image/png" href="../logo.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -49,20 +49,18 @@
 
     <main class="content">
       <h1>Desktops &amp; the X11 viewer</h1>
-      <p class="lead">Podroid includes a built-in VNC viewer that connects to <strong>Xvnc</strong> running inside the VM on display <code>:0</code> (port 5900, auto-forwarded). Tap the monitor icon in the terminal's top bar to open it.</p>
+      <p class="lead">The inherited Android VNC viewer remains visible during staged refactoring, but the minimal guest has no bundled endpoint. It does not ship Xvnc, PulseAudio, a desktop, X11/font packages, <code>DISPLAY</code> defaults, port 5900/4713 listeners, or automatic display/audio forwards.</p>
 
-      <h2>Installing a desktop</h2>
-      <p>Alpine ships <code>setup-desktop</code> as part of the <code>alpine-conf</code> package. It is an interactive helper that creates a user and installs a desktop environment of your choice. Run it in the Podroid terminal:</p>
-      <pre><code><span class="p">#</span> setup-desktop</code></pre>
-      <p>Follow the prompts to pick a desktop and create a user account. The script handles the <code>apk add</code> steps for you.</p>
+      <h2>Optional manual provisioning</h2>
+      <p>You may install a desktop, fonts, an RFB server, and audio software from Alpine repositories later. That software and its security configuration are guest-owned: review the packages, authentication, bind addresses, and explicit port-forward rules before exposing an endpoint. Podroid does not configure or start one for you.</p>
 
       <div class="callout warn">
-        <span class="label">X11 only - Wayland desktops will not appear</span>
-        <p>The built-in viewer speaks RFB (VNC), so it connects to an X11 display. It cannot show a Wayland compositor. Use <strong>Xfce, LXQt, or MATE</strong> - they run on X11 and render correctly. <strong>KDE Plasma 6, GNOME, and Sway are Wayland on Alpine</strong> and will not appear in the viewer, even after launching them.</p>
+        <span class="label">No endpoint is bundled or tested</span>
+        <p>The retained viewer speaks RFB, not Wayland. Installing desktop packages alone does not create a compatible or secure RFB endpoint, and the current minimal release does not promise a one-command desktop setup.</p>
       </div>
 
-      <h2>Launching a desktop</h2>
-      <p>You do not need a display manager. Xvnc is already the X server on <code>:0</code>, and <code>DISPLAY=:0</code> is preset in the environment. After installing a desktop, start it directly from the terminal:</p>
+      <h2>Example session commands</h2>
+      <p>The commands below are desktop session examples only. They work only after you install and configure the selected desktop and your own X11/RFB server, set <code>DISPLAY</code>, and add any required explicit forward.</p>
       <pre><code><span class="c"># Xfce example</span>
 <span class="p">$</span> startxfce4 &amp;
 
@@ -73,21 +71,21 @@
 <span class="p">$</span> mate-session &amp;</code></pre>
 
       <div class="callout warn">
-        <span class="label">Do not install or enable a display manager</span>
-        <p>Installing <code>lightdm</code> or any other display manager and enabling it with <code>rc-update add</code> will cause it to fight Xvnc for display <code>:0</code>. Xvnc is already the X server; no display manager is needed.</p>
+        <span class="label">Avoid implicit network exposure</span>
+        <p>Do not enable a display manager or RFB service until you have reviewed its authentication and listener configuration. The base image deliberately creates no listener.</p>
       </div>
 
       <h2>Single GUI apps</h2>
-      <p>You do not need a full desktop to run individual X11 applications. Install any X11 app and launch it directly; <code>DISPLAY=:0</code> is already exported:</p>
+      <p>Individual X11 applications likewise need a separately installed and configured X server; <code>DISPLAY</code> is not preset by the minimal guest:</p>
       <pre><code><span class="p">#</span> apk add firefox
 <span class="p">$</span> firefox &amp;</code></pre>
-      <p>The app will appear in the viewer as soon as it opens a window.</p>
+      <p>This does not display anything until your guest-owned X11/RFB endpoint is running and reachable through an explicit rule.</p>
 
       <h2>Viewer settings reference</h2>
-      <p>Tap the tune/gear icon in the X11 viewer's top bar to open viewer settings.</p>
+      <p>The retained Android viewer still exposes its legacy client settings. They have no effect until a compatible guest endpoint is provisioned manually.</p>
 
       <h3>Resolution</h3>
-      <p>Controls what resolution Xvnc presents to the desktop. Uses the RFB ExtendedDesktopSize extension to resize live without restarting the VM.</p>
+      <p>Requests an RFB framebuffer size from a manually provisioned server that supports the ExtendedDesktopSize extension.</p>
       <ul>
         <li><strong>Match viewport</strong> - the desktop tracks your screen size exactly, resizing whenever the viewer resizes. Pixel-perfect on most devices.</li>
         <li><strong>Preset</strong> - fixed resolutions: 720p, 900p, 1080p, or 1440p. Pick a lower preset for smoother rendering on heavy desktops over a high-DPI display.</li>
@@ -127,11 +125,11 @@
           </tr>
           <tr>
             <td>Server DPI</td>
-            <td>96 to 192. Tells Xvnc what DPI to report to apps. Takes effect on the next VM start.</td>
+            <td>Legacy client preference for a compatible manually provisioned server; the minimal guest has no Xvnc process to consume it.</td>
           </tr>
           <tr>
             <td>Audio</td>
-            <td>PulseAudio streams PCM from the VM to the app over port 4713. Toggle to enable or disable.</td>
+            <td>Legacy client toggle only. PulseAudio and the port 4713 listener/forward are not bundled.</td>
           </tr>
         </tbody>
       </table>

@@ -20,6 +20,7 @@ MAX_EXPLICIT_PACKAGES = 32
 MAX_RESOLVED_PACKAGES = 128
 MAX_PACKAGE_DATABASE_BYTES = 2 * 1024 * 1024
 MAX_MIGRATION_INDEX_BYTES = 4096
+MAX_RUNLEVELS_LOCK_BYTES = 4096
 MINIROOTFS_SHA256 = "9250667a8affac8f1e98086392f80f43f086626701e9bce33398eb9b6c0bd64c"
 ALPINE_IMAGE_DIGEST = "sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40"
 EXPECTED_EXPLICIT_PACKAGES = (
@@ -53,6 +54,12 @@ REQUIRED_SERVICES = (
     "podroid-hostd",
     "podroid-ready",
 )
+EXPECTED_RUNLEVELS = {
+    "sysinit": {},
+    "boot": {},
+    "default": {service: f"/etc/init.d/{service}" for service in REQUIRED_SERVICES},
+    "shutdown": {},
+}
 FORBIDDEN_SOURCE_PATHS = (
     "build-rootfs/files/etc/init.d/podroid-x11",
     "build-rootfs/files/etc/profile.d/podroid-x11.sh",
@@ -161,6 +168,42 @@ def parse_migration_index(data: bytes) -> tuple[int, ...]:
     return tuple(entries)
 
 
+def parse_runlevels_lock(data: bytes) -> dict[str, dict[str, str]]:
+    if not data or len(data) > MAX_RUNLEVELS_LOCK_BYTES:
+        fail("runlevel lock is empty or exceeds 4096 bytes")
+    try:
+        lines = data.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        fail("runlevel lock is not ASCII")
+    runlevels: dict[str, dict[str, str]] = {}
+    empty_declarations: set[str] = set()
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split(" ")
+        if len(fields) != 3 or any(not field for field in fields):
+            fail("runlevel lock contains a malformed entry")
+        runlevel, entry, target = fields
+        if runlevel not in EXPECTED_RUNLEVELS:
+            fail(f"runlevel lock declares unknown runlevel: {runlevel}")
+        entries = runlevels.setdefault(runlevel, {})
+        if entry == "-" and target == "-":
+            if entries or runlevel in empty_declarations:
+                fail(f"runlevel lock has a duplicate empty declaration: {runlevel}")
+            empty_declarations.add(runlevel)
+            continue
+        if runlevel in empty_declarations:
+            fail(f"runlevel lock mixes empty and populated declarations: {runlevel}")
+        if not PACKAGE_NAME.fullmatch(entry) or target != f"/etc/init.d/{entry}":
+            fail("runlevel lock contains an invalid entry or symlink target")
+        if entry in entries:
+            fail(f"runlevel lock contains a duplicate entry: {runlevel}/{entry}")
+        entries[entry] = target
+    if set(runlevels) != set(EXPECTED_RUNLEVELS) or runlevels != EXPECTED_RUNLEVELS:
+        fail("runlevel lock differs from the exact reviewed inittab runlevels")
+    return runlevels
+
+
 def verify_migration_policy(
     migration: bytes,
     migrate_service: bytes,
@@ -248,11 +291,23 @@ def verify_source(repo_root: Path) -> None:
         repo_root / "build-rootfs/files/etc/podroid/migrations/index",
         MAX_MIGRATION_INDEX_BYTES,
     )
+    runlevels_lock = bounded.read_regular_file(
+        repo_root / "build-rootfs/runlevels.lock", MAX_RUNLEVELS_LOCK_BYTES
+    )
+    initramfs_init = bounded.read_regular_file(repo_root / "init-podroid")
+    normalizer_source = bounded.read_regular_file(
+        repo_root / "build-rootfs/overlay-normalize/podroid-overlay-normalize.c"
+    )
+    normalizer_tests = bounded.read_regular_file(
+        repo_root / "build-rootfs/overlay-normalize/test_normalize.sh"
+    )
+    build_all = bounded.read_regular_file(repo_root / "build-all.sh")
 
     require_bytes(build_script, b'MINIMAL_PACKAGES=/work/minimal-packages.txt', "rootfs build does not consume the reviewed package manifest")
     require_bytes(build_script, b'--initdb add "$@"', "rootfs build does not pass only parsed manifest entries to apk")
     require_bytes(dockerfile, b"COPY minimal-packages.txt /work/minimal-packages.txt", "rootfs Dockerfile does not copy the reviewed package manifest")
     require_bytes(dockerfile, b"COPY resolved-packages.lock /work/resolved-packages.lock", "rootfs Dockerfile does not copy the resolved package lock")
+    require_bytes(dockerfile, b"COPY runlevels.lock /work/runlevels.lock", "rootfs Dockerfile does not copy the reviewed runlevel lock")
     require_bytes(build_script, b'resolved package closure differs from reviewed lock', "rootfs build does not enforce the resolved package lock")
     require_bytes(dockerfile, MINIROOTFS_SHA256.encode(), "minirootfs SHA-256 is not pinned")
     require_bytes(dockerfile, b"sha256sum -c -", "minirootfs download is not checksum verified")
@@ -270,15 +325,9 @@ def verify_source(repo_root: Path) -> None:
     if version_codes != [b"31"]:
         fail("Android versionCode must be exactly 31 for the minimal guest migration")
 
-    runlevel_line = next(
-        (line for line in bounded.active_config_lines(build_script) if line.startswith(b"for svc in podroid-migrate ")),
-        None,
-    )
-    if runlevel_line is None:
-        fail("minimal OpenRC runlevel declaration is missing")
-    declared_services = tuple(runlevel_line.removeprefix(b"for svc in ").removesuffix(b"; do").decode().split())
-    if declared_services != REQUIRED_SERVICES:
-        fail("minimal OpenRC runlevel differs from the required boot contract")
+    parse_runlevels_lock(runlevels_lock)
+    require_bytes(build_script, b'rm -rf "$ROOTFS/etc/runlevels"', "rootfs build does not remove package-provided runlevels")
+    require_bytes(build_script, b'done < "$RUNLEVELS_LOCK"', "rootfs build does not reconstruct runlevels from the reviewed lock")
 
     if active_fields(forwards) != [[b"9100", b"ctl"]]:
         fail("minimal guest must seed only the AVF control forward on port 9100")
@@ -303,10 +352,42 @@ def verify_source(repo_root: Path) -> None:
 
     inittab = bounded.read_regular_file(repo_root / "build-rootfs/files/etc/inittab")
     dropbear = bounded.read_regular_file(repo_root / "build-rootfs/files/etc/conf.d/dropbear")
+    executed_runlevels = tuple(
+        match.decode()
+        for match in re.findall(rb"/sbin/openrc (sysinit|boot|default|shutdown)", inittab)
+    )
+    if executed_runlevels != ("sysinit", "boot", "default", "shutdown"):
+        fail("inittab must execute exactly the four reviewed OpenRC runlevels")
     require_bytes(inittab, b"/sbin/openrc default", "OpenRC default runlevel is not PID 1 boot flow")
     require_bytes(inittab, b"hvc0::respawn:/usr/local/bin/podroid-getty hvc0", "app-owned hvc0 getty is missing")
     if bounded.active_config_lines(dropbear) != [b'DROPBEAR_OPTS="-s"']:
         fail("Dropbear must remain public-key-only")
+
+    normalizer_command = b"/mnt/lower/usr/local/bin/podroid-overlay-normalize /mnt/persist"
+    require_bytes(initramfs_init, normalizer_command, "initramfs does not invoke the immutable normalizer on the persistent root")
+    normalizer_line = next(
+        (line for line in initramfs_init.splitlines() if normalizer_command in line), b""
+    )
+    if b"|| true" in normalizer_line or b": > /mnt/persist/.podroid/normalized" in initramfs_init:
+        fail("initramfs still ignores normalization failure or creates the marker itself")
+    require_bytes(initramfs_init, b"FATAL: overlay normalization failed", "initramfs does not stop before stacking a failed normalization")
+    for token in (
+        b"openat(", b"O_NOFOLLOW", b"fstatat(", b"AT_SYMLINK_NOFOLLOW",
+        b"lgetxattr(", b"ENODATA", b"lremovexattr(", b"unlinkat(",
+        b"AT_REMOVEDIR", b"SYS_renameat2", b"RENAME_NOREPLACE", b"close_checked(",
+    ):
+        require_bytes(normalizer_source, token, f"overlay normalizer omits fail-closed token {token!r}")
+    for case in (b"hostile-directory", b"hostile-marker", b"path-length", b"PODROID_NORMALIZE_FAIL", b"after-marker"):
+        require_bytes(normalizer_tests, case, f"overlay normalizer tests omit regression case {case!r}")
+    require_bytes(
+        build_all,
+        b'build-rootfs/overlay-normalize/test_normalize.sh',
+        "standard rootfs verification does not execute overlay normalizer regressions",
+    )
+    for verifier in (b"tests/verify_guest_credentials.py", b"tests/verify_minimal_guest.py"):
+        require_bytes(build_all, verifier, f"standard APK build omits exact verifier {verifier!r}")
+    if build_all.count(b"--require-rootfs") < 2:
+        fail("standard APK build does not require the packaged rootfs in both exact verifiers")
 
     print(
         f"minimal guest source verification passed: {len(packages)} explicit packages, "
@@ -370,6 +451,10 @@ def listing_paths(listing: bytes, inode_count: int) -> dict[str, tuple[bytes, st
             relative = path[len("squashfs-root/") :]
         else:
             fail("artifact listing path escapes the expected SquashFS root")
+        if relative:
+            components = relative.split("/")
+            if any(component in ("", ".", "..") for component in components):
+                fail("artifact listing contains an empty or traversal path component")
         if relative in paths:
             fail(f"artifact listing contains duplicate path: {relative}")
         paths[relative] = (match.group("mode"), target)
@@ -417,20 +502,32 @@ def verify_open_artifact(tool: str, artifact: Path, artifact_fd: int, artifact_s
     if present_forbidden:
         fail(f"minimal artifact contains forbidden paths: {', '.join(present_forbidden)}")
 
-    default_runlevel_entries = {
-        path.removeprefix("etc/runlevels/default/")
+    runlevel_directories = {
+        path.removeprefix("etc/runlevels/")
         for path in paths
-        if path.startswith("etc/runlevels/default/")
-        and "/" not in path.removeprefix("etc/runlevels/default/")
+        if path.startswith("etc/runlevels/")
+        and path != "etc/runlevels/"
+        and "/" not in path.removeprefix("etc/runlevels/")
     }
-    if default_runlevel_entries != set(REQUIRED_SERVICES):
-        fail("minimal artifact default runlevel differs from the exact boot contract")
-
-    for service in REQUIRED_SERVICES:
-        runlevel_path = f"etc/runlevels/default/{service}"
-        mode, target = paths[runlevel_path]
-        if not mode.startswith(b"l") or target != f"/etc/init.d/{service}":
-            fail(f"minimal artifact has an invalid runlevel link: {runlevel_path}")
+    if runlevel_directories != set(EXPECTED_RUNLEVELS):
+        fail("minimal artifact contains an unknown or missing runlevel directory")
+    for runlevel, expected_entries in EXPECTED_RUNLEVELS.items():
+        directory_mode, directory_target = paths[f"etc/runlevels/{runlevel}"]
+        if not directory_mode.startswith(b"d") or directory_target is not None:
+            fail(f"minimal artifact runlevel is not a real directory: {runlevel}")
+        prefix = f"etc/runlevels/{runlevel}/"
+        artifact_entries = {
+            path.removeprefix(prefix)
+            for path in paths
+            if path.startswith(prefix) and "/" not in path.removeprefix(prefix)
+        }
+        if artifact_entries != set(expected_entries):
+            fail(f"minimal artifact {runlevel} runlevel differs from the exact reviewed lock")
+        for entry, expected_target in expected_entries.items():
+            runlevel_path = prefix + entry
+            mode, target = paths[runlevel_path]
+            if not mode.startswith(b"l") or target != expected_target:
+                fail(f"minimal artifact has an invalid runlevel link: {runlevel_path}")
     executable_paths = {
         *(f"etc/init.d/{service}" for service in REQUIRED_SERVICES),
         "etc/podroid/migrations/31.sh",

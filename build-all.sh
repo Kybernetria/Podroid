@@ -128,6 +128,7 @@ build_rootfs() {
     command -v "$container_engine" >/dev/null || error "Container engine not found: $container_engine"
     command -v python3 >/dev/null || error "Python 3 is required for rootfs verification"
     command -v unsquashfs >/dev/null || error "unsquashfs (squashfs-tools) is required for rootfs verification"
+    "${SCRIPT_DIR}/build-rootfs/overlay-normalize/test_normalize.sh"
     python3 "${SCRIPT_DIR}/tests/verify_minimal_guest.py"
     log "Building Alpine rootfs squashfs with ${container_engine}..."
     local sysver
@@ -168,9 +169,14 @@ build_qemu() {
 }
 
 build_apk() {
+    command -v python3 >/dev/null || error "Python 3 is required for exact APK verification"
     log "Building APK via Gradle..."
     ./gradlew assembleDebug
-    success "APK built: app/build/outputs/apk/debug/app-debug.apk"
+    python3 "${SCRIPT_DIR}/tests/verify_guest_credentials.py" \
+        --apk "${SCRIPT_DIR}/app/build/outputs/apk/debug/app-debug.apk" --require-rootfs
+    python3 "${SCRIPT_DIR}/tests/verify_minimal_guest.py" \
+        --apk "${SCRIPT_DIR}/app/build/outputs/apk/debug/app-debug.apk" --require-rootfs
+    success "APK built and exact packaged rootfs verified: app/build/outputs/apk/debug/app-debug.apk"
 }
 
 deploy_apk() {

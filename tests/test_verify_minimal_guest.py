@@ -40,6 +40,18 @@ class MinimalGuestVerifierTest(unittest.TestCase):
         self.assertEqual(verifier.parse_resolved_package_lock(data), verifier.EXPECTED_RESOLVED_PACKAGES)
         self.assertEqual(len(verifier.EXPECTED_RESOLVED_PACKAGES), 41)
 
+    def test_runlevel_lock_requires_all_and_only_inittab_runlevels(self):
+        data = (REPO_ROOT / "build-rootfs/runlevels.lock").read_bytes()
+        self.assertEqual(verifier.parse_runlevels_lock(data), verifier.EXPECTED_RUNLEVELS)
+        for changed in (
+            data + b"rescue - -\n",
+            data.replace(b"/etc/init.d/dropbear", b"/tmp/dropbear"),
+            data.replace(b"shutdown - -\n", b""),
+            data + b"boot mystery /etc/init.d/mystery\n",
+        ):
+            with self.subTest(changed=changed), self.assertRaises(verifier.VerificationError):
+                verifier.parse_runlevels_lock(changed)
+
     def test_package_database_bounds_and_record_shape_are_enforced(self):
         database = b"P:alpine-base\nV:1\n\nP:openrc\nV:1\n"
         self.assertEqual(verifier.parse_installed_packages(database), ("alpine-base", "openrc"))
@@ -60,6 +72,11 @@ class MinimalGuestVerifierTest(unittest.TestCase):
         confused = good.replace(b"squashfs-root/etc/issue", b"other-root/etc/issue")
         with self.assertRaisesRegex(verifier.VerificationError, "escapes"):
             verifier.listing_paths(confused, 2)
+        for hostile in (b"squashfs-root/../outside", b"squashfs-root/etc/./issue", b"squashfs-root/etc//issue"):
+            with self.subTest(hostile=hostile), self.assertRaisesRegex(
+                verifier.VerificationError, "traversal path component"
+            ):
+                verifier.listing_paths(good.replace(b"squashfs-root/etc/issue", hostile), 2)
 
     def build_migration_helper(self, destination: Path) -> Path:
         compiler = shutil.which("cc")

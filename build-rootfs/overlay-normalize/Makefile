@@ -1,7 +1,7 @@
 # build-rootfs/overlay-normalize/Makefile
 # musl-static aarch64 build. Invoked from Dockerfile.rootfs's vsock-builder stage.
 CC      ?= gcc
-CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -static -D_GNU_SOURCE \
+CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -static \
            -fstack-protector-strong -D_FORTIFY_SOURCE=2
 LDFLAGS ?=
 

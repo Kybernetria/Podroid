@@ -113,14 +113,14 @@
             <td>The virtio-9p driver used to expose the host Downloads folder on the QEMU backend is unstable on some hardware. On some ARMv9.2 devices (including the Pixel 10) the 9p worker in QEMU can crash and bring down the VM. If your VM crashes shortly after boot, disable Downloads sharing in Settings as the first diagnostic step. The AVF backend uses a separate 9p2000.L server over vsock and is not affected.</td>
           </tr>
           <tr>
-            <td>X11 viewer: Wayland desktops</td>
-            <td>Wayland sessions do not render</td>
-            <td>The in-app X11 viewer connects to an Xvnc (X11) display. Wayland-native desktops (GNOME on Wayland, Plasma Wayland session, sway, Hyprland) start a compositor that does not render to an X display. Use XFCE, LXDE, or another X11 session, or force GNOME into its X11/Xorg session.</td>
+            <td>X11 viewer: no bundled endpoint</td>
+            <td>No display or audio session as shipped</td>
+            <td>The inherited Android viewer remains, but the minimal guest has no Xvnc, PulseAudio, desktop/fonts, display defaults, listener, or automatic display/audio forward. A compatible endpoint must be installed and secured manually.</td>
           </tr>
           <tr>
             <td>X11 viewer: compression</td>
             <td>Raw encoding only - heavier bandwidth</td>
-            <td>ZRLE compression is currently disabled in the VNC client. Every frame is sent as uncompressed Raw pixels. At high resolutions on a high-DPI phone this means more bandwidth and slower screen updates. Choose a 720p or 900p resolution preset in the X11 viewer settings to compensate.</td>
+            <td>The retained VNC client uses Raw encoding when connected to a compatible endpoint provisioned later. This client detail does not imply that an endpoint is bundled.</td>
           </tr>
           <tr>
             <td>X11 viewer: right-click</td>
@@ -130,7 +130,7 @@
           <tr>
             <td>X11 viewer: DPI</td>
             <td>Server DPI changes need a VM restart</td>
-            <td>The guest Xvnc server is started with a fixed DPI argument. Changing the DPI setting in the app requires stopping and restarting the VM to take effect; hot-reloading is not supported.</td>
+            <td>The retained DPI control has no server to configure in the minimal guest. Its behavior depends on any compatible endpoint the guest owner installs later.</td>
           </tr>
           <tr>
             <td>First boot</td>
@@ -180,11 +180,11 @@
       <h3>First boot is very slow</h3>
       <p>Expected. Dropbear generates RSA and ECDSA host keys on the first boot, which takes 15-60 seconds on low-end hardware under TCG emulation. Once the keys exist on the persistent overlay they are never regenerated; subsequent boots skip this step entirely.</p>
 
-      <h3>Right-click exits fullscreen when I use a mouse</h3>
-      <p>This is a known limitation of the X11 viewer: Android's fullscreen gesture handler intercepts the right mouse button before it reaches the VNC client. Use a two-finger touch gesture to right-click instead - that path bypasses the gesture handler and is delivered correctly to the guest X session.</p>
+      <h3>The X11 viewer does not connect</h3>
+      <p>This is expected for the minimal guest: no Xvnc/PulseAudio endpoint or port 5900/4713 forward is bundled. Installing, authenticating, and explicitly forwarding a compatible RFB server is manual guest-owner configuration.</p>
 
-      <h3>X11 is blurry or laggy</h3>
-      <p>The VNC client uses uncompressed Raw encoding (ZRLE is currently disabled), so high resolutions generate large frame payloads. Open the X11 viewer settings and pick a lower resolution preset (720p or 900p are good starting points). If you are on AVF, the latency should be much lower than on QEMU; on QEMU, latency will scale with how busy the TCG threads are.</p>
+      <h3>A manually provisioned X11 endpoint is blurry or laggy</h3>
+      <p>The retained VNC client uses uncompressed Raw encoding, so high resolutions generate large frame payloads. This troubleshooting guidance applies only after you supply your own compatible endpoint.</p>
 
       <h3>I changed RAM or CPU count and nothing happened</h3>
       <p>RAM and CPU count are passed to QEMU at launch time and cannot be hot-changed. Stop the VM from the main screen, then start it again - the new values will be used. Port-forward rules and SSH toggle changes take effect without a restart.</p>

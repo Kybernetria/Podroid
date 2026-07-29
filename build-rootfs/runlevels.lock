@@ -1,0 +1,14 @@
+# Exact OpenRC runlevels executed by build-rootfs/files/etc/inittab.
+# Format: runlevel entry absolute-init-script-target; "- -" declares empty.
+sysinit - -
+boot - -
+default dropbear /etc/init.d/dropbear
+default podroid-migrate /etc/init.d/podroid-migrate
+default podroid-bootstrap /etc/init.d/podroid-bootstrap
+default podroid-network /etc/init.d/podroid-network
+default podroid-resize /etc/init.d/podroid-resize
+default podroid-vsock /etc/init.d/podroid-vsock
+default podroid-downloads /etc/init.d/podroid-downloads
+default podroid-hostd /etc/init.d/podroid-hostd
+default podroid-ready /etc/init.d/podroid-ready
+shutdown - -

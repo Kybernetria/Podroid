@@ -1,6 +1,6 @@
 # Podroid feature and dependency inventory
 
-This is the inventory at commit `8ecfefaa3459b7e84c3d6e52c57e8005e289e8e3`. “Retain” identifies the preserved VM baseline. “Removable candidate” identifies a bounded optional group for later work; it is not evidence that deleting one file is safe and it is not an approved source change.
+This is a **historical** inventory at commit `8ecfefaa3459b7e84c3d6e52c57e8005e289e8e3`, not a description of the current release. “Retain” identifies that earlier VM baseline. “Removable candidate” identifies a bounded optional group as reviewed at that commit; it is not evidence that deleting one file is safe and it is not an approved source change. The current minimal guest does not bundle Docker, Podman, LXC, Xvnc, PulseAudio, desktop/font packages, or their listeners/forwards; see `docs/guide/packages.html` for the current contract.
 
 ## Release-blocking credential
 
@@ -89,7 +89,7 @@ Retain all of these alignment points:
 - ELF program-header verification in `build-all.sh`.
 - Legacy JNI packaging in `app/build.gradle.kts`, required because QEMU and helpers are executable ELF files packaged with `.so` names.
 
-## Current Android features
+## Android features at the recorded baseline commit
 
 - Single-activity Jetpack Compose UI with setup, home/status, terminal, settings, backup, and X11 routes.
 - Foreground service, wake lock, notifications, diagnostics export, and DataStore settings.
