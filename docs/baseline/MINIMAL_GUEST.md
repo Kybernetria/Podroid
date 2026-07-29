@@ -7,20 +7,29 @@ This record covers the bounded guest-image feature group at versionCode 31. It d
 | Metric | Before | After |
 |---|---:|---:|
 | Resolved Alpine packages | 255 | 41 |
-| Rootfs artifact bytes (`stat -c %s`) | 228,225,024 | 8,953,856 |
-| SquashFS filesystem bytes (`unsquashfs -s`) | Not recorded | 8,950,019 |
+| Rootfs artifact bytes (`stat -c %s`) | 228,225,024 | 9,035,776 |
+| SquashFS filesystem bytes (`unsquashfs -s`) | Not recorded | 9,034,782 |
+| Strict debug APK bytes (`stat -c %s`) | Not recorded | 55,908,661 |
 
-The before values are the supplied ticket/scout baseline for the previous artifact; that artifact was not regenerated in this worktree. The after artifact was built with live Alpine 3.23 repositories by:
+The before values are the supplied ticket/scout baseline for the previous artifact; that artifact was not regenerated in this worktree. The final source-only commit excludes generated rootfs/APK artifacts. Final evidence artifacts were built inside the `android-dev` distrobox with live Alpine 3.23 repositories and strict rootfs-in-APK checks:
 
 ```sh
 CONTAINER_ENGINE=podman ./build-all.sh rootfs
+./build-all.sh apk
+python3 tests/verify_guest_credentials.py \
+  --apk app/build/outputs/apk/debug/app-debug.apk --require-rootfs
+python3 tests/verify_minimal_guest.py \
+  --apk app/build/outputs/apk/debug/app-debug.apk --require-rootfs
 ```
 
-After artifact SHA-256 for this evidence run:
+Final artifact SHA-256 values for this evidence run:
 
 ```text
-89ab4d5649e465a1c02b6212af06401c096b7fd4b42e620fd4e93d673281b82c
+31fbe55365c182d51bb678679a09cc229a749aa6b1764cc6c138ca050e712bd0  app/src/main/assets/alpine-rootfs.squashfs
+427f00dd3e08e679dad8c4d8fca6169dd55e274efe40e4083a47e9465e3454c4  app/build/outputs/apk/debug/app-debug.apk
 ```
+
+The rootfs build reported `minimal guest artifact verification passed: 41 resolved packages, 9034782 SquashFS bytes` and `Guest credential source and explicit artifact verification passed.` The two explicit strict APK verifier commands then reported `Guest credential source and packaged APK verification passed` and `minimal guest packaged APK verification passed`; both used `--require-rootfs`, so omission of the packaged SquashFS would fail.
 
 The Alpine 3.23 base image is pinned by multi-architecture manifest digest and the Alpine 3.23.4 aarch64 minirootfs archive is pinned by SHA-256. Package repository URLs are not snapshot URLs, but the build and artifact verifier now require the exact reviewed 41-package name closure, failing closed on dependency-name drift. Package versions and compressed bytes may still change while that exact name closure remains available.
 
@@ -90,7 +99,9 @@ The build and verifier require this exact 41-package lock: additions and removal
 
 The source and artifact verifiers require the OpenRC services/runlevels, hvc0 console/getty, public-key-only Dropbear config, QEMU static and AVF DHCP network logic, CA/apk packages, boot markers, both Downloads/9p paths, migration 31, host bridge/vsock helpers, control port 9100, `/dev/net/tun`, FUSE, cgroup2, shared-mount, ZRAM, and OOM policy tokens.
 
-Migration tests execute the static no-follow helper twice against a temporary root and verify obsolete system paths are removed, copied-up AVF seeds become exactly `9100 ctl`, and `/mnt/persist`, `/var/lib`, home, and user files remain unchanged. Hostile parent and test-root symlinks are rejected. The runner validates the complete bounded, ordered index from `/mnt/lower` before executing immutable scripts and commits the marker through a symlink-safe atomic helper operation.
+Migration tests execute the static no-follow helper twice against a temporary root and verify obsolete system paths are removed, copied-up AVF seeds become exactly `9100 ctl`, and `/mnt/persist`, `/var/lib`, home, and user files remain unchanged. Hostile parent and test-root symlinks are rejected. The runner validates the complete bounded, ordered index from `/mnt/lower` before executing immutable scripts and commits the marker through a symlink-safe atomic helper operation. A failed-migration regression verifies that `applied-version` does not advance and that the required `podroid-migrate` → bootstrap → network → `Ready!` dependency chain cannot proceed.
+
+Overlay-normalization regressions require the exact `podroid-overlay-normalize-v1\n` marker payload, force empty/old regular markers to be removed before cleanup reruns, and inject cleanup, publication, temporary rollback-unlink, and rollback-directory-sync failures. A reported final publication sync error may leave the exact marker only after all upper/work cleanup has been durably synced; the test records that state as safe and verifies a retry is idempotent.
 
 ## Pending physical gate
 

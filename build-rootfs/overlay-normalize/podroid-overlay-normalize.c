@@ -5,10 +5,11 @@
  *   podroid-overlay-normalize PERSIST_ROOT
  *
  * PERSIST_ROOT must contain upper/ and work/. The helper removes work/index,
- * removes metadata-only upper entries, clears directory redirects, and only
- * then atomically publishes .podroid/normalized. All traversal and mutation is
- * anchored to no-follow directory descriptors so an existing symlink cannot
- * redirect normalization outside the persistent filesystem.
+ * unlinks metadata-only upper entries, clears directory redirects, durably
+ * syncs every traversed upper/work directory, and only then atomically
+ * publishes the exact versioned .podroid/normalized payload. All traversal and
+ * mutation is anchored to no-follow directory descriptors so an existing
+ * symlink cannot redirect normalization outside the persistent filesystem.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -30,15 +31,26 @@
 #define RENAME_NOREPLACE (1U << 0)
 #endif
 
+static const char marker_payload[] = "podroid-overlay-normalize-v1\n";
 static char metacopy_xattr[128];
 static char redirect_xattr[128];
 
 #ifdef PODROID_NORMALIZE_TESTING
 static bool injected_failure(const char *operation) {
     const char *requested = getenv("PODROID_NORMALIZE_FAIL");
-    if (requested != NULL && strcmp(requested, operation) == 0) {
-        errno = EIO;
-        return true;
+    if (requested == NULL) return false;
+    size_t operation_length = strlen(operation);
+    while (*requested != '\0') {
+        while (*requested == ',') requested++;
+        const char *end = strchr(requested, ',');
+        size_t length = end == NULL ? strlen(requested) : (size_t)(end - requested);
+        if (length == operation_length &&
+            memcmp(requested, operation, operation_length) == 0) {
+            errno = EIO;
+            return true;
+        }
+        if (end == NULL) break;
+        requested = end + 1;
     }
     return false;
 }
@@ -75,6 +87,13 @@ static int close_after_error(int fd, const char *path) {
     return -1;
 }
 
+static int sync_directory(int fd, const char *path, const char *failure_name) {
+    if (injected_failure(failure_name))
+        return report_error("sync directory", path);
+    if (fsync(fd) != 0) return report_error("sync directory", path);
+    return 0;
+}
+
 static bool valid_component(const char *component) {
     size_t length = strlen(component);
     return length > 0 && length <= NAME_MAX && strcmp(component, ".") != 0 &&
@@ -93,8 +112,7 @@ static int open_absolute_dir(const char *path) {
         return report_error("validate path length", path);
     }
 
-    if (injected_failure("open"))
-        return report_error("open", "/");
+    if (injected_failure("open")) return report_error("open", "/");
     int current = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (current < 0) return report_error("open", "/");
 
@@ -134,8 +152,7 @@ static int open_absolute_dir(const char *path) {
 
 static int stat_at(int parent, const char *name, struct stat *status,
                    bool absent_ok) {
-    if (injected_failure("lstat"))
-        return report_error("lstat", name);
+    if (injected_failure("lstat")) return report_error("lstat", name);
     if (fstatat(parent, name, status, AT_SYMLINK_NOFOLLOW) == 0) return 1;
     if (absent_ok && errno == ENOENT) return 0;
     return report_error("lstat", name);
@@ -159,8 +176,7 @@ static int proc_entry_path(char *output, size_t output_size, int parent,
 static int has_xattr_at(int parent, const char *name, const char *xattr) {
     char path[64 + NAME_MAX];
     if (proc_entry_path(path, sizeof(path), parent, name) != 0) return -1;
-    if (injected_failure("xattr"))
-        return report_error("read xattr", name);
+    if (injected_failure("xattr")) return report_error("read xattr", name);
     ssize_t result = lgetxattr(path, xattr, NULL, 0);
     if (result >= 0) return 1;
     if (errno == ENODATA) return 0;
@@ -173,17 +189,14 @@ static int has_xattr_at(int parent, const char *name, const char *xattr) {
 static int remove_xattr_at(int parent, const char *name, const char *xattr) {
     char path[64 + NAME_MAX];
     if (proc_entry_path(path, sizeof(path), parent, name) != 0) return -1;
-    if (injected_failure("remove"))
-        return report_error("remove xattr", name);
-    if (lremovexattr(path, xattr) != 0)
-        return report_error("remove xattr", name);
+    if (injected_failure("remove")) return report_error("remove xattr", name);
+    if (lremovexattr(path, xattr) != 0) return report_error("remove xattr", name);
     return 0;
 }
 
 static int unlink_at(int parent, const char *name, bool directory) {
     const char *operation = directory ? "rmdir" : "unlink";
-    if (injected_failure(operation))
-        return report_error(operation, name);
+    if (injected_failure(operation)) return report_error(operation, name);
     if (unlinkat(parent, name, directory ? AT_REMOVEDIR : 0) != 0)
         return report_error(operation, name);
     return 0;
@@ -254,8 +267,11 @@ static int read_directory(int directory,
     return result;
 }
 
+/* Sync before returning so every successful child removal is durable before
+ * its now-empty directory is removed by the parent. */
 static int remove_tree_contents(int directory) {
-    return read_directory(directory, remove_tree_entry);
+    if (read_directory(directory, remove_tree_entry) != 0) return -1;
+    return sync_directory(directory, "work/index", "cleanup-sync");
 }
 
 static int normalize_directory(int directory);
@@ -285,8 +301,12 @@ static int normalize_entry(int parent, const char *name,
     return close_checked(child, name);
 }
 
+/* Sync every traversed upper directory. This includes directories whose own
+ * redirect xattr changed and parents from which metadata-only entries were
+ * unlinked, without relying on an error-prone mutation bookkeeping side path. */
 static int normalize_directory(int directory) {
-    return read_directory(directory, normalize_entry);
+    if (read_directory(directory, normalize_entry) != 0) return -1;
+    return sync_directory(directory, "upper", "cleanup-sync");
 }
 
 static int open_named_dir(int parent, const char *name) {
@@ -306,6 +326,8 @@ static int open_metadata_dir(int persist) {
     if (present == 0) {
         if (mkdirat(persist, ".podroid", 0700) != 0)
             return report_error("mkdir", ".podroid");
+        if (sync_directory(persist, "persistent root", "metadata-sync") != 0)
+            return -1;
     } else if (!S_ISDIR(status.st_mode)) {
         errno = ELOOP;
         return report_error("reject non-directory metadata path", ".podroid");
@@ -313,7 +335,8 @@ static int open_metadata_dir(int persist) {
     return open_named_dir(persist, ".podroid");
 }
 
-/* Return 1 for a valid existing marker, 0 for absence, and -1 for hostility. */
+/* Return 1 only for the exact completed version payload, 0 for absence, 2 for
+ * a legacy/unknown regular marker, and -1 for hostility or an I/O failure. */
 static int inspect_marker(int metadata) {
     struct stat status;
     int present = stat_at(metadata, "normalized", &status, true);
@@ -322,7 +345,41 @@ static int inspect_marker(int metadata) {
         errno = ELOOP;
         return report_error("reject non-regular marker", "normalized");
     }
-    return 1;
+    if (injected_failure("open")) return report_error("open marker", "normalized");
+    int marker = openat(metadata, "normalized", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (marker < 0) return report_error("open marker", "normalized");
+    if (fstat(marker, &status) != 0 || !S_ISREG(status.st_mode)) {
+        if (errno == 0) errno = ELOOP;
+        close_after_error(marker, "normalized");
+        return report_error("validate opened marker", "normalized");
+    }
+
+    unsigned char content[sizeof(marker_payload)];
+    size_t offset = 0;
+    while (offset < sizeof(content)) {
+        if (injected_failure("marker-read")) {
+            close_after_error(marker, "normalized");
+            return report_error("read marker", "normalized");
+        }
+        ssize_t count = read(marker, content + offset, sizeof(content) - offset);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            close_after_error(marker, "normalized");
+            return report_error("read marker", "normalized");
+        }
+        if (count == 0) break;
+        offset += (size_t)count;
+    }
+    if (close_checked(marker, "normalized") != 0) return -1;
+    return offset == sizeof(marker_payload) - 1 &&
+                   memcmp(content, marker_payload, sizeof(marker_payload) - 1) == 0
+               ? 1
+               : 2;
+}
+
+static int remove_legacy_marker(int metadata) {
+    if (unlink_at(metadata, "normalized", false) != 0) return -1;
+    return sync_directory(metadata, ".podroid", "legacy-sync");
 }
 
 static int configure_xattr_names(void) {
@@ -362,6 +419,8 @@ static int random_temp_name(char *output, size_t output_size) {
 static int write_all(int fd, const char *data, size_t size) {
     size_t offset = 0;
     while (offset < size) {
+        if (injected_failure("publish-write"))
+            return report_error("write marker temporary", "normalized");
         ssize_t count = write(fd, data + offset, size - offset);
         if (count < 0) {
             if (errno == EINTR) continue;
@@ -372,36 +431,20 @@ static int write_all(int fd, const char *data, size_t size) {
     return 0;
 }
 
-static int rollback_marker(const char *persist_root) {
-    int persist = open_absolute_dir(persist_root);
-    if (persist < 0) return -1;
-    int metadata = open_named_dir(persist, ".podroid");
-    if (metadata < 0) {
-        close_after_error(persist, persist_root);
-        return -1;
-    }
-    int result = 0;
-    if (unlinkat(metadata, "normalized", 0) != 0 && errno != ENOENT)
-        result = report_error("rollback marker", "normalized");
-    if (close_checked(metadata, ".podroid") != 0) result = -1;
-    if (close_checked(persist, persist_root) != 0) result = -1;
-    return result;
+/* Roll back only an unpublished temporary. A published valid marker is never
+ * removed: cleanup was fully synced before rename, so retaining the marker is
+ * safe even when the publication directory sync reports an error. */
+static int rollback_temporary(int metadata, const char *temporary) {
+    if (injected_failure("rollback-unlink"))
+        return report_error("rollback marker temporary", temporary);
+    if (unlinkat(metadata, temporary, 0) != 0)
+        return report_error("rollback marker temporary", temporary);
+    return sync_directory(metadata, ".podroid", "rollback-sync");
 }
 
-static int remove_published_marker(int metadata) {
-    if (unlinkat(metadata, "normalized", 0) != 0 && errno != ENOENT)
-        return report_error("rollback marker", "normalized");
-    struct stat status;
-    int present = stat_at(metadata, "normalized", &status, true);
-    if (present < 0) return -1;
-    if (present != 0) {
-        errno = EIO;
-        return report_error("verify marker rollback", "normalized");
-    }
-    return 0;
-}
-
-static int publish_marker(int metadata, const char *persist_root) {
+/* Return 0 for fully reported success, -1 before publication, and -2 when an
+ * exact valid marker may survive a reported post-publication sync failure. */
+static int publish_marker(int metadata) {
     char temporary[NAME_MAX + 1];
     if (random_temp_name(temporary, sizeof(temporary)) != 0) return -1;
     if (injected_failure("open"))
@@ -410,62 +453,46 @@ static int publish_marker(int metadata, const char *persist_root) {
                         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (marker < 0) return report_error("open marker temporary", temporary);
 
-    int result = 0;
-    static const char content[] = "normalized\n";
-    if (write_all(marker, content, sizeof(content) - 1) != 0 ||
-        fchmod(marker, 0600) != 0 || fsync(marker) != 0)
-        result = report_error("prepare marker temporary", temporary);
-    if (close_checked(marker, temporary) != 0) result = -1;
-    if (result != 0) {
-        if (unlink_at(metadata, temporary, false) != 0) result = -1;
-        return result;
+    int prepared = 0;
+    if (injected_failure("publish-prepare")) {
+        prepared = report_error("prepare marker temporary", temporary);
+    } else if (write_all(marker, marker_payload, sizeof(marker_payload) - 1) != 0) {
+        prepared = -1;
+    } else if (fchmod(marker, 0600) != 0) {
+        prepared = report_error("set marker mode", temporary);
+    } else if (fsync(marker) != 0) {
+        prepared = report_error("sync marker temporary", temporary);
+    }
+    if (close_checked(marker, temporary) != 0) prepared = -1;
+    if (prepared != 0) {
+        if (rollback_temporary(metadata, temporary) != 0)
+            report_error("marker temporary rollback incomplete", temporary);
+        return -1;
     }
 
     int existing = inspect_marker(metadata);
     if (existing != 0) {
         if (existing > 0) errno = EEXIST;
-        unlink_at(metadata, temporary, false);
+        if (rollback_temporary(metadata, temporary) != 0)
+            report_error("marker temporary rollback incomplete", temporary);
         return existing > 0 ? report_error("refuse to replace marker", "normalized") : -1;
     }
-    int rollback_descriptor = dup(metadata);
-    if (rollback_descriptor < 0) {
-        unlink_at(metadata, temporary, false);
-        return report_error("duplicate marker directory for rollback", ".podroid");
-    }
-    if (syscall(SYS_renameat2, metadata, temporary, metadata, "normalized",
+    if (injected_failure("publish-rename") ||
+        syscall(SYS_renameat2, metadata, temporary, metadata, "normalized",
                 RENAME_NOREPLACE) != 0) {
+        if (errno == 0) errno = EIO;
         int saved = errno;
-        unlink_at(metadata, temporary, false);
-        close_after_error(rollback_descriptor, ".podroid rollback");
+        report_error("atomically publish marker", "normalized");
+        if (rollback_temporary(metadata, temporary) != 0)
+            report_error("marker temporary rollback incomplete", temporary);
         errno = saved;
-        return report_error("atomically publish marker", "normalized");
-    }
-
-    bool publish_sync_failed = injected_failure("publish-sync");
-    if (publish_sync_failed || fsync(metadata) != 0) {
-        if (publish_sync_failed) errno = EIO;
-        report_error("sync marker directory", ".podroid");
-        remove_published_marker(rollback_descriptor);
-        close_after_error(rollback_descriptor, ".podroid rollback");
         return -1;
     }
 
-    /* Keep an independent descriptor until the publication descriptor closes.
-     * If that close fails, remove and verify the marker before returning. */
-    bool publish_close_failed = injected_failure("publish-close");
-    int metadata_close = close(metadata);
-    if (publish_close_failed || metadata_close != 0) {
-        if (publish_close_failed) errno = EIO;
-        report_error("close marker directory", ".podroid");
-        int rollback_result = remove_published_marker(rollback_descriptor);
-        if (close_checked(rollback_descriptor, ".podroid rollback") != 0)
-            rollback_result = -1;
-        if (rollback_result != 0) rollback_marker(persist_root);
-        return -2; /* metadata is closed; tell the caller not to close it again. */
-    }
-    if (close_checked(rollback_descriptor, ".podroid rollback") != 0) {
-        if (rollback_marker(persist_root) != 0)
-            report_error("marker rollback after close failure", "normalized");
+    if (sync_directory(metadata, ".podroid", "publish-sync") != 0) {
+        /* The exact marker may remain visible. This is safe because upper/work
+         * cleanup was durably synced before publication; a lost marker merely
+         * causes the idempotent cleanup to run again after reboot. */
         return -2;
     }
     return 0;
@@ -497,6 +524,11 @@ int main(int argc, char **argv) {
         if (close_checked(persist, argv[1]) != 0) result = 1;
         return result;
     }
+    if (marker == 2 && remove_legacy_marker(metadata) != 0) {
+        close_after_error(metadata, ".podroid");
+        close_after_error(persist, argv[1]);
+        return 1;
+    }
 
     int upper = open_named_dir(persist, "upper");
     int work = upper >= 0 ? open_named_dir(persist, "work") : -1;
@@ -512,6 +544,7 @@ int main(int argc, char **argv) {
     int index_present = stat_at(work, "index", &index_status, true);
     if (index_present < 0 ||
         (index_present == 1 && remove_tree_entry(work, "index", &index_status) != 0) ||
+        sync_directory(work, "work", "cleanup-sync") != 0 ||
         normalize_directory(upper) != 0)
         result = 1;
     if (close_checked(work, "work") != 0) result = 1;
@@ -522,10 +555,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int published = publish_marker(metadata, argv[1]);
-    if (published == -1) {
-        close_after_error(metadata, ".podroid");
-        return 1;
-    }
+    int published = publish_marker(metadata);
+    if (close_checked(metadata, ".podroid") != 0) return 1;
     return published == 0 ? 0 : 1;
 }

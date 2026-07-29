@@ -109,9 +109,9 @@
 
       <h2>Local guest console</h2>
       <p>The in-app terminal is an app-owned console connected directly to the Linux guest over QEMU virtio-console or the AVF console transport. Its dedicated getty automatically opens a guest-root session. This is not remote authentication and it is not an Android shell.</p>
-      <p>To create a regular user with sudo-equivalent access:</p>
-      <pre><code><span class="p">~#</span> adduser -G wheel &lt;username&gt;</code></pre>
-      <p>Members of <code>wheel</code> can use <code>doas</code> and <code>sudo</code>.</p>
+      <p>To create a regular unprivileged user:</p>
+      <pre><code><span class="p">~#</span> adduser &lt;username&gt;</code></pre>
+      <p>Administrative commands remain available from the in-app guest-root console.</p>
 
       <h2>SSH from another device</h2>
       <p>Dropbear accepts public keys only; password authentication is disabled and Podroid bundles no authorized key. Before connecting, use the in-app guest console to install your laptop or desktop's public key:</p>

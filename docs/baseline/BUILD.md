@@ -8,7 +8,8 @@ This procedure separates the verified Gradle-only build and Podman-built rootfs 
 |---|---|
 | Android unit tests and Gradle-only debug APK | Verified successful with `:app:testDebugUnitTest assembleDebug` |
 | Kernel/initramfs | Not rebuilt in this environment; these stages remain Docker-only |
-| Alpine squashfs rootfs | Verified with the supported `CONTAINER_ENGINE=podman` path and explicit artifact checks |
+| Alpine squashfs rootfs | Rebuilt and verified with the supported `CONTAINER_ENGINE=podman` path and explicit artifact checks |
+| Strict debug APK containing that exact rootfs | Verified by `./build-all.sh apk` and both explicit `--apk ... --require-rootfs` verifiers |
 | QEMU, libslirp, bridge, and launcher | Not rebuilt in this environment; this stage remains Docker-only |
 | Full APK assembled from all freshly generated native/VM artifacts | Not verified |
 | Device install, RAM, QEMU boot, and AVF boot | Pending |
@@ -59,6 +60,29 @@ distrobox enter android-dev -- bash -lc '
 ```
 
 The minimal-guest verifier checks the exact explicit package manifest, resolved `/lib/apk/db/installed` closure, forbidden source/artifact paths, required OpenRC/runlevel and backend contracts, migration 31, and bounded artifact metadata. Ticket 5 before/after package and size evidence is recorded in `docs/baseline/MINIMAL_GUEST.md`.
+
+## Recorded final strict rootfs-in-APK evidence
+
+The final ticket 5 evidence run was performed inside `android-dev` after the rootfs build:
+
+```bash
+./build-all.sh apk
+python3 tests/verify_guest_credentials.py \
+  --apk app/build/outputs/apk/debug/app-debug.apk --require-rootfs
+python3 tests/verify_minimal_guest.py \
+  --apk app/build/outputs/apk/debug/app-debug.apk --require-rootfs
+```
+
+All three commands passed. The strict build's Gradle tasks verified both the explicit rootfs artifact and packaged APK. The explicit commands reported `Guest credential source and packaged APK verification passed` and `minimal guest packaged APK verification passed`. Recorded artifact measurements were:
+
+```text
+app/src/main/assets/alpine-rootfs.squashfs 9035776 bytes
+app/build/outputs/apk/debug/app-debug.apk 55908661 bytes
+31fbe55365c182d51bb678679a09cc229a749aa6b1764cc6c138ca050e712bd0  app/src/main/assets/alpine-rootfs.squashfs
+427f00dd3e08e679dad8c4d8fca6169dd55e274efe40e4083a47e9465e3454c4  app/build/outputs/apk/debug/app-debug.apk
+```
+
+`unsquashfs -s` reported a 9,034,782-byte SquashFS filesystem with 1,219 inodes. Generated artifacts remain gitignored and are not part of the source commit. This evidence proves exact packaging of the freshly rebuilt rootfs; it does not claim that the Docker-only kernel, initramfs, QEMU, or helper artifacts were freshly rebuilt, and physical QEMU/AVF boot remains pending.
 
 `openssl` and Alpine signing keys are installed inside the rootfs builder image. The rootfs package installation explicitly uses the copied Alpine keys and does not use apk's `--allow-untrusted` bypass.
 
@@ -230,4 +254,4 @@ distrobox enter android-dev -- bash -lc '
 '
 ```
 
-A complete APK should be distinguished from the 38,033,502-byte Gradle-only baseline by recording hashes and the presence and provenance of the kernel, initramfs, rootfs, QEMU, libslirp, bridge, and launcher artifacts.
+The final strict ticket 5 debug APK was 55,908,661 bytes with SHA-256 `427f00dd3e08e679dad8c4d8fca6169dd55e274efe40e4083a47e9465e3454c4`. Its fresh rootfs provenance is recorded above; kernel, initramfs, QEMU, libslirp, bridge, and launcher still require a future full Docker-backed rebuild before claiming complete native provenance.

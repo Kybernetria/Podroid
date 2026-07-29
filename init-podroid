@@ -72,10 +72,11 @@ mkdir -p /mnt/persist/upper /mnt/persist/work \
 
 # One-time legacy-overlay normalization: older versions mounted the overlay with
 # metacopy=on,redirect_dir=on,index=on, which bind the upper to the OLD lower.
-# The immutable helper validates the marker with no-follow operations, performs
-# all cleanup, and atomically creates the marker only after complete success.
-# Any failure leaves the replacement lower unstacked and drops to recovery so a
-# later boot can retry against the same preserved upper.
+# The immutable helper accepts only its exact versioned marker payload, removes
+# and syncs any legacy regular marker, and performs no-follow cleanup. It fsyncs
+# changed upper/work directories before atomically publishing the final marker.
+# Any incomplete-cleanup failure leaves the replacement lower unstacked and
+# drops to recovery so a later boot can retry against the preserved upper.
 echo "Checking legacy overlay normalization..." > /dev/console
 /mnt/lower/usr/local/bin/podroid-overlay-normalize /mnt/persist > /dev/console 2>&1 \
     || { echo "FATAL: overlay normalization failed; replacement system not mounted" > /dev/console; exec sh; }

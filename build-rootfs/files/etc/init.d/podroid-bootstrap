@@ -2,7 +2,7 @@
 description="Podroid VM system bootstrap (mounts, modules, cgroup2, ZRAM)"
 
 depend() {
-    need localmount
+    need localmount podroid-migrate
     before podroid-network
 }
 

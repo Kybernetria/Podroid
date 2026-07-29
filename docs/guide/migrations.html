@@ -92,11 +92,13 @@
       <h2>One-time legacy normalization</h2>
       <p>Earlier releases mounted the overlay with <code>metacopy=on</code>/<code>index=on</code>/<code>redirect_dir=on</code>. These options record inode references from the lower in the upper, so the upper becomes tied to that specific lower image. Replacing the lower without clearing that state corrupts the overlay.</p>
 
-      <p>On the first boot after updating to a version that uses the plain overlay, <code>init-podroid</code> runs <code>podroid-overlay-normalize</code> before stacking the overlay. This tool strips the metacopy and redirect xattrs from any upper entries that carry them, making the upper safe to use with the new lower. It runs once - a marker file at <code>/mnt/persist/.podroid/normalized</code> prevents it from running again. On a fresh install there is nothing to normalize and the tool exits immediately.</p>
+      <p>Before stacking the overlay, <code>init-podroid</code> runs the immutable <code>podroid-overlay-normalize</code> helper. For each non-directory upper entry carrying <code>trusted.overlay.metacopy</code>, the helper unlinks that metadata-only upper entry so the replacement lower file becomes authoritative. It removes <code>trusted.overlay.redirect</code> from upper directories without deleting those directories or their contents, and recursively removes the legacy <code>work/index</code> tree. It does not clear <code>trusted.overlay.impure</code> and does not delete ordinary copied-up file content.</p>
+
+      <p>All traversal and mutation is descriptor-relative and no-follow. Changed upper/work directories are durably synced before publication. Only a regular marker containing exactly <code>podroid-overlay-normalize-v1</code> plus a newline proves completion; empty or older regular markers are removed and synced before the idempotent cleanup reruns. The exact marker is then written, synced, and atomically renamed to <code>/mnt/persist/.podroid/normalized</code>. A failure before complete durable cleanup can never publish an accepted marker.</p>
 
       <div class="callout note">
-        <span class="label">Conservative by design</span>
-        <p>The normalizer only removes xattrs (<code>trusted.overlay.metacopy</code>, <code>trusted.overlay.redirect</code>, <code>trusted.overlay.impure</code>) that it placed there; it does not touch file content. If something goes wrong, the worst outcome is a file that reads from the lower instead of the upper - the upper content is never deleted.</p>
+        <span class="label">Fail closed and retry safely</span>
+        <p>Any cleanup failure stops boot before the replacement lower is mounted, leaving the persistent upper available for an idempotent retry. If the final marker rename succeeds but syncing its directory reports an error, the already-visible exact marker may remain: this is safe because cleanup was fully durable first. If the marker is lost after reboot, cleanup simply runs again.</p>
       </div>
 
       <h2>What is preserved across an update</h2>
@@ -120,8 +122,8 @@
 
       <ol>
         <li>Create <code>build-rootfs/files/etc/podroid/migrations/&lt;versionCode&gt;.sh</code>. Use the app's <code>versionCode</code> (an integer, found in <code>app/build.gradle.kts</code>) as the filename.</li>
+        <li>Append that integer to <code>build-rootfs/files/etc/podroid/migrations/index</code>. The immutable index is the only migration enumeration source: entries must be complete, strictly increasing, unique decimal integers, and the final entry must equal the baked <code>system-version</code>. The runner rejects a missing, malformed, oversized, or incomplete index before executing any hook.</li>
         <li>Make the script <strong>idempotent</strong>. It may run more than once if the guest crashes mid-migration; it must be safe to re-run.</li>
-        <li>Register it in <code>build-rootfs.sh</code> so it is copied into the squashfs.</li>
       </ol>
 
       <p>Example - enabling a newly-added service:</p>
@@ -131,7 +133,7 @@
 # idempotent: rc-update -u is a no-op if the link already exists</span>
 rc-update -u add my-service default</code></pre>
 
-      <p><code>podroid-migrate</code> runs scripts in numeric order, so a script for versionCode 26 runs before one for 27. After all pending scripts complete, <code>applied-version</code> is updated atomically. A crash before that point means the scripts run again on the next boot - which is why idempotency matters.</p>
+      <p><code>podroid-migrate</code> reads scripts only from the immutable squashfs index and runs pending entries in index order, so a script for versionCode 26 runs before one for 27. After all pending scripts complete, <code>applied-version</code> is updated atomically. A crash or hook failure before that point leaves the marker unchanged and the scripts run again on the next boot. Bootstrap requires successful migration, so a migration failure also blocks networking, <code>Ready!</code>, and Android's success detection.</p>
 
       <div class="callout note">
         <span class="label">No script needed for most changes</span>

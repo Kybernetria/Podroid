@@ -204,6 +204,34 @@ def parse_runlevels_lock(data: bytes) -> dict[str, dict[str, str]]:
     return runlevels
 
 
+def verify_boot_dependency_policy(
+    bootstrap: bytes,
+    network: bytes,
+    ready: bytes,
+) -> None:
+    """Require the complete migration-to-Ready OpenRC dependency chain."""
+    require_bytes(
+        bootstrap,
+        b"need localmount podroid-migrate",
+        "podroid-bootstrap does not need successful podroid-migrate",
+    )
+    require_bytes(
+        bootstrap,
+        b"before podroid-network",
+        "podroid-bootstrap is not ordered before networking",
+    )
+    require_bytes(
+        network,
+        b"need podroid-bootstrap",
+        "podroid-network does not need successful bootstrap",
+    )
+    require_bytes(
+        ready,
+        b"need podroid-network",
+        "podroid-ready does not need successful networking",
+    )
+
+
 def verify_migration_policy(
     migration: bytes,
     migrate_service: bytes,
@@ -336,6 +364,16 @@ def verify_source(repo_root: Path) -> None:
             fail("Android host still injects or reserves a display/audio listener")
 
     verify_migration_policy(migration, migrate_service, migrate_runner, migrate_helper, migration_index)
+    bootstrap_service = bounded.read_regular_file(
+        repo_root / "build-rootfs/files/etc/init.d/podroid-bootstrap"
+    )
+    network_service = bounded.read_regular_file(
+        repo_root / "build-rootfs/files/etc/init.d/podroid-network"
+    )
+    ready_service = bounded.read_regular_file(
+        repo_root / "build-rootfs/files/etc/init.d/podroid-ready"
+    )
+    verify_boot_dependency_policy(bootstrap_service, network_service, ready_service)
 
     required_service_content = {
         "podroid-bootstrap": (b"Loading kernel modules...", b"mount --make-rshared /", b"/dev/net/tun", b"cgroup2", b"zram0", b"downloads /mnt/downloads"),
@@ -373,11 +411,17 @@ def verify_source(repo_root: Path) -> None:
     require_bytes(initramfs_init, b"FATAL: overlay normalization failed", "initramfs does not stop before stacking a failed normalization")
     for token in (
         b"openat(", b"O_NOFOLLOW", b"fstatat(", b"AT_SYMLINK_NOFOLLOW",
-        b"lgetxattr(", b"ENODATA", b"lremovexattr(", b"unlinkat(",
+        b"lgetxattr(", b"ENODATA", b"lremovexattr(", b"unlinkat(", b"fsync(",
         b"AT_REMOVEDIR", b"SYS_renameat2", b"RENAME_NOREPLACE", b"close_checked(",
+        b"podroid-overlay-normalize-v1\\n", b"remove_legacy_marker(",
     ):
         require_bytes(normalizer_source, token, f"overlay normalizer omits fail-closed token {token!r}")
-    for case in (b"hostile-directory", b"hostile-marker", b"path-length", b"PODROID_NORMALIZE_FAIL", b"after-marker"):
+    for case in (
+        b"hostile-directory", b"hostile-marker", b"path-length",
+        b"PODROID_NORMALIZE_FAIL", b"after-marker", b"legacy_payload in empty old",
+        b"publish-prepare,rollback-unlink", b"publish-prepare,rollback-sync",
+        b"publication-sync-safe",
+    ):
         require_bytes(normalizer_tests, case, f"overlay normalizer tests omit regression case {case!r}")
     require_bytes(
         build_all,
@@ -577,6 +621,7 @@ def verify_open_artifact(tool: str, artifact: Path, artifact_fd: int, artifact_s
         fail("minimal artifact system-version is not 31")
     if active_fields(forwards) != [[b"9100", b"ctl"]]:
         fail("minimal artifact seeds a forbidden display/audio/default forward")
+    verify_boot_dependency_policy(bootstrap, network, ready)
     for data, needle in (
         (bootstrap, b"/dev/net/tun"),
         (bootstrap, b"cgroup2"),

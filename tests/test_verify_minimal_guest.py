@@ -188,6 +188,45 @@ class MinimalGuestVerifierTest(unittest.TestCase):
             self.assertNotEqual(malformed.returncode, 0)
             self.assertEqual(marker.read_text(), "031\n")
 
+    def test_failed_migration_cannot_advance_marker_or_reach_ready_dependency(self):
+        bootstrap_path = REPO_ROOT / "build-rootfs/files/etc/init.d/podroid-bootstrap"
+        network_path = REPO_ROOT / "build-rootfs/files/etc/init.d/podroid-network"
+        ready_path = REPO_ROOT / "build-rootfs/files/etc/init.d/podroid-ready"
+        bootstrap = bootstrap_path.read_bytes()
+        network = network_path.read_bytes()
+        ready = ready_path.read_bytes()
+        verifier.verify_boot_dependency_policy(bootstrap, network, ready)
+        with self.assertRaisesRegex(verifier.VerificationError, "successful podroid-migrate"):
+            verifier.verify_boot_dependency_policy(
+                bootstrap.replace(b"need localmount podroid-migrate", b"need localmount"),
+                network,
+                ready,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            lower = base / "lower"
+            persist = base / "persist"
+            target = base / "target"
+            migrations = lower / "etc/podroid/migrations"
+            binaries = lower / "usr/local/bin"
+            migrations.mkdir(parents=True)
+            binaries.mkdir(parents=True)
+            persist.mkdir()
+            target.mkdir()
+            (lower / "etc/podroid/system-version").write_text("31\n")
+            (migrations / "index").write_text("31\n")
+            (migrations / "31.sh").write_text("#!/bin/sh\nexit 23\n")
+            self.build_migration_helper(binaries / "podroid-migrate-safe")
+            runner = REPO_ROOT / "build-rootfs/files/usr/local/bin/podroid-migrate-runner"
+            result = subprocess.run(
+                ["sh", str(runner), str(lower), str(persist), str(target)],
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((persist / ".podroid/applied-version").exists())
+            self.assertIn(b"migration 31 failed", result.stderr)
+
     def test_migration_index_rejects_malformed_duplicate_and_out_of_order_entries(self):
         for index in (b"031\n", b"31\n31\n", b"32\n31\n", b"31 extra\n"):
             with self.subTest(index=index), tempfile.TemporaryDirectory() as temporary:
