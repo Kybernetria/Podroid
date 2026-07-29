@@ -123,7 +123,7 @@ internal object HostSupervisorRecordCodec {
     private fun currentState(
         common: Common,
         reconciliation: ReconciliationMetadata,
-        runtimeMayBeLive: Boolean = legacyRuntimeMayBeLive(common.transaction),
+        runtimeMayBeLive: Boolean = legacyRuntimeMayBeLive(common.transaction, reconciliation),
         runtimeEvidenceVersion: Long = if (runtimeMayBeLive) 1 else 0,
     ) = HostSupervisorState(
         schemaVersion = V3,
@@ -140,14 +140,35 @@ internal object HostSupervisorRecordCodec {
         reconciliation = reconciliation,
     )
 
-    private fun legacyRuntimeMayBeLive(transaction: LifecycleTransaction?): Boolean =
-        transaction?.outcome == LifecycleOutcome.PENDING && (
-            (transaction.effectStarted && transaction.operation != LifecycleOperation.SETUP) ||
-                transaction.operation in setOf(
-                    LifecycleOperation.STOP,
-                    LifecycleOperation.FORCE_STOP,
-                )
+    private fun legacyRuntimeMayBeLive(
+        transaction: LifecycleTransaction?,
+        reconciliation: ReconciliationMetadata,
+    ): Boolean {
+        val definitiveStop = transaction?.outcome == LifecycleOutcome.SUCCEEDED &&
+            transaction.operation in setOf(
+                LifecycleOperation.STOP,
+                LifecycleOperation.FORCE_STOP,
             )
+        if (definitiveStop) return false
+        if (reconciliation.lastOutcome in setOf(
+                ReconciliationOutcome.ATTEMPTING,
+                ReconciliationOutcome.INTERRUPTED,
+            )
+        ) return true
+        return when (transaction?.operation) {
+            LifecycleOperation.START,
+            LifecycleOperation.RESTART,
+            LifecycleOperation.RECOVER,
+            -> transaction.effectStarted || transaction.outcome == LifecycleOutcome.SUCCEEDED
+            LifecycleOperation.STOP,
+            LifecycleOperation.FORCE_STOP,
+            -> transaction.outcome != LifecycleOutcome.SUCCEEDED
+            LifecycleOperation.SETUP,
+            LifecycleOperation.REMOVE,
+            null,
+            -> false
+        }
+    }
 
     fun encode(state: HostSupervisorState): String = buildString {
         appendLine("schema=$V3")

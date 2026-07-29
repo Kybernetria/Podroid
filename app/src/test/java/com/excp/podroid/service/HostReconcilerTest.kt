@@ -93,6 +93,81 @@ class HostReconcilerTest {
         )
     }
 
+    @Test fun `persisted possible-live retry restores cleanup for stopped or disabled host`() {
+        for (outcome in listOf(ReconciliationOutcome.FAILED, ReconciliationOutcome.BACKOFF)) {
+            for ((name, hostEnabled, desiredState) in listOf(
+                Triple("stopped", true, VmDesiredState.STOPPED),
+                Triple("host disabled", false, VmDesiredState.RUNNING),
+            )) {
+                val state = HostSupervisorState.safeDefaults().copy(
+                    hostEnabled = hostEnabled,
+                    desiredState = desiredState,
+                    runtimeMayBeLive = true,
+                    runtimeEvidenceVersion = 1,
+                    reconciliation = ReconciliationMetadata(
+                        2,
+                        11_000,
+                        ReconciliationTrigger.PROCESS_RESTART,
+                        outcome,
+                        LifecycleErrorCode.RUNTIME_OWNERSHIP,
+                    ),
+                )
+                assertEquals(
+                    "$name ${outcome.name}",
+                    ReconciliationRetryDirective.Schedule(11_000),
+                    ReconciliationRetryDirective.fromPersistedState(state),
+                )
+            }
+        }
+    }
+
+    @Test fun `persisted exhaustion success and definitive absence cancel retry`() {
+        val exhausted = HostSupervisorState.safeDefaults().copy(
+            runtimeMayBeLive = true,
+            runtimeEvidenceVersion = 1,
+            reconciliation = ReconciliationMetadata(
+                ReconciliationMetadata.MAX_ATTEMPTS,
+                0,
+                ReconciliationTrigger.PROCESS_RESTART,
+                ReconciliationOutcome.EXHAUSTED,
+                LifecycleErrorCode.RUNTIME_OWNERSHIP,
+            ),
+        )
+        val succeeded = HostSupervisorState.safeDefaults().copy(
+            runtimeMayBeLive = true,
+            runtimeEvidenceVersion = 1,
+            reconciliation = ReconciliationMetadata(
+                0, 0, ReconciliationTrigger.PROCESS_RESTART,
+                ReconciliationOutcome.SUCCEEDED, null,
+            ),
+        )
+        val definitiveAbsence = HostSupervisorState.safeDefaults().copy(
+            hostEnabled = true,
+            desiredState = VmDesiredState.STOPPED,
+            reconciliation = ReconciliationMetadata(
+                2, 11_000, ReconciliationTrigger.PROCESS_RESTART,
+                ReconciliationOutcome.FAILED, LifecycleErrorCode.IO,
+            ),
+        )
+        val disabledWithoutCleanup = definitiveAbsence.copy(
+            hostEnabled = false,
+            desiredState = VmDesiredState.RUNNING,
+        )
+
+        for ((name, state) in listOf(
+            "exhausted" to exhausted,
+            "succeeded" to succeeded,
+            "definitive absence" to definitiveAbsence,
+            "disabled without cleanup" to disabledWithoutCleanup,
+        )) {
+            assertEquals(
+                name,
+                ReconciliationRetryDirective.Cancel,
+                ReconciliationRetryDirective.fromPersistedState(state),
+            )
+        }
+    }
+
     @Test fun `boot skip does not prepare launch when autostart is false`() = runBlocking {
         val fixture = fixture(autostart = false)
         val result = fixture.reconciler.reconcile(ReconciliationTrigger.BOOT_COMPLETED)

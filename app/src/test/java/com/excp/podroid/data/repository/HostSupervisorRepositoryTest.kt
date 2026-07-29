@@ -76,6 +76,157 @@ class HostSupervisorRepositoryTest {
     }
 
     @Test
+    fun `legacy migrations conservatively derive runtime evidence from lifecycle matrix`() {
+        data class MigrationCase(
+            val name: String,
+            val transaction: LifecycleTransaction,
+            val runtimeMayBeLive: Boolean,
+        )
+
+        val cases = listOf(
+            MigrationCase(
+                "effect-started start",
+                transaction(LifecycleOperation.START, LifecycleOutcome.PENDING, effectStarted = true),
+                true,
+            ),
+            MigrationCase(
+                "successful start",
+                transaction(LifecycleOperation.START, LifecycleOutcome.SUCCEEDED),
+                true,
+            ),
+            MigrationCase(
+                "effect-started restart",
+                transaction(LifecycleOperation.RESTART, LifecycleOutcome.PENDING, effectStarted = true),
+                true,
+            ),
+            MigrationCase(
+                "successful restart",
+                transaction(LifecycleOperation.RESTART, LifecycleOutcome.SUCCEEDED),
+                true,
+            ),
+            MigrationCase(
+                "successful recover",
+                transaction(LifecycleOperation.RECOVER, LifecycleOutcome.SUCCEEDED),
+                true,
+            ),
+            MigrationCase(
+                "failed stop",
+                transaction(LifecycleOperation.STOP, LifecycleOutcome.FAILED),
+                true,
+            ),
+            MigrationCase(
+                "failed force stop",
+                transaction(LifecycleOperation.FORCE_STOP, LifecycleOutcome.FAILED),
+                true,
+            ),
+            MigrationCase(
+                "unclaimed pending stop",
+                transaction(LifecycleOperation.STOP, LifecycleOutcome.PENDING),
+                true,
+            ),
+            MigrationCase(
+                "successful stop",
+                transaction(LifecycleOperation.STOP, LifecycleOutcome.SUCCEEDED),
+                false,
+            ),
+            MigrationCase(
+                "successful force stop",
+                transaction(LifecycleOperation.FORCE_STOP, LifecycleOutcome.SUCCEEDED),
+                false,
+            ),
+            MigrationCase(
+                "effect-started setup",
+                transaction(LifecycleOperation.SETUP, LifecycleOutcome.PENDING, effectStarted = true),
+                false,
+            ),
+            MigrationCase(
+                "successful remove",
+                transaction(LifecycleOperation.REMOVE, LifecycleOutcome.SUCCEEDED),
+                false,
+            ),
+        )
+        val decoders = listOf<Pair<String, (HostSupervisorState) -> HostSupervisorState>>(
+            "v1" to { state -> HostSupervisorRecordCodec.decodeV1(
+                HostSupervisorRecordCodec.encodeV1ForMigration(state),
+            ) },
+            "v2" to { state -> HostSupervisorRecordCodec.decodeV2(
+                HostSupervisorRecordCodec.encodeV2ForMigration(state),
+            ) },
+        )
+
+        for ((schema, decode) in decoders) {
+            for (case in cases) {
+                val migrated = decode(HostSupervisorState.safeDefaults().copy(
+                    latestTransaction = case.transaction,
+                ))
+                assertEquals("$schema ${case.name}", case.runtimeMayBeLive, migrated.runtimeMayBeLive)
+                assertEquals(
+                    "$schema ${case.name} evidence version",
+                    if (case.runtimeMayBeLive) 1L else 0L,
+                    migrated.runtimeEvidenceVersion,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `v2 attempting and interrupted reconciliation migrate as possible-live evidence`() {
+        val reconciliationCases = listOf(
+            ReconciliationMetadata(
+                1, 0, ReconciliationTrigger.PROCESS_RESTART,
+                ReconciliationOutcome.ATTEMPTING, null,
+            ) to transaction(LifecycleOperation.RECOVER, LifecycleOutcome.SUCCEEDED),
+            ReconciliationMetadata(
+                1, 0, ReconciliationTrigger.PROCESS_RESTART,
+                ReconciliationOutcome.INTERRUPTED, LifecycleErrorCode.PROCESS_DIED,
+            ) to null,
+        )
+
+        for ((reconciliation, latestTransaction) in reconciliationCases) {
+            val migrated = HostSupervisorRecordCodec.decodeV2(
+                HostSupervisorRecordCodec.encodeV2ForMigration(
+                    HostSupervisorState.safeDefaults().copy(
+                        desiredState = VmDesiredState.RUNNING,
+                        latestTransaction = latestTransaction,
+                        reconciliation = reconciliation,
+                    ),
+                ),
+            )
+            assertTrue(reconciliation.lastOutcome.name, migrated.runtimeMayBeLive)
+            assertEquals(reconciliation.lastOutcome.name, 1L, migrated.runtimeEvidenceVersion)
+        }
+    }
+
+    @Test
+    fun `v2 definitive successful stops override interrupted reconciliation evidence`() {
+        val reconciliationCases = listOf(
+            ReconciliationMetadata(
+                1, 0, ReconciliationTrigger.PROCESS_RESTART,
+                ReconciliationOutcome.ATTEMPTING, null,
+            ),
+            ReconciliationMetadata(
+                1, 0, ReconciliationTrigger.PROCESS_RESTART,
+                ReconciliationOutcome.INTERRUPTED, LifecycleErrorCode.PROCESS_DIED,
+            ),
+        )
+        for (operation in listOf(LifecycleOperation.STOP, LifecycleOperation.FORCE_STOP)) {
+            for (reconciliation in reconciliationCases) {
+                val legacy = HostSupervisorState.safeDefaults().copy(
+                    latestTransaction = transaction(operation, LifecycleOutcome.SUCCEEDED),
+                    reconciliation = reconciliation,
+                )
+
+                val migrated = HostSupervisorRecordCodec.decodeV2(
+                    HostSupervisorRecordCodec.encodeV2ForMigration(legacy),
+                )
+
+                assertFalse("$operation ${reconciliation.lastOutcome}", migrated.runtimeMayBeLive)
+                assertEquals("$operation evidence version", 0L, migrated.runtimeEvidenceVersion)
+            }
+        }
+    }
+
+    @Test
     fun `legacy transaction layout without effect bit remains readable`() = runBlocking {
         val state = HostSupervisorState.safeDefaults().copy(
             latestTransaction = LifecycleTransaction(
@@ -390,6 +541,20 @@ class HostSupervisorRepositoryTest {
         assertEquals(before.desiredState, after.desiredState)
         assertEquals(before.latestTransaction, after.latestTransaction)
     }
+
+    private fun transaction(
+        operation: LifecycleOperation,
+        outcome: LifecycleOutcome,
+        effectStarted: Boolean = outcome != LifecycleOutcome.PENDING,
+    ): LifecycleTransaction = LifecycleTransaction(
+        id = 1,
+        operation = operation,
+        outcome = outcome,
+        requestedAtEpochMs = 1,
+        completedAtEpochMs = if (outcome == LifecycleOutcome.PENDING) null else 2,
+        errorCode = if (outcome == LifecycleOutcome.FAILED) LifecycleErrorCode.IO else null,
+        effectStarted = effectStarted,
+    )
 
     private fun enabledRunningRepository(clock: AtomicLong): HostSupervisorRepository {
         val state = HostSupervisorState.safeDefaults().copy(

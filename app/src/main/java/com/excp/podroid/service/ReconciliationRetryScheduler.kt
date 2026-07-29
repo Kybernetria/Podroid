@@ -45,7 +45,9 @@ internal sealed interface ReconciliationRetryDirective {
 
         fun fromPersistedState(state: HostSupervisorState): ReconciliationRetryDirective {
             val reconciliation = state.reconciliation
-            return if (state.desiredState == VmDesiredState.RUNNING &&
+            val retryRequired = state.runtimeMayBeLive ||
+                (state.hostEnabled && state.desiredState == VmDesiredState.RUNNING)
+            return if (retryRequired &&
                 reconciliation.consecutiveAttempts in 1 until ReconciliationMetadata.MAX_ATTEMPTS &&
                 reconciliation.nextEligibleEpochMs > 0 && reconciliation.lastOutcome in setOf(
                     ReconciliationOutcome.FAILED,
