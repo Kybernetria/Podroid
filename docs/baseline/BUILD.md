@@ -77,14 +77,13 @@ The minimal-guest verifier checks the exact explicit package manifest, resolved 
 | Linux kernel | 7.0.10 | `gradle.properties` and Docker build argument |
 | QEMU | 11.0.0 | `gradle.properties` and Docker build argument |
 | QEMU cross-build NDK | r27c | Downloaded explicitly by `Dockerfile` |
-| Alpine | 3.23.x | Base images use `alpine:3.23`; minirootfs defaults to 3.23.4; kernel/initramfs downloads currently use 3.23.3 |
+| Alpine | 3.23.x | Rootfs base stages pin the Alpine 3.23 multi-arch digest; minirootfs 3.23.4 aarch64 is SHA-256 pinned; kernel/initramfs downloads currently use 3.23.3 |
 
-Two reproducibility gaps are deliberate baseline facts:
+Remaining reproducibility gaps are baseline facts:
 
-1. Alpine `apk` packages and Debian `apt` packages are installed without package-version locks or a repository snapshot.
+1. Alpine package versions and Debian `apt` packages are not repository-snapshot locked. The minimal rootfs does fail closed unless the resolved Alpine package-name closure exactly matches its reviewed 41-package lock.
 2. `libucontext` is cloned with `--depth=1` and no commit/tag, and the Meson installation is also unpinned.
-
-Image tags such as Debian bookworm and Alpine 3.23 are mutable. Preserve image digests and package lock output when a fully reproducible build is designed.
+3. Other Debian image tags remain mutable.
 
 ## Shared Android SDK through `local.properties`
 

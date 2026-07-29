@@ -112,7 +112,7 @@ Current boundary:
 - Navigation/entry: `ui/navigation/NavGraph.kt` and the desktop action in `ui/screens/terminal/TerminalScreen.kt`.
 - Guest service/config: `build-rootfs/files/etc/init.d/podroid-x11`, `build-rootfs/files/etc/profile.d/podroid-x11.sh`, and its copy/runlevel wiring in `build-rootfs/build-rootfs.sh`.
 - Guest packages: `tigervnc`, `pulseaudio`, and `pulseaudio-utils`.
-- Always-on loopback forwards: TCP 5900 and 4713 in `PodroidService`, `EngineHolder`, `PortForwardRepository.RESERVED_HOST_PORTS`, AVF forwarding, and `build-rootfs/files/etc/podroid/forwards.conf`.
+- The inherited Android X11/audio clients still dial TCP 5900 and 4713 when explicitly started, but the host no longer injects or reserves those forwards and the guest no longer seeds listeners. User-created forwards on those ports are ordinary explicit rules.
 - Launch config/settings: `VmConfig.x11Dpi`, `podroid.x11.dpi`, X11 DataStore keys, strings, tests, and diagnostics.
 
 Removal must delete the whole group on both backends and release the reserved ports. It must not remove the interactive terminal console or generic forwarding.

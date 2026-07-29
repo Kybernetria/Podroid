@@ -22,7 +22,7 @@ After artifact SHA-256 for this evidence run:
 89ab4d5649e465a1c02b6212af06401c096b7fd4b42e620fd4e93d673281b82c
 ```
 
-Alpine packages and image tags remain unpinned to immutable repository snapshots, so the hash, exact dependency versions, and compressed byte count may change on a later rebuild even when the reviewed explicit package manifest does not.
+The Alpine 3.23 base image is pinned by multi-architecture manifest digest and the Alpine 3.23.4 aarch64 minirootfs archive is pinned by SHA-256. Package repository URLs are not snapshot URLs, but the build and artifact verifier now require the exact reviewed 41-package name closure, failing closed on dependency-name drift. Package versions and compressed bytes may still change while that exact name closure remains available.
 
 ## Reviewed explicit package set
 
@@ -84,13 +84,13 @@ zlib
 zstd-libs
 ```
 
-No Docker, Podman, LXC, container-runtime, X11/VNC, PulseAudio, desktop, or font package matched the forbidden closure policy. The artifact verifier also rejected any occurrence of the retired X11 profile/service, container storage config, appliance logo, backup/statistics helpers, or representative removed binaries.
+The build and verifier require this exact 41-package lock: additions and removals both fail. The artifact verifier also rejects any occurrence of the retired X11 profile/service, container storage config, appliance logo, backup/statistics helpers, or representative removed binaries.
 
 ## Preserved checks
 
 The source and artifact verifiers require the OpenRC services/runlevels, hvc0 console/getty, public-key-only Dropbear config, QEMU static and AVF DHCP network logic, CA/apk packages, boot markers, both Downloads/9p paths, migration 31, host bridge/vsock helpers, control port 9100, `/dev/net/tun`, FUSE, cgroup2, shared-mount, ZRAM, and OOM policy tokens.
 
-Migration tests execute migration 31 twice against a temporary root and verify obsolete system paths are removed while `/mnt/persist` container directories, `/var/lib` data, home data, and user files remain unchanged.
+Migration tests execute the static no-follow helper twice against a temporary root and verify obsolete system paths are removed, copied-up AVF seeds become exactly `9100 ctl`, and `/mnt/persist`, `/var/lib`, home, and user files remain unchanged. Hostile parent and test-root symlinks are rejected. The runner validates the complete bounded, ordered index from `/mnt/lower` before executing immutable scripts and commits the marker through a symlink-safe atomic helper operation.
 
 ## Pending physical gate
 
