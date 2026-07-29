@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/tailscale/libtailscale.git",
+  "commit": "5e89501def80a6579ca5d0f9a02f336be62b8f2e",
+  "tree": "8ec36e63223a51af384482a786f27e4fc53b4458",
+  "commitDate": "2026-02-27T18:06:50-08:00",
+  "license": "BSD-3-Clause",
+  "licenseSha256": "d6e14a92f27cd6c82f8914041c1bb43819fcf3167b827b9198c2c803d4dff5d3",
+  "goVersion": "1.25.5",
+  "tailscaleModule": "tailscale.com@v1.94.1",
+  "integrationStatus": "source-only-spike-pin",
+  "androidArtifact": null,
+  "supportedAbi": null,
+  "trackingIssue": "https://github.com/Kybernetria/Podroid/issues/15"
+}
