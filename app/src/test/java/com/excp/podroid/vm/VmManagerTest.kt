@@ -366,7 +366,9 @@ class VmManagerTest {
                 }
             },
         )
-        val restart = async(Dispatchers.Default) { manager.restart(VmId.DEFAULT) }
+        val restart = async(Dispatchers.Default) {
+            runCatching { manager.restart(VmId.DEFAULT) }
+        }
         handoffPaused.await()
 
         val newerStop = async(Dispatchers.Default) {
@@ -378,8 +380,9 @@ class VmManagerTest {
 
         releaseStopPrepare.complete(Unit)
         val stop = newerStop.await()
-        restart.await()
+        val restartFailure = restart.await().exceptionOrNull()
 
+        assertTrue(restartFailure is StaleLifecycleCommandException)
         assertEquals(LifecycleOperation.STOP, stop.operation)
         assertEquals(0, runtime.startCalls)
         assertEquals(VmDesiredState.STOPPED, supervisor.snapshot().desiredState)
@@ -387,7 +390,7 @@ class VmManagerTest {
     }
 
     @Test
-    fun `launch authorization excludes stop prepare until backend acceptance then stop applies`() = runBlocking {
+    fun `launch authorization excludes stop prepare until acceptance then direct restart is superseded`() = runBlocking {
         val supervisor = FakeSupervisor()
         val handoffReached = CompletableDeferred<Unit>()
         val launchEntered = CompletableDeferred<Unit>()
@@ -414,7 +417,9 @@ class VmManagerTest {
                 if (command.operation == LifecycleOperation.RESTART) handoffReached.complete(Unit)
             },
         )
-        val restart = async(Dispatchers.Default) { manager.restart(VmId.DEFAULT) }
+        val restart = async(Dispatchers.Default) {
+            runCatching { manager.restart(VmId.DEFAULT) }
+        }
         handoffReached.await()
         launchEntered.await()
 
@@ -433,7 +438,7 @@ class VmManagerTest {
 
         assertTrue(manager.executePrepared(VmId.DEFAULT, stop))
         releaseRuntimeStart.complete(Unit)
-        restart.await()
+        assertTrue(restart.await().exceptionOrNull() is StaleLifecycleCommandException)
         assertEquals(2, runtime.stopCalls) // Restart shutdown plus the newer STOP.
         assertTrue(runtime.quiescent.value)
     }
@@ -890,6 +895,194 @@ class VmManagerTest {
         assertEquals(LifecycleOutcome.SUCCEEDED, removed.latestTransaction?.outcome)
         assertFalse(removed.runtimeMayBeLive)
         assertEquals(2L, removed.runtimeEvidenceVersion)
+        assertFalse(
+            manager.beginReconciliation(VmId.DEFAULT, ReconciliationTrigger.PROCESS_RESTART) ==
+                ReconciliationAdmission.Skip(ReconciliationOutcome.SUPERSEDED),
+        )
+    }
+
+    @Test
+    fun `reconciliation before remove claim skips without interrupting local command`() = runBlocking {
+        val beforeClaim = CompletableDeferred<Unit>()
+        val releaseClaim = CompletableDeferred<Unit>()
+        val files = FakeFiles()
+        val supervisor = hostSupervisor()
+        val manager = manager(
+            files = files,
+            supervisor = supervisor,
+            beforeDirectCommandClaim = { command ->
+                if (command.operation == LifecycleOperation.REMOVE) {
+                    beforeClaim.complete(Unit)
+                    releaseClaim.await()
+                }
+            },
+        )
+        val remove = async(Dispatchers.Default) {
+            manager.remove(VmId.DEFAULT, VmRemovePolicy.DELETE_DATA)
+        }
+        beforeClaim.await()
+        val pending = supervisor.snapshot()
+
+        val admission = manager.beginReconciliation(
+            VmId.DEFAULT,
+            ReconciliationTrigger.PROCESS_RESTART,
+        )
+
+        assertEquals(
+            ReconciliationAdmission.Skip(ReconciliationOutcome.SUPERSEDED),
+            admission,
+        )
+        assertEquals(pending, supervisor.snapshot())
+        assertEquals(LifecycleOutcome.PENDING, pending.latestTransaction?.outcome)
+        assertFalse(pending.latestTransaction?.effectStarted == true)
+        assertTrue(files.removePolicies.isEmpty())
+
+        releaseClaim.complete(Unit)
+        remove.await()
+        assertEquals(listOf(VmRemovePolicy.DELETE_DATA), files.removePolicies)
+        assertEquals(LifecycleOutcome.SUCCEEDED, supervisor.snapshot().latestTransaction?.outcome)
+    }
+
+    @Test
+    fun `reconciliation after remove claim skips without interrupting local command`() = runBlocking {
+        val beforeEffect = CompletableDeferred<Unit>()
+        val releaseEffect = CompletableDeferred<Unit>()
+        val files = FakeFiles()
+        val supervisor = hostSupervisor()
+        val manager = manager(
+            files = files,
+            supervisor = supervisor,
+            beforeDirectCommandEffect = { command ->
+                if (command.operation == LifecycleOperation.REMOVE) {
+                    beforeEffect.complete(Unit)
+                    releaseEffect.await()
+                }
+            },
+        )
+        val remove = async(Dispatchers.Default) {
+            manager.remove(VmId.DEFAULT, VmRemovePolicy.DELETE_DATA)
+        }
+        beforeEffect.await()
+        val claimed = supervisor.snapshot()
+
+        val admission = manager.beginReconciliation(
+            VmId.DEFAULT,
+            ReconciliationTrigger.PROCESS_RESTART,
+        )
+
+        assertEquals(
+            ReconciliationAdmission.Skip(ReconciliationOutcome.SUPERSEDED),
+            admission,
+        )
+        assertEquals(claimed, supervisor.snapshot())
+        assertEquals(LifecycleOutcome.PENDING, claimed.latestTransaction?.outcome)
+        assertTrue(claimed.latestTransaction?.effectStarted == true)
+        assertTrue(files.removePolicies.isEmpty())
+
+        releaseEffect.complete(Unit)
+        remove.await()
+        assertEquals(listOf(VmRemovePolicy.DELETE_DATA), files.removePolicies)
+        assertEquals(LifecycleOutcome.SUCCEEDED, supervisor.snapshot().latestTransaction?.outcome)
+    }
+
+    @Test
+    fun `ready service command blocks reconciliation without datastore mutation`() = runBlocking {
+        val supervisor = hostSupervisor()
+        val manager = manager(supervisor = supervisor)
+        val command = manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.START)
+        assertTrue(manager.acceptPrepared(VmId.DEFAULT, command))
+        val ready = supervisor.snapshot()
+
+        val admission = manager.beginReconciliation(
+            VmId.DEFAULT,
+            ReconciliationTrigger.PROCESS_RESTART,
+        )
+
+        assertEquals(
+            ReconciliationAdmission.Skip(ReconciliationOutcome.SUPERSEDED),
+            admission,
+        )
+        assertEquals(ready, supervisor.snapshot())
+        assertTrue(ready.latestTransaction?.effectStarted == true)
+    }
+
+    @Test
+    fun `process recreation interrupts pending command after local registry is lost`() = runBlocking {
+        val supervisor = hostSupervisor()
+        val originalManager = manager(supervisor = supervisor)
+        originalManager.ensureInstalled(VmId.DEFAULT)
+        val pending = originalManager.prepareLifecycleCommand(
+            VmId.DEFAULT,
+            LifecycleOperation.START,
+        )
+        val recreatedManager = manager(supervisor = supervisor)
+
+        val admission = recreatedManager.beginReconciliation(
+            VmId.DEFAULT,
+            ReconciliationTrigger.PROCESS_RESTART,
+        )
+
+        assertTrue(admission is ReconciliationAdmission.Execute)
+        val interrupted = supervisor.snapshot().latestTransaction
+        assertEquals(pending.id, interrupted?.id)
+        assertEquals(LifecycleOutcome.FAILED, interrupted?.outcome)
+        assertEquals(LifecycleErrorCode.PROCESS_DIED, interrupted?.errorCode)
+    }
+
+    @Test
+    fun `direct remove throws when superseded before claim`() = runBlocking {
+        val beforeClaim = CompletableDeferred<Unit>()
+        val releaseClaim = CompletableDeferred<Unit>()
+        val files = FakeFiles()
+        val supervisor = hostSupervisor()
+        val manager = manager(
+            files = files,
+            supervisor = supervisor,
+            beforeDirectCommandClaim = { command ->
+                if (command.operation == LifecycleOperation.REMOVE) {
+                    beforeClaim.complete(Unit)
+                    releaseClaim.await()
+                }
+            },
+        )
+        val remove = async(Dispatchers.Default) {
+            runCatching { manager.remove(VmId.DEFAULT, VmRemovePolicy.DELETE_DATA) }
+        }
+        beforeClaim.await()
+        manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.STOP)
+        releaseClaim.complete(Unit)
+
+        assertTrue(remove.await().exceptionOrNull() is StaleLifecycleCommandException)
+        assertTrue(files.removePolicies.isEmpty())
+    }
+
+    @Test
+    fun `superseded direct remove throws instead of reporting success`() = runBlocking {
+        val beforeEffect = CompletableDeferred<Unit>()
+        val releaseEffect = CompletableDeferred<Unit>()
+        val files = FakeFiles()
+        val supervisor = hostSupervisor()
+        val manager = manager(
+            files = files,
+            supervisor = supervisor,
+            beforeDirectCommandEffect = { command ->
+                if (command.operation == LifecycleOperation.REMOVE) {
+                    beforeEffect.complete(Unit)
+                    releaseEffect.await()
+                }
+            },
+        )
+        val remove = async(Dispatchers.Default) {
+            runCatching { manager.remove(VmId.DEFAULT, VmRemovePolicy.DELETE_DATA) }
+        }
+        beforeEffect.await()
+        manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.STOP)
+        releaseEffect.complete(Unit)
+
+        assertTrue(remove.await().exceptionOrNull() is StaleLifecycleCommandException)
+        assertTrue(files.removePolicies.isEmpty())
+        assertEquals(LifecycleOperation.STOP, supervisor.snapshot().latestTransaction?.operation)
+        assertEquals(LifecycleOutcome.PENDING, supervisor.snapshot().latestTransaction?.outcome)
     }
 
     @Test
@@ -923,7 +1116,10 @@ class VmManagerTest {
         assertEquals(VmDesiredState.STOPPED, failed.desiredState)
         assertTrue(failed.runtimeMayBeLive)
         assertEquals(1L, failed.runtimeEvidenceVersion)
-        assertTrue(supervisor.begin(ReconciliationTrigger.PROCESS_RESTART) is ReconciliationAdmission.Execute)
+        assertTrue(
+            manager.beginReconciliation(VmId.DEFAULT, ReconciliationTrigger.PROCESS_RESTART) is
+                ReconciliationAdmission.Execute,
+        )
     }
 
     @Test
@@ -941,7 +1137,10 @@ class VmManagerTest {
         assertEquals(LifecycleOutcome.FAILED, failed.latestTransaction?.outcome)
         assertTrue(failed.runtimeMayBeLive)
         assertEquals(1L, failed.runtimeEvidenceVersion)
-        assertTrue(supervisor.begin(ReconciliationTrigger.PROCESS_RESTART) is ReconciliationAdmission.Execute)
+        assertTrue(
+            manager.beginReconciliation(VmId.DEFAULT, ReconciliationTrigger.PROCESS_RESTART) is
+                ReconciliationAdmission.Execute,
+        )
     }
 
     @Test
@@ -1184,11 +1383,13 @@ class VmManagerTest {
         }
         val manager = manager(runtime = runtime, guestTimeoutMs = 1_000)
 
-        val graceful = async(Dispatchers.Default) { manager.stop(VmId.DEFAULT) }
+        val graceful = async(Dispatchers.Default) {
+            runCatching { manager.stop(VmId.DEFAULT) }
+        }
         while (runtime.powerdownCalls == 0) delay(5)
         val forced = async(Dispatchers.Default) { manager.forceStop(VmId.DEFAULT) }
         forced.await()
-        graceful.await()
+        assertTrue(graceful.await().exceptionOrNull() is StaleLifecycleCommandException)
 
         assertEquals(1, runtime.powerdownCalls)
         assertEquals(0, runtime.stopCalls)
@@ -1417,6 +1618,8 @@ class VmManagerTest {
         beforeFinalLaunchAuthorization: suspend (LifecycleTransactionToken) -> Unit = {},
         beforeFinalStopAuthorization: suspend (LifecycleTransactionToken) -> Unit = {},
         beforeCoordinatedStop: suspend () -> Unit = {},
+        beforeDirectCommandClaim: suspend (LifecycleTransactionToken) -> Unit = {},
+        beforeDirectCommandEffect: suspend (LifecycleTransactionToken) -> Unit = {},
         runtimePreflight: RuntimePreflightCoordinator? = null,
     ): DefaultVmManager {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default).also(scopes::add)
@@ -1439,6 +1642,8 @@ class VmManagerTest {
             beforeFinalLaunchAuthorization = beforeFinalLaunchAuthorization,
             beforeFinalStopAuthorization = beforeFinalStopAuthorization,
             beforeCoordinatedStop = beforeCoordinatedStop,
+            beforeDirectCommandClaim = beforeDirectCommandClaim,
+            beforeDirectCommandEffect = beforeDirectCommandEffect,
         )
     }
 
