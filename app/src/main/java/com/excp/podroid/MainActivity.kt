@@ -15,7 +15,6 @@ import androidx.compose.ui.Modifier
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.excp.podroid.data.repository.LanguageManager
-import com.excp.podroid.service.PodroidService
 import com.excp.podroid.ui.navigation.NavGraphViewModel
 import com.excp.podroid.ui.navigation.PodroidNavGraph
 import com.excp.podroid.ui.theme.PodroidTheme
@@ -34,20 +33,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        if (coldStartReconciliation.compareAndSet(false, true)) {
-            runCatching {
-                androidx.core.content.ContextCompat.startForegroundService(
-                    this,
-                    PodroidService.reconciliationIntent(this, PodroidService.ACTION_RECONCILE_APP),
-                )
-            }.onFailure { failure ->
-                coldStartReconciliation.set(false)
-                android.util.Log.e(
-                    "PodroidReconcile",
-                    "App-cold reconciliation dispatch failed type=${failure.javaClass.simpleName}",
-                )
-            }
-        }
+        // This Activity is exported for launcher use, so creation is not proof of
+        // an authenticated user resume. Recovery is intentionally not dispatched
+        // here; after Android force-stop the user must explicitly tap Start VM.
         setContent {
             val windowSizeClass = calculateWindowSizeClass(this)
             val navVm: NavGraphViewModel = hiltViewModel()
@@ -102,9 +90,5 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-    }
-
-    private companion object {
-        val coldStartReconciliation = java.util.concurrent.atomic.AtomicBoolean(false)
     }
 }

@@ -86,6 +86,25 @@ class HostSupervisorRepositoryTest {
     }
 
     @Test
+    fun `invalid reconciliation cross field combinations fail closed without rewrite`() = runBlocking {
+        val base = HostSupervisorRecordCodec.encode(HostSupervisorState.safeDefaults())
+        val invalidRecords = listOf(
+            base.replace("reconcile_attempts=0", "reconcile_attempts=1"),
+            base.replace("reconcile_last_outcome=NEVER_RUN", "reconcile_last_outcome=ATTEMPTING"),
+            base.replace("reconcile_last_outcome=NEVER_RUN", "reconcile_last_outcome=FAILED"),
+            base.replace("reconcile_last_outcome=NEVER_RUN", "reconcile_last_outcome=BACKOFF"),
+            base.replace("reconcile_last_outcome=NEVER_RUN", "reconcile_last_outcome=EXHAUSTED"),
+        )
+        for (evidence in invalidRecords) {
+            val store = FakeAtomicStore(evidence)
+            val failure = runCatching { repository(store).snapshot() }.exceptionOrNull()
+            assertTrue(failure is HostSupervisorCorruptionException)
+            assertEquals(evidence, store.raw)
+            assertEquals(0, store.commits)
+        }
+    }
+
+    @Test
     fun `DataStore waits are bounded before lifecycle effects`() = runBlocking {
         val blocked = object : AtomicHostSupervisorRecordStore {
             override suspend fun read(): String? = null
@@ -123,7 +142,7 @@ class HostSupervisorRepositoryTest {
     }
 
     @Test
-    fun `durable exponential backoff gates attempts and successful lifecycle resets it`() = runBlocking {
+    fun `durable exponential backoff survives recovery lifecycle until matching finish`() = runBlocking {
         val clock = AtomicLong(1_000)
         val repository = enabledRunningRepository(clock)
         val first = repository.begin(ReconciliationTrigger.APP_COLD_START) as ReconciliationAdmission.Execute
@@ -136,12 +155,52 @@ class HostSupervisorRepositoryTest {
 
         clock.set(6_000)
         val second = repository.begin(ReconciliationTrigger.PROCESS_RESTART) as ReconciliationAdmission.Execute
-        val start = repository.prepare(LifecycleOperation.START, second.token.expectedNextTransactionId)
+        val start = repository.prepare(LifecycleOperation.RECOVER, second.token.expectedNextTransactionId)
         assertTrue(repository.claim(start))
         assertTrue(repository.succeed(start, runtimeStarted = true))
+        val beforeFinish = repository.snapshot().reconciliation
+        assertEquals(2, beforeFinish.consecutiveAttempts)
+        assertEquals(ReconciliationOutcome.ATTEMPTING, beforeFinish.lastOutcome)
+
+        repository.finish(second.token, ReconciliationOutcome.SUCCEEDED)
         val reset = repository.snapshot().reconciliation
         assertEquals(0, reset.consecutiveAttempts)
         assertEquals(0, reset.nextEligibleEpochMs)
+        assertEquals(ReconciliationOutcome.SUCCEEDED, reset.lastOutcome)
+    }
+
+    @Test
+    fun `explicit user start success resets an existing backoff budget`() = runBlocking {
+        val clock = AtomicLong(1_000)
+        val repository = enabledRunningRepository(clock)
+        val attempt = repository.begin(ReconciliationTrigger.PROCESS_RESTART) as ReconciliationAdmission.Execute
+        repository.finish(attempt.token, ReconciliationOutcome.FAILED, LifecycleErrorCode.IO)
+
+        val start = repository.prepare(LifecycleOperation.START)
+        assertTrue(repository.claim(start))
+        assertTrue(repository.succeed(start, runtimeStarted = true))
+
+        assertEquals(ReconciliationMetadata.safeDefaults(), repository.snapshot().reconciliation)
+    }
+
+    @Test
+    fun `crash after each recovery runtime start keeps attempts and eventually exhausts`() = runBlocking {
+        val repository = enabledRunningRepository(AtomicLong(1_000))
+        repeat(ReconciliationMetadata.MAX_ATTEMPTS) { index ->
+            val admission = repository.begin(ReconciliationTrigger.PROCESS_RESTART) as ReconciliationAdmission.Execute
+            assertEquals(index + 1, admission.token.attempt)
+            val recovery = repository.prepare(
+                LifecycleOperation.RECOVER,
+                admission.token.expectedNextTransactionId,
+            )
+            assertTrue(repository.claim(recovery))
+            assertTrue(repository.succeed(recovery, runtimeStarted = true))
+            assertEquals(index + 1, repository.snapshot().reconciliation.consecutiveAttempts)
+            // Simulate process death before finishReconciliation(SUCCEEDED).
+        }
+        val exhausted = repository.begin(ReconciliationTrigger.PROCESS_RESTART) as ReconciliationAdmission.Skip
+        assertEquals(ReconciliationOutcome.EXHAUSTED, exhausted.outcome)
+        assertEquals(ReconciliationMetadata.MAX_ATTEMPTS, repository.snapshot().reconciliation.consecutiveAttempts)
     }
 
     @Test

@@ -9,7 +9,7 @@ enum class VmDesiredState { RUNNING, STOPPED }
 enum class HostWakePolicy { WHILE_VM_ACTIVE, NEVER }
 enum class HostPowerPolicy { GRACEFUL_THEN_FORCE, FORCE }
 enum class HostThermalPolicy { STOP_AT_CRITICAL, IGNORE }
-enum class LifecycleOperation { SETUP, START, STOP, FORCE_STOP, RESTART, REMOVE }
+enum class LifecycleOperation { SETUP, START, RECOVER, STOP, FORCE_STOP, RESTART, REMOVE }
 enum class LifecycleOutcome { PENDING, SUCCEEDED, FAILED }
 
 enum class ReconciliationTrigger { BOOT_COMPLETED, PROCESS_RESTART, APP_COLD_START }
@@ -85,11 +85,44 @@ data class ReconciliationMetadata(
     init {
         require(consecutiveAttempts in 0..MAX_ATTEMPTS) { "reconciliation attempt count is out of bounds" }
         require(nextEligibleEpochMs >= 0) { "next reconciliation timestamp must be non-negative" }
-        require(lastErrorCode == null || lastOutcome in setOf(
-            ReconciliationOutcome.INTERRUPTED,
-            ReconciliationOutcome.FAILED,
-            ReconciliationOutcome.EXHAUSTED,
-        )) { "reconciliation error requires a terminal error outcome" }
+        when (lastOutcome) {
+            ReconciliationOutcome.NEVER_RUN -> require(
+                consecutiveAttempts == 0 && nextEligibleEpochMs == 0L &&
+                    lastTrigger == null && lastErrorCode == null,
+            ) { "never-run reconciliation metadata must be empty" }
+            ReconciliationOutcome.ATTEMPTING -> require(
+                consecutiveAttempts in 1..MAX_ATTEMPTS && nextEligibleEpochMs == 0L &&
+                    lastTrigger != null && lastErrorCode == null,
+            ) { "attempting reconciliation metadata is inconsistent" }
+            ReconciliationOutcome.FAILED -> require(
+                consecutiveAttempts in 1 until MAX_ATTEMPTS && nextEligibleEpochMs > 0L &&
+                    lastTrigger != null && lastErrorCode != null,
+            ) { "failed reconciliation metadata is inconsistent" }
+            ReconciliationOutcome.BACKOFF -> require(
+                consecutiveAttempts in 1 until MAX_ATTEMPTS && nextEligibleEpochMs > 0L &&
+                    lastTrigger != null && lastErrorCode != null,
+            ) { "backoff reconciliation metadata is inconsistent" }
+            ReconciliationOutcome.EXHAUSTED -> require(
+                consecutiveAttempts == MAX_ATTEMPTS && lastTrigger != null && lastErrorCode != null,
+            ) { "exhausted reconciliation metadata is inconsistent" }
+            ReconciliationOutcome.SUCCEEDED -> require(
+                consecutiveAttempts == 0 && nextEligibleEpochMs == 0L &&
+                    lastTrigger != null && lastErrorCode == null,
+            ) { "successful reconciliation metadata is inconsistent" }
+            ReconciliationOutcome.SUPERSEDED -> require(
+                consecutiveAttempts in 1..MAX_ATTEMPTS && nextEligibleEpochMs == 0L &&
+                    lastTrigger != null && lastErrorCode == null,
+            ) { "superseded reconciliation metadata is inconsistent" }
+            ReconciliationOutcome.INTERRUPTED -> require(
+                lastTrigger != null && lastErrorCode == LifecycleErrorCode.PROCESS_DIED,
+            ) { "interrupted reconciliation metadata requires process-death evidence" }
+            ReconciliationOutcome.SKIPPED_HOST_DISABLED,
+            ReconciliationOutcome.SKIPPED_AUTOSTART_DISABLED,
+            ReconciliationOutcome.SKIPPED_DESIRED_STOPPED,
+            -> require(lastTrigger != null && lastErrorCode == null) {
+                "skipped reconciliation metadata is inconsistent"
+            }
+        }
     }
 
     companion object {

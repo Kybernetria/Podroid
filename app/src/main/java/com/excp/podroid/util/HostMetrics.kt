@@ -86,7 +86,9 @@ object HostMetrics {
 
     fun processPid(process: Process): Int? = try {
         val m = Process::class.java.getMethod("pid")
-        (m.invoke(process) as Int).takeIf { it > 0 }
+        (m.invoke(process) as? Number)?.toLong()
+            ?.takeIf { it in 1..Int.MAX_VALUE.toLong() }
+            ?.toInt()
     } catch (_: Exception) {
         null
     }

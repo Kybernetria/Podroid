@@ -35,6 +35,7 @@ class VmPaths private constructor(
     val controlSocket: File = child("ctrl.sock")
     val hostSocket: File = child("host.sock")
     val qmpSocket: File = child("qmp.sock")
+    val qemuOwnerRecord: File = child(".qemu-owner")
     val avfTerminalSocket: File = child("avf-terminal.sock")
     val avfControlSocket: File = child("avf-ctrl.sock")
     val consoleLog: File = child("console.log")
@@ -57,6 +58,7 @@ class VmPaths private constructor(
         "controlSocket" to controlSocket,
         "hostSocket" to hostSocket,
         "qmpSocket" to qmpSocket,
+        "qemuOwnerRecord" to qemuOwnerRecord,
         "avfTerminalSocket" to avfTerminalSocket,
         "avfControlSocket" to avfControlSocket,
         "consoleLog" to consoleLog,

@@ -1350,7 +1350,8 @@ class VmManagerTest {
             state = state.copy(
                 hostEnabled = state.hostEnabled || operation == LifecycleOperation.SETUP,
                 desiredState = when (operation) {
-                    LifecycleOperation.START, LifecycleOperation.RESTART -> VmDesiredState.RUNNING
+                    LifecycleOperation.START, LifecycleOperation.RECOVER, LifecycleOperation.RESTART ->
+                        VmDesiredState.RUNNING
                     LifecycleOperation.STOP, LifecycleOperation.FORCE_STOP, LifecycleOperation.REMOVE ->
                         VmDesiredState.STOPPED
                     LifecycleOperation.SETUP -> state.desiredState

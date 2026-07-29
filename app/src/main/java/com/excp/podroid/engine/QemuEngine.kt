@@ -43,6 +43,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -122,6 +123,7 @@ class QemuEngine @Inject constructor(
     private val stderrLineLengths = ArrayDeque<Int>()
 
     private val qmpSocketPath: String get() = vmPaths.qmpSocket.absolutePath
+    private val runtimeOwnerStore = QemuRuntimeOwnerStore(vmPaths)
 
     override val qmpController: QmpController? by lazy { QmpClient(qmpSocketPath) }
 
@@ -366,17 +368,14 @@ class QemuEngine @Inject constructor(
         // feed (or race the one-shot guard / scan offsets of) this run's detector.
         val detector = newBootStageDetector(generation)
 
-        // Clean up stale sockets from a previous run. qmp.sock must be
-        // included — a leftover file from a crashed QEMU prevents the new
-        // process from binding its QMP server socket.
-        qemuRuntimeSockets().forEach { it.delete() }
-
         if (!launchGate.mayLaunch(generation)) {
             finishBeforeProcess(generation, VmState.Stopped)
             return
         }
 
         var processOwner: QemuProcessOwner<Process, Int>? = null
+        var capturedOwner: QemuRuntimeOwner? = null
+        var publishedOwner: PublishedQemuOwner? = null
         try {
             val cmd = buildCommand(qemuExe, portForwards, config)
             // Never emit the command: user QEMU and kernel extras may contain
@@ -407,10 +406,29 @@ class QemuEngine @Inject constructor(
             pathSecurity.validateForLaunch()
             val owner = QemuProcessOwner<Process, Int>(
                 commit = { child ->
-                    launchGate.commitLaunch(generation) { process = child }
+                    val pid = HostMetrics.processPid(child)?.toLong()
+                        ?: throw IOException("QEMU pid unavailable at ownership commit")
+                    val record = runtimeOwnerStore.capture(pid, generation)
+                    capturedOwner = record
+                    launchGate.commitLaunch(generation) {
+                        process = child
+                        // Publication is atomic and occurs only after this
+                        // generation passed the process-commit fence.
+                        publishedOwner = runtimeOwnerStore.publish(record)
+                    }
                 },
                 forceDestroy = { it.destroyForcibly() },
-                reap = { child -> withContext(dispatcher) { child.waitFor() } },
+                reap = { child ->
+                    val exitCode = withContext(dispatcher) { child.waitFor() }
+                    withContext(NonCancellable) {
+                        capturedOwner?.let { record ->
+                            runtimeOwnerStore.cleanupAfterConfirmedReap(record, publishedOwner)
+                        }
+                        capturedOwner = null
+                        publishedOwner = null
+                    }
+                    exitCode
+                },
             )
             processOwner = owner
             val proc = owner.createAndCommit {
@@ -655,7 +673,6 @@ class QemuEngine @Inject constructor(
         sessionClientDelegate = null
         _consoleText.value = ""
         _runningSinceMs = null
-        qemuRuntimeSockets().forEach { it.delete() }
         _bootStage.value = ""
         activeLaunchGeneration?.let(launchGate::complete)
         activeLaunchGeneration = null

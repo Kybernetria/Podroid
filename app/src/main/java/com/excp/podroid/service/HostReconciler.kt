@@ -15,7 +15,6 @@ import kotlinx.coroutines.sync.Mutex
 internal object ReconciliationServiceTriggerPolicy {
     fun fromAction(action: String?): ReconciliationTrigger? = when (action) {
         PodroidService.ACTION_RECONCILE_BOOT -> ReconciliationTrigger.BOOT_COMPLETED
-        PodroidService.ACTION_RECONCILE_APP -> ReconciliationTrigger.APP_COLD_START
         null -> ReconciliationTrigger.PROCESS_RESTART
         else -> null
     }
@@ -25,6 +24,7 @@ internal enum class ReconciliationServiceDisposition { NO_ACTION, SUPERVISE_RUNT
 internal data class HostReconciliationResult(
     val outcome: ReconciliationOutcome,
     val disposition: ReconciliationServiceDisposition,
+    val runtimeMayBeLive: Boolean = false,
 )
 
 /** Process-local serialization around the durable pure policy/state machine. */
@@ -34,14 +34,14 @@ class HostReconciler @Inject internal constructor(
     private val transport: HostTransportReconciler,
 ) {
     private val mutex = Mutex()
+    @Volatile private var possibleOrphanRuntime = false
 
     internal suspend fun reconcile(trigger: ReconciliationTrigger): HostReconciliationResult {
         if (!mutex.tryLock()) {
             return HostReconciliationResult(
                 ReconciliationOutcome.SUPERSEDED,
-                if (manager.quiescent(VmId.DEFAULT).value) {
-                    ReconciliationServiceDisposition.NO_ACTION
-                } else ReconciliationServiceDisposition.SUPERVISE_RUNTIME,
+                currentDisposition(possibleOrphanRuntime),
+                runtimeMayBeLive = possibleOrphanRuntime,
             )
         }
         try {
@@ -49,7 +49,8 @@ class HostReconciler @Inject internal constructor(
             if (admission is ReconciliationAdmission.Skip) {
                 return HostReconciliationResult(
                     admission.outcome,
-                    currentDisposition(),
+                    currentDisposition(possibleOrphanRuntime),
+                    runtimeMayBeLive = possibleOrphanRuntime,
                 )
             }
             val execution = admission as ReconciliationAdmission.Execute
@@ -62,7 +63,7 @@ class HostReconciler @Inject internal constructor(
                 if (!alreadyOwned) {
                     val command = manager.prepareLifecycleCommand(
                         VmId.DEFAULT,
-                        LifecycleOperation.START,
+                        LifecycleOperation.RECOVER,
                         token.expectedNextTransactionId,
                     )
                     if (!manager.executePrepared(VmId.DEFAULT, command)) {
@@ -71,7 +72,8 @@ class HostReconciler @Inject internal constructor(
                         )
                         return HostReconciliationResult(
                             ReconciliationOutcome.SUPERSEDED,
-                            currentDisposition(),
+                            currentDisposition(possibleOrphanRuntime),
+                            runtimeMayBeLive = possibleOrphanRuntime,
                         )
                     }
                 }
@@ -79,6 +81,7 @@ class HostReconciler @Inject internal constructor(
                 manager.finishReconciliation(
                     VmId.DEFAULT, token, ReconciliationOutcome.SUCCEEDED,
                 )
+                possibleOrphanRuntime = false
                 HostReconciliationResult(
                     ReconciliationOutcome.SUCCEEDED,
                     ReconciliationServiceDisposition.SUPERVISE_RUNTIME,
@@ -91,16 +94,20 @@ class HostReconciler @Inject internal constructor(
                 )
                 HostReconciliationResult(
                     ReconciliationOutcome.SUPERSEDED,
-                    currentDisposition(),
+                    currentDisposition(possibleOrphanRuntime),
+                    runtimeMayBeLive = possibleOrphanRuntime,
                 )
             } catch (failure: Throwable) {
                 val code = stableCode(failure)
                 manager.finishReconciliation(
                     VmId.DEFAULT, token, ReconciliationOutcome.FAILED, code,
                 )
+                possibleOrphanRuntime = possibleOrphanRuntime ||
+                    (failure as? RuntimeProbeException)?.runtimeMayBeLive == true
                 HostReconciliationResult(
                     ReconciliationOutcome.FAILED,
-                    currentDisposition(),
+                    currentDisposition(possibleOrphanRuntime),
+                    runtimeMayBeLive = possibleOrphanRuntime,
                 )
             }
         } finally {
@@ -108,8 +115,10 @@ class HostReconciler @Inject internal constructor(
         }
     }
 
-    private fun currentDisposition(): ReconciliationServiceDisposition =
-        if (!manager.quiescent(VmId.DEFAULT).value) {
+    private fun currentDisposition(
+        runtimeMayBeLive: Boolean = false,
+    ): ReconciliationServiceDisposition =
+        if (runtimeMayBeLive || !manager.quiescent(VmId.DEFAULT).value) {
             ReconciliationServiceDisposition.SUPERVISE_RUNTIME
         } else ReconciliationServiceDisposition.NO_ACTION
 

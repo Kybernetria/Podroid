@@ -15,13 +15,12 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class HostReconcilerTest {
-    @Test fun `service action mapping distinguishes boot app and sticky null restart`() {
+    @Test fun `service action mapping accepts only boot and sticky null restart`() {
         assertEquals(ReconciliationTrigger.BOOT_COMPLETED,
             ReconciliationServiceTriggerPolicy.fromAction(PodroidService.ACTION_RECONCILE_BOOT))
-        assertEquals(ReconciliationTrigger.APP_COLD_START,
-            ReconciliationServiceTriggerPolicy.fromAction(PodroidService.ACTION_RECONCILE_APP))
         assertEquals(ReconciliationTrigger.PROCESS_RESTART,
             ReconciliationServiceTriggerPolicy.fromAction(null))
+        assertNull(ReconciliationServiceTriggerPolicy.fromAction("com.excp.podroid.action.RECONCILE_APP"))
         assertNull(ReconciliationServiceTriggerPolicy.fromAction("unexpected"))
     }
 
@@ -39,6 +38,7 @@ class HostReconcilerTest {
             val result = fixture.reconciler.reconcile(trigger)
             assertEquals(ReconciliationOutcome.SUCCEEDED, result.outcome)
             assertEquals(1, fixture.manager.prepareCalls)
+            assertEquals(LifecycleOperation.RECOVER, fixture.manager.lastPreparedOperation)
             assertEquals(1, fixture.manager.executeCalls)
             assertEquals(1, fixture.manager.forwardRestoreCalls)
             assertEquals(1, fixture.transport.calls)
@@ -100,6 +100,33 @@ class HostReconcilerTest {
         assertFalse(HostSupervisorRecordCodec.encode(state).contains("private"))
     }
 
+    @Test fun `possible live orphan failure supervises despite quiescent in-process engine`() = runBlocking {
+        val fixture = fixture(autostart = true)
+        fixture.manager.failure = RuntimeProbeException(
+            LifecycleErrorCode.RUNTIME_OWNERSHIP,
+            runtimeMayBeLive = true,
+        )
+        fixture.manager.quiescent.value = true
+
+        val result = fixture.reconciler.reconcile(ReconciliationTrigger.PROCESS_RESTART)
+
+        assertEquals(ReconciliationOutcome.FAILED, result.outcome)
+        assertEquals(ReconciliationServiceDisposition.SUPERVISE_RUNTIME, result.disposition)
+        assertTrue(result.runtimeMayBeLive)
+
+        val backoff = fixture.reconciler.reconcile(ReconciliationTrigger.PROCESS_RESTART)
+        assertEquals(ReconciliationOutcome.BACKOFF, backoff.outcome)
+        assertEquals(ReconciliationServiceDisposition.SUPERVISE_RUNTIME, backoff.disposition)
+        assertTrue(backoff.runtimeMayBeLive)
+        val retention = VmServiceLifecyclePolicy.decide(
+            VmLifecycleState.IDLE,
+            quiescent = true,
+            busy = false,
+            pendingStartOwned = backoff.runtimeMayBeLive,
+        )
+        assertFalse(retention.teardown)
+    }
+
     @Test fun `explicit desired stopped never starts`() = runBlocking {
         val fixture = fixture(autostart = true, desired = VmDesiredState.STOPPED)
         val result = fixture.reconciler.reconcile(ReconciliationTrigger.APP_COLD_START)
@@ -146,6 +173,7 @@ class HostReconcilerTest {
         val lifecycle = MutableStateFlow(VmLifecycleState.IDLE)
         val quiescent = MutableStateFlow(true)
         var prepareCalls = 0
+        var lastPreparedOperation: LifecycleOperation? = null
         var executeCalls = 0
         var forwardRestoreCalls = 0
         var executionGate: suspend () -> Unit = {}
@@ -173,6 +201,7 @@ class HostReconcilerTest {
             expectedCommandGeneration: Long?,
         ): LifecycleTransactionToken {
             prepareCalls++
+            lastPreparedOperation = operation
             val before = beforeRecoveryPrepare
             beforeRecoveryPrepare = {}
             before()

@@ -60,6 +60,10 @@ ssh root@<phone-ip> -p 9922
 
 Password authentication is disabled.
 
+## Recovery behavior
+
+Podroid keeps sticky process-restart recovery and the configured post-unlock boot policy. Android force-stop remains authoritative: merely opening the exported launcher Activity does not resume the VM. After force-stop, explicitly tap **Start VM** in the app to resume it.
+
 ## Build and verification
 
 ```sh

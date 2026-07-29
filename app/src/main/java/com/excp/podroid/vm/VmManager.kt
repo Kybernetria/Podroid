@@ -470,7 +470,7 @@ class DefaultVmManager internal constructor(
                             ensureInstalledEffect(vmId, command)
                             false
                         }
-                        LifecycleOperation.START -> startEffect(vmId, command)
+                        LifecycleOperation.START, LifecycleOperation.RECOVER -> startEffect(vmId, command)
                         LifecycleOperation.STOP -> {
                             stopEffect(vmId, command, force = false)
                             false
@@ -485,6 +485,7 @@ class DefaultVmManager internal constructor(
                 }
             }
             if (command.operation == LifecycleOperation.START ||
+                command.operation == LifecycleOperation.RECOVER ||
                 command.operation == LifecycleOperation.RESTART
             ) {
                 // Serialize launch acceptance together with its generation

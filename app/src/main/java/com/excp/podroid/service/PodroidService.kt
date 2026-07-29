@@ -74,6 +74,8 @@ class PodroidService : Service() {
 
     private val launchCoordinator = ServiceLaunchCoordinator<ServiceLaunchOwner>()
     private val reconciliationActive = kotlinx.coroutines.flow.MutableStateFlow(false)
+    /** Keeps foreground/WakeLock ownership when only an out-of-process runtime may remain live. */
+    private val orphanSupervisionRequired = kotlinx.coroutines.flow.MutableStateFlow(false)
     /** Main-thread count prevents a duplicate delivery from disarming an older run. */
     private var activeReconciliationDeliveries = 0
     private val serviceDispatchMutex = Mutex()
@@ -190,7 +192,7 @@ class PodroidService : Service() {
                     }
                 }
             }
-            ACTION_RECONCILE_BOOT, ACTION_RECONCILE_APP, null -> {
+            ACTION_RECONCILE_BOOT, null -> {
                 enterForegroundStartWindow()
                 acquireWakeLock()
                 activeReconciliationDeliveries++
@@ -207,9 +209,16 @@ class PodroidService : Service() {
                     }
                     withContext(NonCancellable + Dispatchers.Main.immediate) {
                         activeReconciliationDeliveries = (activeReconciliationDeliveries - 1).coerceAtLeast(0)
+                        result.getOrNull()?.let { completed ->
+                            orphanSupervisionRequired.value = completed.runtimeMayBeLive
+                        }
                         reconciliationActive.value = activeReconciliationDeliveries > 0
                         result.onSuccess { completed ->
-                            Log.i(TAG, "Reconciliation trigger=${trigger.name} outcome=${completed.outcome.name}")
+                            Log.i(
+                                TAG,
+                                "Reconciliation trigger=${trigger.name} outcome=${completed.outcome.name} " +
+                                    "runtimeMayBeLive=${completed.runtimeMayBeLive}",
+                            )
                             if (completed.disposition == ReconciliationServiceDisposition.SUPERVISE_RUNTIME) {
                                 acquireWakeLock()
                                 startSupervision()
@@ -685,14 +694,24 @@ class PodroidService : Service() {
      * cleanup signal (including one produced by a Stop retry).
      */
     private suspend fun observeStateForShutdown() {
+        val recoveryOwnership = reconciliationActive.combine(
+            orphanSupervisionRequired,
+        ) { reconciling, orphanSupervision ->
+            reconciling || orphanSupervision
+        }
         combine(
             vmManager.lifecycle(VmId.DEFAULT),
             vmManager.quiescent(VmId.DEFAULT),
             vmManager.busy(VmId.DEFAULT),
             launchCoordinator.ownershipActive,
-            reconciliationActive,
-        ) { state, quiescent, busy, pendingStart, reconciling ->
-            VmServiceLifecyclePolicy.decide(state, quiescent, busy, pendingStart || reconciling)
+            recoveryOwnership,
+        ) { state, quiescent, busy, pendingStart, recoveryOwned ->
+            VmServiceLifecyclePolicy.decide(
+                state,
+                quiescent,
+                busy,
+                pendingStart || recoveryOwned,
+            )
         }.collect { decision ->
             // No unconditional baseline suppression: if cleanup completed before
             // this collector's first emission, that first terminal snapshot must
@@ -706,7 +725,8 @@ class PodroidService : Service() {
             vmManager.lifecycle(VmId.DEFAULT).value,
             vmManager.quiescent(VmId.DEFAULT).value,
             vmManager.busy(VmId.DEFAULT).value,
-            launchCoordinator.ownershipActive.value || reconciliationActive.value,
+            launchCoordinator.ownershipActive.value || reconciliationActive.value ||
+                orphanSupervisionRequired.value,
         )
 
     /** Release the WakeLock, drop the foreground notification, and stop. */
@@ -958,7 +978,6 @@ class PodroidService : Service() {
         const val ACTION_STOP    = "com.excp.podroid.action.STOP"
         const val ACTION_RESTART = "com.excp.podroid.action.RESTART"
         const val ACTION_RECONCILE_BOOT = "com.excp.podroid.action.RECONCILE_BOOT"
-        const val ACTION_RECONCILE_APP = "com.excp.podroid.action.RECONCILE_APP"
 
         internal fun reconciliationIntent(context: Context, action: String) =
             Intent(context, PodroidService::class.java).setAction(action)

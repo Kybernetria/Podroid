@@ -285,8 +285,10 @@ class HostSupervisorRepository internal constructor(
                 )
             }
             val desired = when (operation) {
-                LifecycleOperation.START, LifecycleOperation.RESTART -> VmDesiredState.RUNNING
-                LifecycleOperation.STOP, LifecycleOperation.FORCE_STOP, LifecycleOperation.REMOVE -> VmDesiredState.STOPPED
+                LifecycleOperation.START, LifecycleOperation.RECOVER, LifecycleOperation.RESTART ->
+                    VmDesiredState.RUNNING
+                LifecycleOperation.STOP, LifecycleOperation.FORCE_STOP, LifecycleOperation.REMOVE ->
+                    VmDesiredState.STOPPED
                 LifecycleOperation.SETUP -> current.desiredState
             }
             token = LifecycleTransactionToken(nextId, operation, current.runtimeGeneration)
@@ -355,15 +357,13 @@ class HostSupervisorRepository internal constructor(
                         completedAtEpochMs = maxOf(now(), transaction.requestedAtEpochMs),
                         errorCode = errorCode,
                     ),
-                    reconciliation = if (outcome == LifecycleOutcome.SUCCEEDED) {
-                        current.reconciliation.copy(
-                            consecutiveAttempts = 0,
-                            nextEligibleEpochMs = 0,
-                            lastOutcome = if (current.reconciliation.lastOutcome == ReconciliationOutcome.ATTEMPTING) {
-                                ReconciliationOutcome.SUCCEEDED
-                            } else ReconciliationOutcome.NEVER_RUN,
-                            lastErrorCode = null,
-                        )
+                    reconciliation = if (outcome == LifecycleOutcome.SUCCEEDED &&
+                        token.operation in setOf(LifecycleOperation.START, LifecycleOperation.RESTART)
+                    ) {
+                        // Explicit user lifecycle success starts a fresh recovery
+                        // budget. RECOVER success is only one step of reconciliation;
+                        // its matching finish(SUCCEEDED) owns the reset.
+                        ReconciliationMetadata.safeDefaults()
                     } else current.reconciliation,
                 )
             }
@@ -376,13 +376,14 @@ class HostSupervisorRepository internal constructor(
         mutate { original ->
             val timestamp = now()
             val pending = original.latestTransaction?.takeIf { it.outcome == LifecycleOutcome.PENDING }
-            var current = if (pending != null) {
+            val interruptedAttempt = original.reconciliation.lastOutcome == ReconciliationOutcome.ATTEMPTING
+            var current = if (pending != null || interruptedAttempt) {
                 original.copy(
-                    latestTransaction = pending.copy(
+                    latestTransaction = if (pending != null) pending.copy(
                         outcome = LifecycleOutcome.FAILED,
                         completedAtEpochMs = maxOf(timestamp, pending.requestedAtEpochMs),
                         errorCode = LifecycleErrorCode.PROCESS_DIED,
-                    ),
+                    ) else original.latestTransaction,
                     reconciliation = original.reconciliation.copy(
                         lastTrigger = trigger,
                         lastOutcome = ReconciliationOutcome.INTERRUPTED,
@@ -395,13 +396,15 @@ class HostSupervisorRepository internal constructor(
                 // Preserve the stronger INTERRUPTED/PROCESS_DIED evidence when
                 // policy prevents recovery. The returned decision still tells
                 // Android why no service effect is eligible.
-                if (pending == null) {
+                if (pending == null && (!interruptedAttempt || decision == ReconciliationOutcome.EXHAUSTED)) {
                     current = current.copy(reconciliation = current.reconciliation.copy(
                         lastTrigger = trigger,
                         lastOutcome = decision,
-                        lastErrorCode = if (decision == ReconciliationOutcome.EXHAUSTED) {
-                            current.reconciliation.lastErrorCode
-                        } else null,
+                        lastErrorCode = if (decision in setOf(
+                                ReconciliationOutcome.BACKOFF,
+                                ReconciliationOutcome.EXHAUSTED,
+                            )
+                        ) current.reconciliation.lastErrorCode else null,
                     ))
                 }
                 admission = ReconciliationAdmission.Skip(decision)
@@ -413,6 +416,7 @@ class HostSupervisorRepository internal constructor(
                 admission = ReconciliationAdmission.Execute(token, pending?.id)
                 current.copy(reconciliation = current.reconciliation.copy(
                     consecutiveAttempts = attempt,
+                    nextEligibleEpochMs = 0,
                     lastTrigger = trigger,
                     lastOutcome = ReconciliationOutcome.ATTEMPTING,
                     lastErrorCode = null,
@@ -436,7 +440,8 @@ class HostSupervisorRepository internal constructor(
         return mutate { current ->
             val metadata = current.reconciliation
             if (metadata.lastTrigger != token.trigger ||
-                (metadata.consecutiveAttempts != token.attempt && metadata.lastOutcome != ReconciliationOutcome.SUCCEEDED)
+                metadata.consecutiveAttempts != token.attempt ||
+                metadata.lastOutcome != ReconciliationOutcome.ATTEMPTING
             ) return@mutate current
             when (outcome) {
                 ReconciliationOutcome.SUCCEEDED -> current.copy(reconciliation = metadata.copy(

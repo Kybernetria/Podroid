@@ -70,6 +70,11 @@ internal class QmpTransactionBudget(
     }
 }
 
+internal class QmpEndpointFailure(
+    val connectionEstablished: Boolean,
+    cause: Throwable,
+) : IOException("QMP endpoint failure", cause)
+
 internal class QmpClient(
     private val socketPath: String,
     private val timeoutMs: Long = SOCKET_TIMEOUT_MS,
@@ -148,6 +153,7 @@ internal class QmpClient(
         val cancellationHandle = closeOnCancellation(coroutineContext[Job]) {
             runCatching { socket.close() }
         }
+        var connectionEstablished = false
         try {
             val budget = QmpTransactionBudget(
                 timeoutMs, MAX_QMP_LINE_BYTES, MAX_QMP_TOTAL_BYTES, MAX_QMP_EVENTS, nanoTime,
@@ -157,6 +163,7 @@ internal class QmpClient(
                 LocalSocketAddress(socketPath, LocalSocketAddress.Namespace.FILESYSTEM),
                 budget.remainingTimeoutMs(),
             )
+            connectionEstablished = true
             val input = socket.inputStream
             val output = socket.outputStream
 
@@ -174,7 +181,7 @@ internal class QmpClient(
             throw c
         } catch (e: Exception) {
             Log.e(TAG, "QMP command failed: $command", e)
-            Result.failure(e)
+            Result.failure(QmpEndpointFailure(connectionEstablished, e))
         } finally {
             cancellationHandle?.dispose()
             runCatching { socket.close() }

@@ -24,6 +24,7 @@ class VmPathSecurity(private val paths: VmPaths) {
     private val filesRoot = paths.filesDirectory.toPath().toAbsolutePath().normalize()
     private val instancesRoot = paths.instancesDirectory.toPath().toAbsolutePath().normalize()
     private val instanceRoot = paths.instanceDirectory.toPath().toAbsolutePath().normalize()
+    private val runtimeOwner = paths.qemuOwnerRecord.toPath().toAbsolutePath().normalize()
     private val runtimeEndpoints = setOf(
         paths.serialSocket,
         paths.terminalSocket,
@@ -41,32 +42,6 @@ class VmPathSecurity(private val paths: VmPaths) {
         createDirectoryNoFollow(instancesRoot)
         createDirectoryNoFollow(instanceRoot)
         validateHierarchy()
-    }
-
-    /**
-     * Removes only fixed runtime endpoint names after a probe proved no live
-     * runtime. Physical confinement, NOFOLLOW type, owner, and identity are
-     * rechecked immediately before each deletion.
-     */
-    @Throws(IOException::class)
-    fun removeStaleRuntimeEndpoints() {
-        validateHierarchy()
-        val expectedOwner = Files.getOwner(instanceRoot, LinkOption.NOFOLLOW_LINKS)
-        for (endpoint in runtimeEndpoints) {
-            if (!existsNoFollow(endpoint)) continue
-            val before = attributesNoFollow(endpoint)
-            if (before.isDirectory || before.isSymbolicLink || before.isRegularFile ||
-                Files.getOwner(endpoint, LinkOption.NOFOLLOW_LINKS) != expectedOwner
-            ) {
-                throw IOException("Unsafe runtime endpoint: $endpoint")
-            }
-            val after = attributesNoFollow(endpoint)
-            if (before.fileKey() != after.fileKey() || before.size() != after.size()) {
-                throw IOException("Runtime endpoint changed before deletion: $endpoint")
-            }
-            Files.delete(endpoint)
-        }
-        forceDirectory(instanceRoot)
     }
 
     /** Strict validation after a probe/cleanup has established quiescence. */
@@ -197,7 +172,9 @@ class VmPathSecurity(private val paths: VmPaths) {
                             }
                             pending.add(normalized to depth + 1)
                         }
-                        attrs.isRegularFile -> Unit
+                        attrs.isRegularFile -> if (!allowRuntimeEndpoints && normalized == runtimeOwner) {
+                            throw IOException("Live runtime ownership record rejected: $normalized")
+                        }
                         allowRuntimeEndpoints && normalized in runtimeEndpoints -> Unit
                         else -> throw IOException("Special VM path rejected: $normalized")
                     }

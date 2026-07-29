@@ -5,15 +5,20 @@
 package com.excp.podroid.vm
 
 import java.io.IOException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 internal enum class RuntimeBackend { QEMU, AVF }
+internal interface StaleRuntimeEvidence
 internal sealed interface RuntimeProbeResult {
     data object Absent : RuntimeProbeResult
-    data object StaleEndpoints : RuntimeProbeResult
+    data class StaleEndpoints(val evidence: StaleRuntimeEvidence) : RuntimeProbeResult
     data class Live(val backend: RuntimeBackend) : RuntimeProbeResult
-    data class Uncertain(val errorCode: LifecycleErrorCode) : RuntimeProbeResult
+    data class Uncertain(
+        val errorCode: LifecycleErrorCode,
+        val runtimeMayBeLive: Boolean,
+    ) : RuntimeProbeResult
 }
 
 /** A probe owns only one fixed per-instance runtime; it accepts no path or name. */
@@ -25,7 +30,7 @@ internal interface NamedRuntimeProbe {
 }
 
 internal fun interface StaleRuntimeEndpointCleaner {
-    fun removeCheckedEndpoints()
+    fun removeCheckedEndpoints(evidence: StaleRuntimeEvidence)
 }
 
 /**
@@ -45,31 +50,65 @@ internal class RuntimePreflightCoordinator(
     }
 
     suspend fun prepareForLaunch() = mutex.withLock {
-        var qemuNeedsCleanup = false
+        var qemuNeedsCleanup: StaleRuntimeEvidence? = null
         for (probe in listOf(qemu, avf)) {
             when (val result = probe.probe()) {
                 RuntimeProbeResult.Absent -> Unit
-                RuntimeProbeResult.StaleEndpoints -> {
+                is RuntimeProbeResult.StaleEndpoints -> {
                     if (probe.backend != RuntimeBackend.QEMU) {
                         throw IOException("Non-QEMU probe reported filesystem endpoints")
                     }
-                    qemuNeedsCleanup = true
+                    qemuNeedsCleanup = result.evidence
                 }
-                is RuntimeProbeResult.Uncertain -> throw RuntimeProbeException(result.errorCode)
+                is RuntimeProbeResult.Uncertain -> throw RuntimeProbeException(
+                    result.errorCode,
+                    result.runtimeMayBeLive,
+                )
                 is RuntimeProbeResult.Live -> {
                     if (!probe.stopLiveRuntime() || !probe.awaitStopped()) {
-                        throw RuntimeProbeException(LifecycleErrorCode.RUNTIME_OWNERSHIP)
+                        throw RuntimeProbeException(
+                            LifecycleErrorCode.RUNTIME_OWNERSHIP,
+                            runtimeMayBeLive = true,
+                        )
                     }
-                    if (probe.backend == RuntimeBackend.QEMU) qemuNeedsCleanup = true
+                    if (probe.backend == RuntimeBackend.QEMU) {
+                        val stopped = probe.probe()
+                        if (stopped !is RuntimeProbeResult.StaleEndpoints) {
+                            throw RuntimeProbeException(
+                                LifecycleErrorCode.RUNTIME_OWNERSHIP,
+                                runtimeMayBeLive = true,
+                            )
+                        }
+                        qemuNeedsCleanup = stopped.evidence
+                    }
                 }
             }
         }
-        if (qemuNeedsCleanup) staleCleaner.removeCheckedEndpoints()
+        qemuNeedsCleanup?.let { evidence ->
+            try {
+                staleCleaner.removeCheckedEndpoints(evidence)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: RuntimeProbeException) {
+                throw failure
+            } catch (failure: Throwable) {
+                throw RuntimeProbeException(
+                    LifecycleErrorCode.RUNTIME_OWNERSHIP,
+                    runtimeMayBeLive = true,
+                    cause = failure,
+                )
+            }
+        }
     }
 }
 
-internal class RuntimeProbeException(val stableCode: LifecycleErrorCode) : IOException(
+internal class RuntimeProbeException(
+    val stableCode: LifecycleErrorCode,
+    val runtimeMayBeLive: Boolean,
+    cause: Throwable? = null,
+) : IOException(
     "Runtime preflight failed with stable code ${stableCode.name}",
+    cause,
 )
 
 /** Ticket #15 has not configured a management transport yet. */

@@ -11,6 +11,7 @@ import com.excp.podroid.engine.avf.AvfReflect
 import com.excp.podroid.vm.*
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.File
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.attribute.BasicFileAttributes
@@ -25,66 +26,124 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
+internal interface QemuRuntimeQmp {
+    suspend fun queryStatus(): Result<String>
+    suspend fun quit(): Result<Unit>
+}
+
+private class QemuRuntimeQmpClient(socketPath: String, timeoutMs: Long) : QemuRuntimeQmp {
+    private val client = QmpClient(socketPath, timeoutMs)
+    override suspend fun queryStatus() = client.queryStatus()
+    override suspend fun quit() = client.quit()
+}
+
 internal class QemuNamedRuntimeProbe(
     private val qmpSocket: File,
+    private val ownerStore: QemuRuntimeOwnerStore,
     private val fixedRuntimeEndpoints: List<File> = listOf(qmpSocket),
     private val timeoutMs: Long = QmpClient.SOCKET_TIMEOUT_MS,
+    private val qmp: QemuRuntimeQmp = QemuRuntimeQmpClient(qmpSocket.absolutePath, timeoutMs),
 ) : NamedRuntimeProbe {
     override val backend = RuntimeBackend.QEMU
-    private val qmp = QmpClient(qmpSocket.absolutePath, timeoutMs)
+    @Volatile private var liveOwner: QemuRuntimeOwner? = null
 
     override suspend fun probe(): RuntimeProbeResult {
         val path = qmpSocket.toPath()
+        val owner = ownerStore.inspect()
         if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
-            return if (fixedRuntimeEndpoints.any {
-                    Files.exists(it.toPath(), LinkOption.NOFOLLOW_LINKS)
-                }) RuntimeProbeResult.StaleEndpoints else RuntimeProbeResult.Absent
+            val hasEvidence = fixedRuntimeEndpoints.any {
+                Files.exists(it.toPath(), LinkOption.NOFOLLOW_LINKS)
+            } || owner !is QemuOwnerInspection.Missing
+            return if (hasEvidence) classifyDeadOwner(owner) else RuntimeProbeResult.Absent
         }
-        val attributes = Files.readAttributes(path, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        val attributes = try {
+            Files.readAttributes(path, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        } catch (_: IOException) {
+            return RuntimeProbeResult.Uncertain(LifecycleErrorCode.SECURITY, runtimeMayBeLive = true)
+        }
         if (attributes.isSymbolicLink || attributes.isDirectory || attributes.isRegularFile) {
-            return RuntimeProbeResult.Uncertain(LifecycleErrorCode.SECURITY)
+            return RuntimeProbeResult.Uncertain(LifecycleErrorCode.SECURITY, runtimeMayBeLive = true)
         }
         return qmp.queryStatus().fold(
-            onSuccess = { RuntimeProbeResult.Live(RuntimeBackend.QEMU) },
+            onSuccess = {
+                liveOwner = (owner as? QemuOwnerInspection.Valid)?.owner
+                RuntimeProbeResult.Live(RuntimeBackend.QEMU)
+            },
             onFailure = { failure ->
-                if (failure.isTimeoutFailure()) {
-                    RuntimeProbeResult.Uncertain(LifecycleErrorCode.PROBE_TIMEOUT)
-                } else {
-                    // A fixed app-private endpoint that cannot complete a QMP
-                    // handshake is not evidence of a live controllable runtime.
-                    RuntimeProbeResult.StaleEndpoints
+                when {
+                    failure.isTimeoutFailure() -> RuntimeProbeResult.Uncertain(
+                        LifecycleErrorCode.PROBE_TIMEOUT,
+                        runtimeMayBeLive = true,
+                    )
+                    failure.establishedQmpPeer() -> RuntimeProbeResult.Uncertain(
+                        LifecycleErrorCode.RUNTIME_OWNERSHIP,
+                        runtimeMayBeLive = true,
+                    )
+                    failure.refusedBeforeQmpPeer() -> classifyDeadOwner(owner)
+                    else -> RuntimeProbeResult.Uncertain(
+                        LifecycleErrorCode.RUNTIME_OWNERSHIP,
+                        runtimeMayBeLive = true,
+                    )
                 }
             },
         )
     }
 
-    override suspend fun stopLiveRuntime(): Boolean {
-        // The bounded command may observe EOF before QEMU removes the socket.
-        // Endpoint disappearance, not the optional reply, is authoritative.
-        qmp.quit()
-        return true
-    }
+    override suspend fun stopLiveRuntime(): Boolean = qmp.quit().isSuccess
 
     override suspend fun awaitStopped(): Boolean {
+        val owner = liveOwner ?: return false
         val deadline = System.nanoTime() + timeoutMs * 1_000_000L
         while (System.nanoTime() < deadline) {
-            if (!Files.exists(qmpSocket.toPath(), LinkOption.NOFOLLOW_LINKS)) return true
+            if (ownerStore.exactProcessIsDead(owner)) return true
             delay(POLL_MS)
         }
         return false
     }
 
-    private fun Throwable.isTimeoutFailure(): Boolean {
+    private fun classifyDeadOwner(owner: QemuOwnerInspection): RuntimeProbeResult = when (owner) {
+        QemuOwnerInspection.Missing -> RuntimeProbeResult.Uncertain(
+            LifecycleErrorCode.RUNTIME_OWNERSHIP,
+            runtimeMayBeLive = true,
+        )
+        is QemuOwnerInspection.Uncertain -> RuntimeProbeResult.Uncertain(
+            owner.errorCode,
+            runtimeMayBeLive = true,
+        )
+        is QemuOwnerInspection.Valid -> when (val proof = ownerStore.proveDead(owner)) {
+            is DeadOwnerProof.Proven -> RuntimeProbeResult.StaleEndpoints(proof.evidence)
+            DeadOwnerProof.ExactProcessAlive -> RuntimeProbeResult.Uncertain(
+                LifecycleErrorCode.RUNTIME_OWNERSHIP,
+                runtimeMayBeLive = true,
+            )
+            is DeadOwnerProof.Uncertain -> RuntimeProbeResult.Uncertain(
+                proof.errorCode,
+                runtimeMayBeLive = true,
+            )
+        }
+    }
+
+    private fun Throwable.establishedQmpPeer(): Boolean =
+        causes().filterIsInstance<QmpEndpointFailure>().firstOrNull()?.connectionEstablished == true
+
+    private fun Throwable.refusedBeforeQmpPeer(): Boolean =
+        causes().filterIsInstance<QmpEndpointFailure>().firstOrNull()?.connectionEstablished == false
+
+    private fun Throwable.isTimeoutFailure(): Boolean = causes().any { value ->
+        value is java.net.SocketTimeoutException || value is TimeoutException ||
+            value.message?.contains("deadline", ignoreCase = true) == true ||
+            value.message?.contains("timed out", ignoreCase = true) == true
+    }
+
+    private fun Throwable.causes(): List<Throwable> {
+        val values = mutableListOf<Throwable>()
         var current: Throwable? = this
         repeat(8) {
-            val value = current ?: return false
-            if (value is java.net.SocketTimeoutException || value is TimeoutException ||
-                value.message?.contains("deadline", ignoreCase = true) == true ||
-                value.message?.contains("timed out", ignoreCase = true) == true
-            ) return true
+            val value = current ?: return values
+            values += value
             current = value.cause
         }
-        return false
+        return values
     }
 
     private companion object { const val POLL_MS = 50L }
@@ -114,6 +173,18 @@ private class BoundedBlockingCall(private val timeoutMs: Long) {
     }
 }
 
+internal object AvfInspectionAvailabilityPolicy {
+    fun classify(featurePresent: Boolean, inspectionPermissionGranted: Boolean): RuntimeProbeResult? =
+        when {
+            !featurePresent -> RuntimeProbeResult.Absent
+            !inspectionPermissionGranted -> RuntimeProbeResult.Uncertain(
+                LifecycleErrorCode.SECURITY,
+                runtimeMayBeLive = true,
+            )
+            else -> null
+        }
+}
+
 internal class AvfNamedRuntimeProbe(
     private val context: Context,
     timeoutMs: Long = PROBE_TIMEOUT_MS,
@@ -123,10 +194,19 @@ internal class AvfNamedRuntimeProbe(
     @Volatile private var liveHandle: Any? = null
 
     override suspend fun probe(): RuntimeProbeResult = withContext(Dispatchers.IO) {
-        if (!context.packageManager.hasSystemFeature("android.software.virtualization_framework") ||
-            ContextCompat.checkSelfPermission(context, "android.permission.MANAGE_VIRTUAL_MACHINE") !=
-                PackageManager.PERMISSION_GRANTED
-        ) return@withContext RuntimeProbeResult.Absent
+        val availability = try {
+            AvfInspectionAvailabilityPolicy.classify(
+                context.packageManager.hasSystemFeature("android.software.virtualization_framework"),
+                ContextCompat.checkSelfPermission(context, "android.permission.MANAGE_VIRTUAL_MACHINE") ==
+                    PackageManager.PERMISSION_GRANTED,
+            )
+        } catch (_: SecurityException) {
+            RuntimeProbeResult.Uncertain(
+                LifecycleErrorCode.SECURITY,
+                runtimeMayBeLive = true,
+            )
+        }
+        if (availability != null) return@withContext availability
         blocking.run {
             val manager = AvfReflect.manager(context)
             val vm = AvfReflect.get(manager, VM_NAME) ?: return@run null
@@ -146,6 +226,7 @@ internal class AvfNamedRuntimeProbe(
                     if (failure.hasCause<TimeoutException>()) LifecycleErrorCode.PROBE_TIMEOUT
                     else if (failure.hasCause<SecurityException>()) LifecycleErrorCode.SECURITY
                     else LifecycleErrorCode.RUNTIME_OWNERSHIP,
+                    runtimeMayBeLive = true,
                 )
             },
         )
@@ -193,22 +274,24 @@ class ProductionRuntimePreflight @Inject internal constructor(
     @ApplicationContext context: Context,
     paths: VmPaths,
 ) {
+    private val qemuOwnerStore = QemuRuntimeOwnerStore(paths)
     internal val coordinator = RuntimePreflightCoordinator(
         qemu = QemuNamedRuntimeProbe(
             paths.qmpSocket,
+            qemuOwnerStore,
             listOf(
                 paths.serialSocket,
                 paths.terminalSocket,
                 paths.controlSocket,
                 paths.hostSocket,
                 paths.qmpSocket,
-                paths.avfTerminalSocket,
-                paths.avfControlSocket,
             ),
         ),
         avf = AvfNamedRuntimeProbe(context),
-        staleCleaner = StaleRuntimeEndpointCleaner {
-            VmPathSecurity(paths).removeStaleRuntimeEndpoints()
+        staleCleaner = StaleRuntimeEndpointCleaner { evidence ->
+            val qemuEvidence = evidence as? QemuStaleRuntimeEvidence
+                ?: throw IOException("Unexpected runtime cleanup evidence")
+            qemuOwnerStore.cleanup(qemuEvidence)
         },
     )
 }
