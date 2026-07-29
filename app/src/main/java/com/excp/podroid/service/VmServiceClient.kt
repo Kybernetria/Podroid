@@ -13,6 +13,7 @@ import android.util.Log
 import com.excp.podroid.di.ApplicationScope
 import com.excp.podroid.vm.ConsoleLog
 import com.excp.podroid.vm.ConsoleLogRequest
+import com.excp.podroid.vm.HostSupervisorState
 import com.excp.podroid.vm.MonotonicDeadline
 import com.excp.podroid.vm.SshEndpointDiscovery
 import com.excp.podroid.vm.VmDiagnostics
@@ -130,6 +131,7 @@ class VmServiceClient @Inject internal constructor(
 
     suspend fun list(): List<VmSummary> = call { it.list() }
     suspend fun status(): VmStatus = call { it.status() }
+    suspend fun supervisorState(): HostSupervisorState = call { it.supervisorState() }
     suspend fun ensureInstalled() = call { it.ensureInstalled() }
     suspend fun start() = call { it.start() }
     suspend fun gracefulStop() = call { it.gracefulStop() }

@@ -53,7 +53,9 @@ internal class ServiceLaunchCoordinator<T : Any> {
 
     private fun beginStopLocked(queueStart: Boolean): Stop<T> {
         if (mode == Mode.STOPPING) {
-            if (queueStart) startQueuedDuringStop = true
+            // A newer explicit Stop cancels a retained Restart/Start intent;
+            // another Restart retains it idempotently.
+            startQueuedDuringStop = queueStart
             return Stop(checkNotNull(stopGeneration), null, shouldExecute = false)
         }
         val invalidatedOwner = launch?.owner

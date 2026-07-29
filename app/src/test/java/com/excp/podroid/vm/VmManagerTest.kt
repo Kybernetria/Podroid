@@ -49,6 +49,70 @@ class VmManagerTest {
     }
 
     @Test
+    fun `setup enables Host and commits a bounded successful transaction`() = runBlocking {
+        val supervisor = FakeSupervisor()
+        val manager = manager(supervisor = supervisor)
+
+        manager.ensureInstalled(VmId.DEFAULT)
+
+        val state = manager.supervisorState(VmId.DEFAULT)
+        assertTrue(state.hostEnabled)
+        assertEquals(VmDesiredState.STOPPED, state.desiredState)
+        assertEquals(LifecycleOperation.SETUP, state.latestTransaction?.operation)
+        assertEquals(LifecycleOutcome.SUCCEEDED, state.latestTransaction?.outcome)
+    }
+
+    @Test
+    fun `pending desired state is durable before backend start effect`() = runBlocking {
+        val supervisor = FakeSupervisor()
+        val runtime = FakeRuntime().apply {
+            onStart = {
+                val duringEffect = supervisor.snapshot()
+                assertEquals(VmDesiredState.RUNNING, duringEffect.desiredState)
+                assertEquals(LifecycleOutcome.PENDING, duringEffect.latestTransaction?.outcome)
+                state.value = VmState.Running
+            }
+        }
+
+        manager(runtime = runtime, supervisor = supervisor).start(VmId.DEFAULT)
+
+        assertEquals(LifecycleOutcome.SUCCEEDED, supervisor.snapshot().latestTransaction?.outcome)
+    }
+
+    @Test
+    fun `start and stop persist desired state around effects and generation is monotonic`() = runBlocking {
+        val supervisor = FakeSupervisor()
+        val runtime = FakeRuntime()
+        val manager = manager(runtime = runtime, supervisor = supervisor)
+
+        manager.start(VmId.DEFAULT)
+        val running = manager.supervisorState(VmId.DEFAULT)
+        assertEquals(VmDesiredState.RUNNING, running.desiredState)
+        assertEquals(1L, running.runtimeGeneration)
+        assertEquals(LifecycleOutcome.SUCCEEDED, running.latestTransaction?.outcome)
+
+        manager.stop(VmId.DEFAULT)
+        val stopped = manager.supervisorState(VmId.DEFAULT)
+        assertEquals(VmDesiredState.STOPPED, stopped.desiredState)
+        assertEquals(1L, stopped.runtimeGeneration)
+        assertEquals(LifecycleOperation.STOP, stopped.latestTransaction?.operation)
+        assertEquals(LifecycleOutcome.SUCCEEDED, stopped.latestTransaction?.outcome)
+    }
+
+    @Test
+    fun `lifecycle failure persists only a stable redacted code`() = runBlocking {
+        val supervisor = FakeSupervisor()
+        val runtime = FakeRuntime().apply { onStart = { throw IOException("secret /private/path") } }
+        val manager = manager(runtime = runtime, supervisor = supervisor)
+
+        runCatching { manager.start(VmId.DEFAULT) }
+
+        val transaction = manager.supervisorState(VmId.DEFAULT).latestTransaction
+        assertEquals(LifecycleOutcome.FAILED, transaction?.outcome)
+        assertEquals(LifecycleErrorCode.IO, transaction?.errorCode)
+    }
+
+    @Test
     fun `concurrent ensure installed is serialized and duplicate is idempotent`() = runBlocking {
         val files = FakeFiles(installed = false)
         val entered = CompletableDeferred<Unit>()
@@ -191,6 +255,29 @@ class VmManagerTest {
         assertEquals(1, runtime.stopCalls)
         assertEquals(1, runtime.startCalls)
         assertEquals(VmState.Running, runtime.state.value)
+    }
+
+    @Test
+    fun `service restart phases keep desired running and finish replacement generation`() = runBlocking {
+        val supervisor = FakeSupervisor()
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+        }
+        val manager = manager(runtime = runtime, supervisor = supervisor)
+
+        manager.stopForRestart(VmId.DEFAULT)
+        val betweenPhases = manager.supervisorState(VmId.DEFAULT)
+        assertEquals(VmDesiredState.RUNNING, betweenPhases.desiredState)
+        assertEquals(LifecycleOperation.RESTART, betweenPhases.latestTransaction?.operation)
+        assertEquals(LifecycleOutcome.SUCCEEDED, betweenPhases.latestTransaction?.outcome)
+
+        manager.startForRestart(VmId.DEFAULT)
+        val restarted = manager.supervisorState(VmId.DEFAULT)
+        assertEquals(VmDesiredState.RUNNING, restarted.desiredState)
+        assertEquals(1L, restarted.runtimeGeneration)
+        assertEquals(LifecycleOperation.RESTART, restarted.latestTransaction?.operation)
+        assertEquals(LifecycleOutcome.SUCCEEDED, restarted.latestTransaction?.outcome)
     }
 
     @Test
@@ -608,6 +695,7 @@ class VmManagerTest {
             override suspend fun install(vmId: VmId) { files.installed = true }
         },
         configuration: FakeConfiguration = FakeConfiguration(),
+        supervisor: HostSupervisorTransactions = FakeSupervisor(),
         guestTimeoutMs: Long = 50,
     ): DefaultVmManager {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default).also(scopes::add)
@@ -616,6 +704,7 @@ class VmManagerTest {
             installer = installer,
             configuration = configuration,
             files = files,
+            supervisor = supervisor,
             scope = scope,
             startAcceptanceTimeoutMs = 500,
             guestShutdownTimeoutMs = guestTimeoutMs,
@@ -634,6 +723,58 @@ class VmManagerTest {
         ): T = action(object : VmAssetTreeLease {
             override suspend fun install(vmId: VmId) = this@TestInstaller.install(vmId)
         })
+    }
+
+    private class FakeSupervisor : HostSupervisorTransactions {
+        private var state = HostSupervisorState.safeDefaults()
+
+        override suspend fun snapshot(): HostSupervisorState = state
+
+        override suspend fun begin(operation: LifecycleOperation): LifecycleTransactionToken {
+            val id = (state.latestTransaction?.id ?: 0L) + 1L
+            val token = LifecycleTransactionToken(id, operation, state.runtimeGeneration)
+            state = state.copy(
+                hostEnabled = state.hostEnabled || operation == LifecycleOperation.SETUP,
+                desiredState = when (operation) {
+                    LifecycleOperation.START, LifecycleOperation.RESTART -> VmDesiredState.RUNNING
+                    LifecycleOperation.STOP, LifecycleOperation.FORCE_STOP, LifecycleOperation.REMOVE ->
+                        VmDesiredState.STOPPED
+                    LifecycleOperation.SETUP -> state.desiredState
+                },
+                latestTransaction = LifecycleTransaction(
+                    id, operation, LifecycleOutcome.PENDING, id, null, null,
+                ),
+            )
+            return token
+        }
+
+        override suspend fun succeed(token: LifecycleTransactionToken, runtimeStarted: Boolean) {
+            finish(token, LifecycleOutcome.SUCCEEDED, null, runtimeStarted)
+        }
+
+        override suspend fun fail(token: LifecycleTransactionToken, errorCode: LifecycleErrorCode) {
+            finish(token, LifecycleOutcome.FAILED, errorCode, false)
+        }
+
+        private fun finish(
+            token: LifecycleTransactionToken,
+            outcome: LifecycleOutcome,
+            errorCode: LifecycleErrorCode?,
+            runtimeStarted: Boolean,
+        ) {
+            val latest = state.latestTransaction ?: return
+            if (latest.id != token.id || latest.outcome != LifecycleOutcome.PENDING) return
+            state = state.copy(
+                runtimeGeneration = if (runtimeStarted) {
+                    maxOf(state.runtimeGeneration, token.baseRuntimeGeneration + 1L)
+                } else state.runtimeGeneration,
+                latestTransaction = latest.copy(
+                    outcome = outcome,
+                    completedAtEpochMs = latest.requestedAtEpochMs,
+                    errorCode = errorCode,
+                ),
+            )
+        }
     }
 
     private class FakeRuntime : ManagedVmRuntime {

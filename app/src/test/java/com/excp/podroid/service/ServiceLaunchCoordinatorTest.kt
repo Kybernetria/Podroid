@@ -89,6 +89,20 @@ class ServiceLaunchCoordinatorTest {
     }
 
     @Test
+    fun `newer explicit stop cancels retained restart intent`() {
+        val coordinator = ServiceLaunchCoordinator<String>()
+        coordinator.beginLaunch("running")
+        val restart = coordinator.beginRestart()
+
+        val newerStop = coordinator.beginStop()
+        val completion = requireNotNull(coordinator.completeStop(restart.generation, "unused"))
+
+        assertFalse(newerStop.shouldExecute)
+        assertNull(completion.launch)
+        assertFalse(coordinator.ownershipActive.value)
+    }
+
+    @Test
     fun `restart intent survives stale cancelled-generation completion window`() {
         val coordinator = ServiceLaunchCoordinator<String>()
         val cancelled = requireNotNull(coordinator.beginLaunch("cancelled"))

@@ -12,6 +12,7 @@
 package com.excp.podroid.engine
 
 import android.content.Context
+import com.excp.podroid.data.repository.HostSupervisorRepository
 import com.excp.podroid.data.repository.PortForwardRepository
 import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.di.ApplicationScope
@@ -45,6 +46,7 @@ object EngineModule {
         @ApplicationContext context: Context,
         settings: SettingsRepository,
         portForwards: PortForwardRepository,
+        hostSupervisor: HostSupervisorRepository,
         paths: VmPaths,
         @ApplicationScope scope: CoroutineScope,
     ): VmManager = DefaultVmManager(
@@ -52,6 +54,7 @@ object EngineModule {
         installer = ApplicationVmInstaller(context),
         configuration = RepositoryVmConfigurationSource(context, settings, portForwards),
         files = VmPathFiles(paths),
+        supervisor = hostSupervisor,
         scope = scope,
     )
 }

@@ -6,6 +6,7 @@ package com.excp.podroid.service
 
 import com.excp.podroid.vm.ConsoleLog
 import com.excp.podroid.vm.ConsoleLogRequest
+import com.excp.podroid.vm.HostSupervisorState
 import com.excp.podroid.vm.MonotonicDeadline
 import com.excp.podroid.vm.SshEndpointDiscovery
 import com.excp.podroid.vm.VmDiagnostics
@@ -93,6 +94,7 @@ interface VmServiceEndpoint {
 
     suspend fun list(): List<VmSummary>
     suspend fun status(): VmStatus
+    suspend fun supervisorState(): HostSupervisorState
     suspend fun ensureInstalled()
     suspend fun start()
     suspend fun gracefulStop()
@@ -200,6 +202,8 @@ internal class LocalVmServiceEndpoint(
 
     override suspend fun list(): List<VmSummary> = checked { manager.list(VmId.DEFAULT) }
     override suspend fun status(): VmStatus = checked { manager.status(VmId.DEFAULT) }
+    override suspend fun supervisorState(): HostSupervisorState =
+        checked { manager.supervisorState(VmId.DEFAULT) }
     override suspend fun ensureInstalled() = command { manager.ensureInstalled(VmId.DEFAULT) }
     override suspend fun start() = command { lifecycleCommands.startForeground() }
     override suspend fun gracefulStop() = command { lifecycleCommands.stop(force = false) }

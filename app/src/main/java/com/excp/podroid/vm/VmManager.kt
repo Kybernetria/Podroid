@@ -23,6 +23,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -134,11 +135,16 @@ interface VmManager {
     fun busy(vmId: VmId): StateFlow<Boolean>
     suspend fun list(vmId: VmId): List<VmSummary>
     suspend fun status(vmId: VmId): VmStatus
+    suspend fun supervisorState(vmId: VmId): HostSupervisorState
     suspend fun ensureInstalled(vmId: VmId)
     suspend fun start(vmId: VmId)
     suspend fun stop(vmId: VmId)
     suspend fun forceStop(vmId: VmId)
     suspend fun restart(vmId: VmId)
+    /** Service-owned first phase of a restart; desired state remains RUNNING. */
+    suspend fun stopForRestart(vmId: VmId)
+    /** Service-owned second phase of a restart; records the replacement generation. */
+    suspend fun startForRestart(vmId: VmId)
     suspend fun remove(vmId: VmId, policy: VmRemovePolicy)
     suspend fun readConsoleLog(vmId: VmId, request: ConsoleLogRequest): ConsoleLog
     suspend fun executeQmp(vmId: VmId, operation: VmQmpOperation): VmQmpResult
@@ -205,6 +211,7 @@ class DefaultVmManager internal constructor(
     private val installer: VmInstaller,
     private val configuration: VmConfigurationSource,
     private val files: VmFiles,
+    private val supervisor: HostSupervisorTransactions,
     private val scope: CoroutineScope,
     private val startAcceptanceTimeoutMs: Long = 5_000L,
     private val guestShutdownTimeoutMs: Long = 5_000L,
@@ -308,7 +315,15 @@ class DefaultVmManager internal constructor(
         )
     }
 
-    override suspend fun ensureInstalled(vmId: VmId) {
+    override suspend fun supervisorState(vmId: VmId): HostSupervisorState {
+        requireDefault(vmId)
+        return supervisor.snapshot()
+    }
+
+    override suspend fun ensureInstalled(vmId: VmId) = lifecycleTransaction(
+        vmId = vmId,
+        operation = LifecycleOperation.SETUP,
+    ) {
         awaitInitial(vmId)
         lifecycleMutex.withLock {
             check(runtime.quiescent.value) { "Cannot install while VM cleanup is incomplete" }
@@ -316,7 +331,11 @@ class DefaultVmManager internal constructor(
         }
     }
 
-    override suspend fun start(vmId: VmId) {
+    override suspend fun start(vmId: VmId) = lifecycleTransaction(
+        vmId = vmId,
+        operation = LifecycleOperation.START,
+        runtimeStarted = true,
+    ) {
         awaitInitial(vmId)
         lifecycleMutex.withLock {
             check(!busyFlow.value) { "Cannot start while previous VM work or cleanup is incomplete" }
@@ -327,24 +346,38 @@ class DefaultVmManager internal constructor(
         }
     }
 
-    override suspend fun stop(vmId: VmId) {
+    override suspend fun stop(vmId: VmId) = lifecycleTransaction(
+        vmId = vmId,
+        operation = LifecycleOperation.STOP,
+    ) {
         awaitInitial(vmId)
         requestStop(force = false).await()
     }
 
-    override suspend fun forceStop(vmId: VmId) {
+    override suspend fun forceStop(vmId: VmId) = lifecycleTransaction(
+        vmId = vmId,
+        operation = LifecycleOperation.FORCE_STOP,
+    ) {
         awaitInitial(vmId)
         requestStop(force = true).await()
     }
 
-    override suspend fun restart(vmId: VmId) {
+    override suspend fun stopForRestart(vmId: VmId) = lifecycleTransaction(
+        vmId = vmId,
+        operation = LifecycleOperation.RESTART,
+    ) {
         awaitInitial(vmId)
-        // Duplicate delivery while the replacement boot is already in progress
-        // is satisfied by that in-flight replacement; do not stop it again.
-        if (busyFlow.value && runtime.state.value is VmState.Starting) return
         requestStop(force = false).await()
+    }
+
+    override suspend fun startForRestart(vmId: VmId) = lifecycleTransaction(
+        vmId = vmId,
+        operation = LifecycleOperation.RESTART,
+        runtimeStarted = true,
+    ) {
+        awaitInitial(vmId)
         lifecycleMutex.withLock {
-            check(runtime.quiescent.value) { "Cannot restart while VM cleanup is incomplete" }
+            check(!busyFlow.value) { "Cannot restart while previous VM cleanup is incomplete" }
             installer.withExclusiveTree(vmId) { lease ->
                 ensureInstalledLocked(vmId, lease)
                 startLocked(vmId)
@@ -352,7 +385,32 @@ class DefaultVmManager internal constructor(
         }
     }
 
-    override suspend fun remove(vmId: VmId, policy: VmRemovePolicy) {
+    override suspend fun restart(vmId: VmId) {
+        requireDefault(vmId)
+        // Duplicate delivery while the replacement boot is already in progress
+        // is already satisfied; it must not create a false generation increment.
+        if (busyFlow.value && runtime.state.value is VmState.Starting) return
+        lifecycleTransaction(
+            vmId = vmId,
+            operation = LifecycleOperation.RESTART,
+            runtimeStarted = true,
+        ) {
+            awaitInitial(vmId)
+            requestStop(force = false).await()
+            lifecycleMutex.withLock {
+                check(runtime.quiescent.value) { "Cannot restart while VM cleanup is incomplete" }
+                installer.withExclusiveTree(vmId) { lease ->
+                    ensureInstalledLocked(vmId, lease)
+                    startLocked(vmId)
+                }
+            }
+        }
+    }
+
+    override suspend fun remove(vmId: VmId, policy: VmRemovePolicy) = lifecycleTransaction(
+        vmId = vmId,
+        operation = LifecycleOperation.REMOVE,
+    ) {
         awaitInitial(vmId)
         lifecycleMutex.withLock {
             check(runtime.quiescent.value) { "Cannot remove VM while backend cleanup is incomplete" }
@@ -397,6 +455,42 @@ class DefaultVmManager internal constructor(
         awaitInitial(vmId)
         val raw = files.redactPrivatePaths(runtime.diagnosticsReport())
         return VmDiagnostics(raw.takeLast(request.maxChars), raw.length > request.maxChars)
+    }
+
+    private suspend fun <T> lifecycleTransaction(
+        vmId: VmId,
+        operation: LifecycleOperation,
+        runtimeStarted: Boolean = false,
+        effect: suspend () -> T,
+    ): T {
+        requireDefault(vmId)
+        // The complete encoded intent and PENDING transaction are fsync-owned by
+        // DataStore before any installer/backend effect is entered.
+        val token = supervisor.begin(operation)
+        val result = try {
+            effect()
+        } catch (failure: Throwable) {
+            val errorCode = classifyLifecycleFailure(failure)
+            withContext(NonCancellable) {
+                runCatching { supervisor.fail(token, errorCode) }
+                    .onFailure(failure::addSuppressed)
+            }
+            throw failure
+        }
+        // Completion is non-cancellable. If this write itself fails, PENDING is
+        // deliberately retained as crash evidence and the failure is returned.
+        withContext(NonCancellable) { supervisor.succeed(token, runtimeStarted) }
+        return result
+    }
+
+    private fun classifyLifecycleFailure(failure: Throwable): LifecycleErrorCode = when (failure) {
+        is TimeoutCancellationException -> LifecycleErrorCode.TIMEOUT
+        is CancellationException -> LifecycleErrorCode.CANCELLED
+        is IOException -> LifecycleErrorCode.IO
+        is IllegalStateException -> LifecycleErrorCode.INVALID_STATE
+        is IllegalArgumentException -> LifecycleErrorCode.INVALID_ARGUMENT
+        is SecurityException -> LifecycleErrorCode.SECURITY
+        else -> LifecycleErrorCode.UNKNOWN
     }
 
     private suspend fun ensureInstalledLocked(vmId: VmId, lease: VmAssetTreeLease) {

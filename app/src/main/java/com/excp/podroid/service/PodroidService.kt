@@ -61,9 +61,14 @@ class PodroidService : Service() {
     // Main-thread commands synchronously claim the exact lazy launch Job. Stop
     // invalidates its generation before cancellation and retains ownership until
     // both launch joining and manager.stop have completed.
-    private data class ServiceLaunchOwner(val job: Job, var generation: Long = 0L)
+    private data class ServiceLaunchOwner(
+        val job: Job,
+        val completesRestart: Boolean,
+        var generation: Long = 0L,
+    )
 
     private val launchCoordinator = ServiceLaunchCoordinator<ServiceLaunchOwner>()
+    @Volatile private var queuedLaunchCompletesRestart = false
 
     private var notificationBuilder: NotificationCompat.Builder? = null
     private var stopPendingIntent: PendingIntent? = null
@@ -196,6 +201,7 @@ class PodroidService : Service() {
         // that window is durable and idempotent. completeStop performs the
         // atomic handoff to exactly one fresh lazy launch.
         val queuedDuringStop = launchCoordinator.queueStartDuringStop()
+        if (queuedDuringStop) queuedLaunchCompletesRestart = false
         val startDecision = VmServiceStartPolicy.decide(
             managerBusy = vmManager.busy(VmId.DEFAULT).value,
             pendingStartOwned = launchCoordinator.ownershipActive.value,
@@ -282,25 +288,44 @@ class PodroidService : Service() {
     }
 
     private fun requestServiceStop(failureLog: String, force: Boolean) {
+        queuedLaunchCompletesRestart = false
         val wasBusy = vmManager.busy(VmId.DEFAULT).value || launchCoordinator.ownershipActive.value
         val stop = launchCoordinator.beginStop()
-        if (force && !stop.shouldExecute) {
-            // A graceful service stop already owns launch joining/teardown. Route
-            // the stronger duplicate to the manager so its force signal can
-            // escalate that exact in-flight stop without starting a second
-            // service teardown sequence.
+        if (!stop.shouldExecute) {
+            // The existing service stop retains teardown ownership. Still route
+            // the newer desired-state command through the manager: Force can
+            // escalate the same backend stop, and a normal Stop can supersede a
+            // queued Restart without starting a second teardown sequence.
             serviceScope.launch(Dispatchers.IO) {
-                runCatching { vmManager.forceStop(VmId.DEFAULT) }
+                runCatching {
+                    if (force) vmManager.forceStop(VmId.DEFAULT) else vmManager.stop(VmId.DEFAULT)
+                }.onFailure { Log.e(TAG, failureLog, it) }
+            }
+            return
+        }
+        dispatchServiceStop(stop, failureLog, wasBusy, force, restartCommand = false)
+    }
+
+    private fun requestServiceRestart(failureLog: String) {
+        queuedLaunchCompletesRestart = true
+        val wasBusy = vmManager.busy(VmId.DEFAULT).value || launchCoordinator.ownershipActive.value
+        val stop = launchCoordinator.beginRestart()
+        if (!stop.shouldExecute) {
+            // Persist the newer Restart intent even when an existing stop owns
+            // cleanup; its retained launch will complete the restart phase.
+            serviceScope.launch(Dispatchers.IO) {
+                runCatching { vmManager.stopForRestart(VmId.DEFAULT) }
                     .onFailure { Log.e(TAG, failureLog, it) }
             }
             return
         }
-        dispatchServiceStop(stop, failureLog, wasBusy, force)
-    }
-
-    private fun requestServiceRestart(failureLog: String) {
-        val wasBusy = vmManager.busy(VmId.DEFAULT).value || launchCoordinator.ownershipActive.value
-        dispatchServiceStop(launchCoordinator.beginRestart(), failureLog, wasBusy, force = false)
+        dispatchServiceStop(
+            stop,
+            failureLog,
+            wasBusy,
+            force = false,
+            restartCommand = true,
+        )
     }
 
     private fun dispatchServiceStop(
@@ -308,6 +333,7 @@ class PodroidService : Service() {
         failureLog: String,
         wasBusy: Boolean,
         force: Boolean,
+        restartCommand: Boolean,
     ) {
         if (!stop.shouldExecute) return
 
@@ -315,7 +341,7 @@ class PodroidService : Service() {
         val stopScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         stopScope.launch {
             try {
-                stopAndApplyPolicy(stop, failureLog, force)
+                stopAndApplyPolicy(stop, failureLog, force, restartCommand)
             } finally {
                 stopScope.cancel()
             }
@@ -329,6 +355,7 @@ class PodroidService : Service() {
         stop: ServiceLaunchCoordinator.Stop<ServiceLaunchOwner>,
         failureLog: String,
         force: Boolean,
+        restartCommand: Boolean,
     ) {
         val stopResult = coroutineScope {
             // Start manager.stop together with the bounded join. If cancellation
@@ -336,7 +363,11 @@ class PodroidService : Service() {
             // this stop operation serialize at the manager lifecycle boundary.
             val managerStop = async {
                 runCatching {
-                    if (force) vmManager.forceStop(VmId.DEFAULT) else vmManager.stop(VmId.DEFAULT)
+                    when {
+                        force -> vmManager.forceStop(VmId.DEFAULT)
+                        restartCommand -> vmManager.stopForRestart(VmId.DEFAULT)
+                        else -> vmManager.stop(VmId.DEFAULT)
+                    }
                 }
             }
             val joined = withTimeoutOrNull(SERVICE_LAUNCH_JOIN_TIMEOUT_MS) {
@@ -350,7 +381,16 @@ class PodroidService : Service() {
         }
         stopResult.onFailure { Log.e(TAG, failureLog, it) }
         withContext(NonCancellable + Dispatchers.Main.immediate) {
-            val restartOwner = createLaunchOwner()
+            if (stopResult.isFailure) {
+                // Cleanup did not complete, so a retained Start/Restart must not
+                // race a still-owned backend. Clear the queued handoff; the
+                // failed durable transaction remains available for diagnosis.
+                launchCoordinator.beginStop()
+                queuedLaunchCompletesRestart = false
+            }
+            val completesRestart = queuedLaunchCompletesRestart
+            queuedLaunchCompletesRestart = false
+            val restartOwner = createLaunchOwner(completesRestart = completesRestart)
             val completion = launchCoordinator.completeStop(stop.generation, restartOwner)
             val restart = completion?.launch
             if (restart != null) {
@@ -545,13 +585,17 @@ class PodroidService : Service() {
         return launch
     }
 
-    private fun createLaunchOwner(): ServiceLaunchOwner {
+    private fun createLaunchOwner(completesRestart: Boolean = false): ServiceLaunchOwner {
         lateinit var owner: ServiceLaunchOwner
         val job = serviceScope.launch(start = CoroutineStart.LAZY) {
             var failure: Throwable? = null
             try {
                 withContext(Dispatchers.IO) {
-                    vmManager.start(VmId.DEFAULT)
+                    if (owner.completesRestart) {
+                        vmManager.startForRestart(VmId.DEFAULT)
+                    } else {
+                        vmManager.start(VmId.DEFAULT)
+                    }
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -571,7 +615,7 @@ class PodroidService : Service() {
                 }
             }
         }
-        owner = ServiceLaunchOwner(job)
+        owner = ServiceLaunchOwner(job, completesRestart)
         return owner
     }
 

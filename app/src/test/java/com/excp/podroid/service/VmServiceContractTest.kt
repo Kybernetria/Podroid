@@ -4,6 +4,7 @@ import com.excp.podroid.engine.avf.AvfSmokeAttemptGate
 import com.excp.podroid.engine.avf.AvfSmokeTestExecutor
 import com.excp.podroid.vm.ConsoleLog
 import com.excp.podroid.vm.ConsoleLogRequest
+import com.excp.podroid.vm.HostSupervisorState
 import com.excp.podroid.vm.MonotonicDeadline
 import com.excp.podroid.vm.SshEndpointDiscovery
 import com.excp.podroid.vm.VmDiagnostics
@@ -85,6 +86,7 @@ class VmServiceContractTest {
 
         endpoint.list()
         endpoint.status()
+        endpoint.supervisorState()
         endpoint.ensureInstalled()
         endpoint.remove(VmRemovePolicy.DELETE_DATA)
         endpoint.readConsoleLog(ConsoleLogRequest(32, 2))
@@ -94,7 +96,7 @@ class VmServiceContractTest {
         endpoint.diagnostics(VmDiagnosticsRequest(32))
 
         assertEquals(
-            listOf("list", "status", "install", "remove:DELETE_DATA", "log", "qmp", "ssh", "metrics", "diagnostics"),
+            listOf("list", "status", "supervisor", "install", "remove:DELETE_DATA", "log", "qmp", "ssh", "metrics", "diagnostics"),
             manager.calls,
         )
         assertTrue(manager.vmIds.all { it == VmId.DEFAULT })
@@ -459,11 +461,15 @@ class VmServiceContractTest {
         override fun busy(vmId: VmId) = boolean
         override suspend fun list(vmId: VmId) = listOf(VmSummary(vmId, true, VmLifecycleState.IDLE)).also { called("list", vmId) }
         override suspend fun status(vmId: VmId) = VmStatus(vmId, true, VmLifecycleState.IDLE, "qemu").also { called("status", vmId) }
+        override suspend fun supervisorState(vmId: VmId) =
+            HostSupervisorState.safeDefaults().also { called("supervisor", vmId) }
         override suspend fun ensureInstalled(vmId: VmId) { called("install", vmId) }
         override suspend fun start(vmId: VmId) { called("start", vmId) }
         override suspend fun stop(vmId: VmId) { called("stop", vmId) }
         override suspend fun forceStop(vmId: VmId) { called("forceStop", vmId) }
         override suspend fun restart(vmId: VmId) { called("restart", vmId) }
+        override suspend fun stopForRestart(vmId: VmId) { called("restartStop", vmId) }
+        override suspend fun startForRestart(vmId: VmId) { called("restartStart", vmId) }
         override suspend fun remove(vmId: VmId, policy: VmRemovePolicy) { called("remove:$policy", vmId) }
         override suspend fun readConsoleLog(vmId: VmId, request: ConsoleLogRequest) = ConsoleLog("", 0, 0, false).also { called("log", vmId) }
         override suspend fun executeQmp(vmId: VmId, operation: VmQmpOperation) = VmQmpResult.Status("running").also { called("qmp", vmId) }
@@ -481,6 +487,7 @@ class VmServiceContractTest {
         var stopCalls = 0
         override suspend fun list() = emptyList<VmSummary>()
         override suspend fun status() = VmStatus(VmId.DEFAULT, true, VmLifecycleState.IDLE, "fake")
+        override suspend fun supervisorState() = HostSupervisorState.safeDefaults()
         override suspend fun ensureInstalled() = Unit
         override suspend fun start() = Unit
         override suspend fun gracefulStop() { stopCalls++ }
