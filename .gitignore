@@ -3,6 +3,7 @@
 /app/build/
 /terminal-emulator/build/
 /terminal-view/build/
+/controller/target/
 *.apk
 *.aab
 

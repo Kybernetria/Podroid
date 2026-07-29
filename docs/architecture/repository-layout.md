@@ -1,12 +1,13 @@
 # Repository Layout
 
-Milestone 1 began with tracked ownership markers only. Ticket #6 now implements
-the VM identity and storage-path slices incrementally inside the existing `app/`
-Gradle module; no inherited source is moved and later skeletons remain inactive.
+Milestone 1 began with tracked ownership markers only. Tickets #6–#8 implement
+the first VM identity, storage, manager, and local Binder slices incrementally inside
+the existing `app/` Gradle module. Ticket #9 adds an external controller prototype;
+no inherited Android source is moved.
 
 | Area | Intended ownership | Milestone 1 state |
 |---|---|---|
-| `app/` | Existing logical Android application and current runtime | Authoritative; includes ticket #6 VM identity/path implementation |
+| `app/` | Existing logical Android application and current runtime | Authoritative through ticket #8; no Slint or ticket #9 controller code |
 | `android-app/platform/` | Android APIs, permissions, networking hooks | README skeleton |
 | `android-app/ui/` | Android presentation and user interaction | README skeleton |
 | `android-app/vm-service/` | Foreground service and one-active-VM coordination | README skeleton |
@@ -19,9 +20,9 @@ Gradle module; no inherited source is moved and later skeletons remain inactive.
 | `transport/tailscale-android/` | Official Tailscale/libtailscale Android adapter | README skeleton |
 | `management/protocol/` | Versioned restricted management messages | README skeleton |
 | `management/ssh-server/` | Restricted SSH endpoint; never a host shell | README skeleton |
-| `controller/core/` | Shared controller client logic | README skeleton |
+| `controller/core/` | Shared controller client logic | Ticket #9 validated DTO/action/service boundary plus non-live in-memory preview; live protocol deferred to #16 |
 | `controller/phonectl/` | CLI adapter | README skeleton |
-| `controller/desktop-ui/` | Slint desktop adapter | README skeleton |
+| `controller/desktop-ui/` | Slint desktop adapter | Ticket #9 external preview UI; no phone transport or Android packaging |
 | `profiles/schemas/` | Versioned profile schemas | README skeleton |
 | `profiles/alpine-direct/` | Initial known-good Alpine profile | README skeleton |
 | `profiles/debian-cloud/` | Deferred profile placeholder, not support | README skeleton |

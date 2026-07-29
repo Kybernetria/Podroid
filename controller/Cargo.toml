@@ -1,0 +1,17 @@
+[workspace]
+members = ["core", "desktop-ui"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "GPL-2.0-only"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.dependencies]
+controller-core = { path = "core" }
+slint = { version = "=1.13.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2"] }
+slint-build = "=1.13.1"
+i-slint-backend-testing = "=1.13.1"

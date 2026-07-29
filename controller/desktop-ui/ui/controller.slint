@@ -1,0 +1,133 @@
+import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "Podroid Desktop Controller — Preview";
+    width: 660px;
+    height: 620px;
+    background: #111827;
+
+    in property <string> host-connection: "Loading preview…";
+    in property <string> host-identity: "—";
+    in property <string> vm-identity: "default";
+    in property <string> vm-lifecycle: "—";
+    in property <string> vm-backend: "—";
+    in property <string> vm-boot-stage: "—";
+    in property <string> vm-uptime: "—";
+    in property <string> vm-error: "None";
+    in property <string> feedback: "Refreshing preview state…";
+    in property <bool> busy: true;
+    in property <bool> can-refresh: false;
+    in property <bool> can-start: false;
+    in property <bool> can-stop: false;
+
+    callback refresh-requested();
+    callback start-requested();
+    callback stop-requested();
+
+    VerticalBox {
+        padding: 26px;
+        spacing: 16px;
+
+        Text {
+            text: "Podroid Desktop Controller";
+            color: #f9fafb;
+            font-size: 28px;
+            font-weight: 700;
+        }
+        Rectangle {
+            background: #78350f;
+            border-color: #f59e0b;
+            border-width: 1px;
+            border-radius: 6px;
+            height: 58px;
+            Text {
+                text: "PREVIEW ONLY — bounded in-memory state; no live phone connection";
+                color: #fef3c7;
+                font-size: 15px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+
+        Rectangle {
+            background: #1f2937;
+            border-radius: 8px;
+            height: 102px;
+            VerticalBox {
+                padding: 14px;
+                spacing: 8px;
+                Text { text: "HOST"; color: #93c5fd; font-weight: 700; }
+                HorizontalBox {
+                    Text { text: "Connection"; color: #9ca3af; }
+                    Text { text: root.host-connection; color: #f9fafb; horizontal-alignment: right; }
+                }
+                HorizontalBox {
+                    Text { text: "Identity"; color: #9ca3af; }
+                    Text { text: root.host-identity; color: #f9fafb; horizontal-alignment: right; }
+                }
+            }
+        }
+
+        Rectangle {
+            background: #1f2937;
+            border-radius: 8px;
+            height: 236px;
+            VerticalBox {
+                padding: 14px;
+                spacing: 7px;
+                Text { text: "DEFAULT VM"; color: #93c5fd; font-weight: 700; }
+                HorizontalBox {
+                    Text { text: "Identity"; color: #9ca3af; }
+                    Text { text: root.vm-identity; color: #f9fafb; horizontal-alignment: right; }
+                }
+                HorizontalBox {
+                    Text { text: "Lifecycle"; color: #9ca3af; }
+                    Text { text: root.vm-lifecycle; color: #f9fafb; horizontal-alignment: right; }
+                }
+                HorizontalBox {
+                    Text { text: "Backend"; color: #9ca3af; }
+                    Text { text: root.vm-backend; color: #f9fafb; horizontal-alignment: right; }
+                }
+                HorizontalBox {
+                    Text { text: "Boot stage"; color: #9ca3af; }
+                    Text { text: root.vm-boot-stage; color: #f9fafb; horizontal-alignment: right; }
+                }
+                HorizontalBox {
+                    Text { text: "Uptime"; color: #9ca3af; }
+                    Text { text: root.vm-uptime; color: #f9fafb; horizontal-alignment: right; }
+                }
+                HorizontalBox {
+                    Text { text: "Error"; color: #9ca3af; }
+                    Text { text: root.vm-error; color: root.vm-error == "None" ? #86efac : #fca5a5; horizontal-alignment: right; }
+                }
+            }
+        }
+
+        Text {
+            text: root.feedback;
+            color: root.busy ? #fbbf24 : #bfdbfe;
+            font-size: 14px;
+            wrap: word-wrap;
+        }
+
+        HorizontalBox {
+            spacing: 12px;
+            Button {
+                text: root.busy ? "Working…" : "Refresh";
+                enabled: root.can-refresh;
+                clicked => { root.refresh-requested(); }
+            }
+            Button {
+                text: "Start";
+                enabled: root.can-start;
+                clicked => { root.start-requested(); }
+            }
+            Button {
+                text: "Stop";
+                enabled: root.can-stop;
+                clicked => { root.stop-requested(); }
+            }
+        }
+    }
+}
