@@ -1030,6 +1030,86 @@ class VmManagerTest {
     }
 
     @Test
+    fun `abandoned prepared command releases local ownership and admits reconciliation`() = runBlocking {
+        val supervisor = hostSupervisor()
+        val manager = manager(supervisor = supervisor)
+        manager.ensureInstalled(VmId.DEFAULT)
+        val command = manager.prepareLifecycleCommand(
+            VmId.DEFAULT,
+            LifecycleOperation.START,
+        )
+
+        assertTrue(
+            manager.abandonPrepared(
+                VmId.DEFAULT,
+                command,
+                LifecycleErrorCode.INVALID_STATE,
+            ),
+        )
+        val failed = supervisor.snapshot().latestTransaction!!
+        assertEquals(LifecycleOutcome.FAILED, failed.outcome)
+        assertEquals(LifecycleErrorCode.INVALID_STATE, failed.errorCode)
+        assertFalse(failed.effectStarted)
+        assertTrue(
+            manager.beginReconciliation(VmId.DEFAULT, ReconciliationTrigger.PROCESS_RESTART) is
+                ReconciliationAdmission.Execute,
+        )
+    }
+
+    @Test
+    fun `stale manager abandon leaves newer local token authoritative`() = runBlocking {
+        val supervisor = hostSupervisor()
+        val manager = manager(supervisor = supervisor)
+        val stale = manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.STOP)
+        val newer = manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.START)
+
+        assertFalse(
+            manager.abandonPrepared(VmId.DEFAULT, stale, LifecycleErrorCode.CANCELLED),
+        )
+        assertEquals(newer.id, supervisor.snapshot().latestTransaction?.id)
+        assertEquals(
+            ReconciliationAdmission.Skip(ReconciliationOutcome.SUPERSEDED),
+            manager.beginReconciliation(VmId.DEFAULT, ReconciliationTrigger.PROCESS_RESTART),
+        )
+        assertTrue(
+            manager.abandonPrepared(VmId.DEFAULT, newer, LifecycleErrorCode.CANCELLED),
+        )
+    }
+
+    @Test
+    fun `completion write failure releases owner and same process reconciliation is admitted`() = runBlocking {
+        val store = FailNextUpdateStore()
+        val supervisor = HostSupervisorRepository(store, currentTimeMillis = { 1_000L })
+        val runtime = FakeRuntime()
+        val manager = manager(runtime = runtime, supervisor = supervisor)
+        manager.ensureInstalled(VmId.DEFAULT)
+        runtime.onStart = {
+            runtime.state.value = VmState.Running
+            store.failure = IOException("transient completion write")
+        }
+        val command = manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.START)
+        assertTrue(manager.acceptPrepared(VmId.DEFAULT, command))
+
+        val completionFailure = runCatching {
+            manager.executeAccepted(VmId.DEFAULT, command)
+        }.exceptionOrNull()
+
+        assertTrue(completionFailure is IOException)
+        val uncertain = supervisor.snapshot().latestTransaction!!
+        assertEquals(LifecycleOutcome.PENDING, uncertain.outcome)
+        assertTrue(uncertain.effectStarted)
+        assertEquals(1, runtime.startCalls)
+        assertTrue(
+            manager.beginReconciliation(VmId.DEFAULT, ReconciliationTrigger.PROCESS_RESTART) is
+                ReconciliationAdmission.Execute,
+        )
+        val interrupted = supervisor.snapshot().latestTransaction!!
+        assertEquals(LifecycleOutcome.FAILED, interrupted.outcome)
+        assertEquals(LifecycleErrorCode.PROCESS_DIED, interrupted.errorCode)
+        assertTrue(supervisor.snapshot().runtimeMayBeLive)
+    }
+
+    @Test
     fun `direct remove throws when superseded before claim`() = runBlocking {
         val beforeClaim = CompletableDeferred<Unit>()
         val releaseClaim = CompletableDeferred<Unit>()
@@ -1647,6 +1727,20 @@ class VmManagerTest {
         )
     }
 
+    private class FailNextUpdateStore : AtomicHostSupervisorRecordStore {
+        private val mutex = kotlinx.coroutines.sync.Mutex()
+        private var raw: String? = null
+        var failure: Throwable? = null
+        override suspend fun read(): String? = mutex.withLock { raw }
+        override suspend fun update(transform: (String?) -> String): String = mutex.withLock {
+            failure?.let {
+                failure = null
+                throw it
+            }
+            transform(raw).also { raw = it }
+        }
+    }
+
     private class InMemoryHostSupervisorStore : AtomicHostSupervisorRecordStore {
         private val mutex = kotlinx.coroutines.sync.Mutex()
         private var raw: String? = null
@@ -1706,6 +1800,22 @@ class VmManagerTest {
                 transaction.outcome != LifecycleOutcome.PENDING || transaction.effectStarted
             ) return@withLock false
             state = state.copy(latestTransaction = transaction.copy(effectStarted = true))
+            true
+        }
+
+        override suspend fun abandon(
+            token: LifecycleTransactionToken,
+            errorCode: LifecycleErrorCode,
+        ): Boolean = mutex.withLock {
+            val transaction = state.latestTransaction ?: return@withLock false
+            if (transaction.id != token.id || transaction.operation != token.operation ||
+                transaction.outcome != LifecycleOutcome.PENDING || transaction.effectStarted
+            ) return@withLock false
+            state = state.copy(latestTransaction = transaction.copy(
+                outcome = LifecycleOutcome.FAILED,
+                completedAtEpochMs = transaction.requestedAtEpochMs,
+                errorCode = errorCode,
+            ))
             true
         }
 

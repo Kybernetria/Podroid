@@ -1,5 +1,7 @@
 package com.excp.podroid.service
 
+import java.io.IOException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -29,6 +31,56 @@ class ServiceCommandOrderTest {
         assertEquals(1L, admission.generation)
         assertEquals("token-1", admission.prepared)
         assertEquals(listOf("prepare:1", "dispatch:1"), events)
+    }
+
+    @Test
+    fun `startForegroundService throw abandons prepared token and rearms recovery`() = runBlocking {
+        val order = ServiceCommandOrder()
+        val events = mutableListOf<String>()
+        var durableId = 1L
+
+        val failure = runCatching {
+            order.admitAndDispatch(
+                latestDurableGeneration = { durableId },
+                prepare = { generation ->
+                    durableId = generation
+                    "token-$generation"
+                },
+                abandon = { token, cause ->
+                    events += "abandon:$token:${cause.javaClass.simpleName}"
+                    events += "reconcile"
+                },
+                dispatch = { throw IOException("startForegroundService rejected") },
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IOException)
+        assertEquals(
+            listOf("abandon:token-2:IOException", "reconcile"),
+            events,
+        )
+        assertFalse(order.deliverAndExecute(1L, { true }) { error("stale effect") }.execute)
+    }
+
+    @Test
+    fun `cancellation after prepare runs non cancellable abandonment`() = runBlocking {
+        val order = ServiceCommandOrder()
+        var abandoned = false
+
+        val failure = runCatching {
+            order.admitAndDispatch(
+                latestDurableGeneration = { 0L },
+                prepare = { "token-$it" },
+                abandon = { _, cause ->
+                    assertTrue(cause is CancellationException)
+                    abandoned = true
+                },
+                dispatch = { throw CancellationException("caller cancelled") },
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is CancellationException)
+        assertTrue(abandoned)
     }
 
     @Test

@@ -93,6 +93,25 @@ class HostReconcilerTest {
         )
     }
 
+    @Test fun `unfinished consumed attempt rearms bounded retry after cancellation or write failure`() {
+        val state = HostSupervisorState.safeDefaults().copy(
+            hostEnabled = true,
+            desiredState = VmDesiredState.RUNNING,
+            reconciliation = ReconciliationMetadata(
+                1,
+                0,
+                ReconciliationTrigger.PROCESS_RESTART,
+                ReconciliationOutcome.ATTEMPTING,
+                null,
+            ),
+        )
+
+        assertEquals(
+            ReconciliationRetryDirective.Schedule(6_000),
+            ReconciliationRetryDirective.afterReconciliationFailure(state, 1_000),
+        )
+    }
+
     @Test fun `persisted possible-live retry restores cleanup for stopped or disabled host`() {
         for (outcome in listOf(ReconciliationOutcome.FAILED, ReconciliationOutcome.BACKOFF)) {
             for ((name, hostEnabled, desiredState) in listOf(
@@ -241,6 +260,10 @@ class HostReconcilerTest {
         assertEquals(ReconciliationOutcome.FAILED, result.outcome)
         assertEquals(LifecycleErrorCode.IO, state.reconciliation.lastErrorCode)
         assertTrue(state.reconciliation.nextEligibleEpochMs > fixture.clock.get())
+        assertEquals(
+            ReconciliationRetryDirective.Schedule(state.reconciliation.nextEligibleEpochMs),
+            ReconciliationRetryDirective.from(result),
+        )
         assertFalse(HostSupervisorRecordCodec.encode(state).contains("private"))
     }
 
@@ -409,6 +432,11 @@ class HostReconcilerTest {
             quiescent.value = false
             return true
         }
+        override suspend fun abandonPrepared(
+            vmId: VmId,
+            command: LifecycleTransactionToken,
+            errorCode: LifecycleErrorCode,
+        ) = repository.abandon(command, errorCode)
         override suspend fun acceptPrepared(vmId: VmId, command: LifecycleTransactionToken) = repository.claim(command)
         override suspend fun authorizeServiceDispatch(vmId: VmId, command: LifecycleTransactionToken, admission: () -> Unit): Boolean {
             admission(); return true

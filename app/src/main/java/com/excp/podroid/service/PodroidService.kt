@@ -37,6 +37,7 @@ import com.excp.podroid.vm.LifecycleErrorCode
 import com.excp.podroid.vm.LifecycleOperation
 import com.excp.podroid.vm.LifecycleTransactionToken
 import com.excp.podroid.vm.HostSupervisorState
+import com.excp.podroid.vm.ReconciliationTrigger
 import com.excp.podroid.vm.VmId
 import com.excp.podroid.vm.VmManager
 import com.excp.podroid.vm.VmPaths
@@ -199,61 +200,9 @@ class PodroidService : Service() {
             }
             ACTION_RECONCILE_BOOT, ACTION_RECONCILE_RETRY, null -> {
                 enterForegroundStartWindow()
-                acquireWakeLock()
-                activeReconciliationDeliveries++
-                reconciliationActive.value = true
-                startSupervision()
-                val trigger = checkNotNull(ReconciliationServiceTriggerPolicy.fromAction(action))
-                serviceScope.launch(Dispatchers.IO) {
-                    var persistedAfterFailure: HostSupervisorState? = null
-                    val result = try {
-                        Result.success(hostReconciler.reconcile(trigger))
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (failure: Throwable) {
-                        persistedAfterFailure = runCatching {
-                            vmManager.supervisorState(VmId.DEFAULT)
-                        }.getOrNull()
-                        Result.failure(failure)
-                    }
-                    withContext(NonCancellable + Dispatchers.Main.immediate) {
-                        activeReconciliationDeliveries = (activeReconciliationDeliveries - 1).coerceAtLeast(0)
-                        result.getOrNull()?.let(::applyReconciliationCompletion)
-                        reconciliationActive.value = activeReconciliationDeliveries > 0
-                        result.onSuccess { completed ->
-                            Log.i(
-                                TAG,
-                                "Reconciliation trigger=${trigger.name} outcome=${completed.outcome.name} " +
-                                    "runtimeMayBeLive=${completed.runtimeMayBeLive}",
-                            )
-                            if (completed.disposition == ReconciliationServiceDisposition.SUPERVISE_RUNTIME) {
-                                acquireWakeLock()
-                                startSupervision()
-                            } else if (currentLifecycleDecision().teardown) {
-                                teardown()
-                            }
-                        }.onFailure { failure ->
-                            Log.e(TAG, "Reconciliation failed type=${failure.javaClass.simpleName}")
-                            val persisted = persistedAfterFailure
-                            if (persisted != null) {
-                                if (persisted.runtimeMayBeLive) {
-                                    applyAuthoritativeRuntimeEvidence(
-                                        true,
-                                        persisted.runtimeEvidenceVersion,
-                                    )
-                                }
-                                updateRetryAlarm(
-                                    ReconciliationRetryDirective.fromPersistedState(persisted),
-                                )
-                            } else {
-                                // Persistence is unavailable, so absence cannot
-                                // be proved and foreground supervision stays up.
-                                orphanSupervisionRequired.value = true
-                            }
-                            if (currentLifecycleDecision().teardown) teardown()
-                        }
-                    }
-                }
+                launchReconciliation(
+                    checkNotNull(ReconciliationServiceTriggerPolicy.fromAction(action)),
+                )
             }
             ACTION_STOP -> {
                 val command = intent.preparedCommandOrNull(action)
@@ -286,21 +235,28 @@ class PodroidService : Service() {
         action: String,
         command: LifecycleTransactionToken,
     ) {
-        val delivery = commandOrder.deliverAndExecute(
-            reservedGeneration = command.id,
-            validatePrepared = { vmManager.acceptPrepared(VmId.DEFAULT, command) },
-        ) {
-            when (command.operation) {
-                LifecycleOperation.START -> executeStartCommand(command)
-                LifecycleOperation.RESTART -> {
-                    acquireWakeLock()
-                    startSupervision()
-                    requestServiceRestart(command, "VM restart failed")
+        val delivery = try {
+            commandOrder.deliverAndExecute(
+                reservedGeneration = command.id,
+                validatePrepared = { vmManager.acceptPrepared(VmId.DEFAULT, command) },
+            ) {
+                when (command.operation) {
+                    LifecycleOperation.START -> executeStartCommand(command)
+                    LifecycleOperation.RESTART -> {
+                        acquireWakeLock()
+                        startSupervision()
+                        requestServiceRestart(command, "VM restart failed")
+                    }
+                    LifecycleOperation.STOP ->
+                        requestServiceStop(command, "VM graceful stop failed", force = false)
+                    else -> Log.w(TAG, "Ignoring operation ${command.operation} for service Intent")
                 }
-                LifecycleOperation.STOP ->
-                    requestServiceStop(command, "VM graceful stop failed", force = false)
-                else -> Log.w(TAG, "Ignoring operation ${command.operation} for service Intent")
             }
+        } catch (failure: Throwable) {
+            settleUndispatchedCommand(command, failure)
+            if (failure is CancellationException) throw failure
+            Log.e(TAG, "Prepared lifecycle delivery failed type=${failure.javaClass.simpleName}")
+            return
         }
         if (!delivery.execute) {
             logStaleCommand(action, delivery)
@@ -337,7 +293,12 @@ class PodroidService : Service() {
                                         updateRetryAlarm(ReconciliationRetryDirective.Cancel)
                                     }
                                 }
-                                .onFailure { Log.e(TAG, "VM start command failed", it) }
+                                .onFailure {
+                                    Log.e(TAG, "VM start command failed", it)
+                                    withContext(Dispatchers.Main.immediate) {
+                                        launchReconciliation(ReconciliationTrigger.PROCESS_RESTART)
+                                    }
+                                }
                         }
                     }
                     launch?.owner?.job?.start()
@@ -375,6 +336,114 @@ class PodroidService : Service() {
         }
     }
 
+    private suspend fun settleUndispatchedCommand(
+        command: LifecycleTransactionToken,
+        failure: Throwable,
+    ) {
+        val errorCode = if (failure is CancellationException) {
+            LifecycleErrorCode.CANCELLED
+        } else {
+            LifecycleErrorCode.INVALID_STATE
+        }
+        var releasedOwner = false
+        try {
+            releasedOwner = vmManager.abandonPrepared(VmId.DEFAULT, command, errorCode)
+            if (!releasedOwner) {
+                releasedOwner = vmManager.failAccepted(VmId.DEFAULT, command, errorCode)
+            }
+        } catch (completionFailure: Throwable) {
+            // The manager still releases process-local ownership in finally;
+            // durable PENDING/FAILED evidence is reconciled below.
+            failure.addSuppressed(completionFailure)
+            releasedOwner = true
+            Log.e(
+                TAG,
+                "Lifecycle dispatch abandonment persistence failed " +
+                    "type=${completionFailure.javaClass.simpleName}",
+            )
+        }
+        if (releasedOwner) {
+            withContext(Dispatchers.Main.immediate) {
+                runCatching { enterForegroundStartWindow() }
+                    .onFailure { foregroundFailure ->
+                        Log.e(
+                            TAG,
+                            "Could not promote abandoned-command reconciliation " +
+                                "type=${foregroundFailure.javaClass.simpleName}",
+                        )
+                    }
+                launchReconciliation(ReconciliationTrigger.PROCESS_RESTART)
+            }
+        }
+    }
+
+    private fun launchReconciliation(trigger: ReconciliationTrigger) {
+        acquireWakeLock()
+        activeReconciliationDeliveries++
+        reconciliationActive.value = true
+        startSupervision()
+        serviceScope.launch(Dispatchers.IO) {
+            var persistedAfterFailure: HostSupervisorState? = null
+            var cancellation: CancellationException? = null
+            val result = try {
+                Result.success(hostReconciler.reconcile(trigger))
+            } catch (failure: Throwable) {
+                if (failure is CancellationException) cancellation = failure
+                persistedAfterFailure = withContext(NonCancellable) {
+                    runCatching { vmManager.supervisorState(VmId.DEFAULT) }.getOrNull()
+                }
+                Result.failure(failure)
+            }
+            withContext(NonCancellable + Dispatchers.Main.immediate) {
+                activeReconciliationDeliveries = (activeReconciliationDeliveries - 1).coerceAtLeast(0)
+                result.getOrNull()?.let(::applyReconciliationCompletion)
+                reconciliationActive.value = activeReconciliationDeliveries > 0
+                result.onSuccess { completed ->
+                    Log.i(
+                        TAG,
+                        "Reconciliation trigger=${trigger.name} outcome=${completed.outcome.name} " +
+                            "runtimeMayBeLive=${completed.runtimeMayBeLive}",
+                    )
+                    if (completed.disposition == ReconciliationServiceDisposition.SUPERVISE_RUNTIME) {
+                        acquireWakeLock()
+                        startSupervision()
+                    } else if (currentLifecycleDecision().teardown) {
+                        teardown()
+                    }
+                }.onFailure { reconciliationFailure ->
+                    Log.e(
+                        TAG,
+                        "Reconciliation failed type=${reconciliationFailure.javaClass.simpleName}",
+                    )
+                    val persisted = persistedAfterFailure
+                    if (persisted != null) {
+                        if (persisted.runtimeMayBeLive) {
+                            applyAuthoritativeRuntimeEvidence(
+                                true,
+                                persisted.runtimeEvidenceVersion,
+                            )
+                        }
+                        updateRetryAlarm(
+                            ReconciliationRetryDirective.afterReconciliationFailure(
+                                persisted,
+                                System.currentTimeMillis().coerceIn(
+                                    0L,
+                                    com.excp.podroid.vm.ReconciliationMetadata.MAX_EPOCH_MS,
+                                ),
+                            ),
+                        )
+                    } else {
+                        // Persistence is unavailable, so absence cannot be proved
+                        // and foreground supervision stays up.
+                        orphanSupervisionRequired.value = true
+                    }
+                    if (currentLifecycleDecision().teardown) teardown()
+                }
+            }
+            cancellation?.let { throw it }
+        }
+    }
+
     private suspend fun admitAndDispatch(
         operation: LifecycleOperation,
         enqueueAction: String,
@@ -400,16 +469,17 @@ class PodroidService : Service() {
                 if (operation == LifecycleOperation.STOP || operation == LifecycleOperation.FORCE_STOP) {
                     updateRetryAlarm(ReconciliationRetryDirective.Cancel)
                 }
-                if (claimBeforeDispatch) {
-                    check(vmManager.acceptPrepared(VmId.DEFAULT, it)) {
-                        "Fresh durable lifecycle command could not be claimed"
-                    }
-                }
             }
         },
+        abandon = ::settleUndispatchedCommand,
         dispatch = { admission ->
             check(admission.prepared.id == admission.generation) {
                 "Durable transaction order diverged from service command order"
+            }
+            if (claimBeforeDispatch) {
+                check(vmManager.acceptPrepared(VmId.DEFAULT, admission.prepared)) {
+                    "Fresh durable lifecycle command could not be claimed"
+                }
             }
             dispatch(admission.prepared)
         },
@@ -605,7 +675,11 @@ class PodroidService : Service() {
                         state.runtimeEvidenceVersion,
                     )
                 }
-                updateRetryAlarm(ReconciliationRetryDirective.Cancel)
+                if (stopResult.isSuccess) {
+                    updateRetryAlarm(ReconciliationRetryDirective.Cancel)
+                } else {
+                    launchReconciliation(ReconciliationTrigger.PROCESS_RESTART)
+                }
             }
             serviceDispatchMutex.withLock {
                 if (stopResult.isFailure) {
@@ -908,7 +982,11 @@ class PodroidService : Service() {
                 Log.e(TAG, "VM failed to execute prepared launch", caught)
             } finally {
                 withContext(NonCancellable + Dispatchers.Main.immediate) {
-                    if (completed) updateRetryAlarm(ReconciliationRetryDirective.Cancel)
+                    if (completed) {
+                        updateRetryAlarm(ReconciliationRetryDirective.Cancel)
+                    } else if (failure != null) {
+                        launchReconciliation(ReconciliationTrigger.PROCESS_RESTART)
+                    }
                     if (launchCoordinator.completeLaunch(owner.generation)) {
                         val decision = currentLifecycleDecision()
                         if (decision.teardown) teardown()

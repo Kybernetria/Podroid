@@ -63,10 +63,14 @@ data class LifecycleTransaction(
                 require(errorCode == null) { "successful transaction cannot contain an error" }
             }
             LifecycleOutcome.FAILED -> {
-                // PROCESS_DIED may resolve evidence for a command that died before
-                // its effect claim. Other failures still require a claimed effect.
-                require(effectStarted || errorCode == LifecycleErrorCode.PROCESS_DIED) {
-                    "failed transaction requires an effect claim or process-death evidence"
+                // These closed classifications may terminate an unclaimed command:
+                // no backend effect was accepted, so effectStarted must stay false.
+                require(effectStarted || errorCode in setOf(
+                    LifecycleErrorCode.PROCESS_DIED,
+                    LifecycleErrorCode.CANCELLED,
+                    LifecycleErrorCode.INVALID_STATE,
+                )) {
+                    "failed transaction requires an effect claim or pre-effect failure evidence"
                 }
                 require(completedAtEpochMs != null && completedAtEpochMs >= requestedAtEpochMs)
                 require(errorCode != null) { "failed transaction requires a stable error code" }
@@ -218,6 +222,8 @@ internal interface HostSupervisorTransactions : HostReconciliationStore {
     suspend fun snapshot(): HostSupervisorState
     suspend fun prepare(operation: LifecycleOperation, expectedId: Long? = null): LifecycleTransactionToken
     suspend fun claim(token: LifecycleTransactionToken): Boolean
+    /** Fails only the exact still-current command before its effect claim. */
+    suspend fun abandon(token: LifecycleTransactionToken, errorCode: LifecycleErrorCode): Boolean
     suspend fun isCurrent(token: LifecycleTransactionToken): Boolean
     suspend fun succeed(token: LifecycleTransactionToken, runtimeStarted: Boolean = false): Boolean
     suspend fun fail(token: LifecycleTransactionToken, errorCode: LifecycleErrorCode): Boolean

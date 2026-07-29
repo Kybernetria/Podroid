@@ -475,6 +475,11 @@ class VmServiceContractTest {
             operation,
             0L,
         ).also { called("prepare:$operation", vmId) }
+        override suspend fun abandonPrepared(
+            vmId: VmId,
+            command: LifecycleTransactionToken,
+            errorCode: LifecycleErrorCode,
+        ): Boolean = true.also { called("abandonPrepared:$errorCode", vmId) }
         override suspend fun acceptPrepared(
             vmId: VmId,
             command: LifecycleTransactionToken,

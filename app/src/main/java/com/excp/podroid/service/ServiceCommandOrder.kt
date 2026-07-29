@@ -4,6 +4,8 @@
  */
 package com.excp.podroid.service
 
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -32,6 +34,7 @@ internal class ServiceCommandOrder {
     suspend fun <T : Any> admitAndDispatch(
         latestDurableGeneration: suspend () -> Long,
         prepare: suspend (generation: Long) -> T,
+        abandon: suspend (prepared: T, failure: Throwable) -> Unit = { _, _ -> },
         dispatch: suspend (Admission<T>) -> Unit,
     ): Admission<T> = mutex.withLock {
         val durableGeneration = latestDurableGeneration()
@@ -40,14 +43,24 @@ internal class ServiceCommandOrder {
             "In-memory command order is ahead of durable transaction order"
         }
         val generation = nextGenerationLocked()
+        var admission: Admission<T>? = null
         try {
-            val admission = Admission(generation, prepare(generation))
+            admission = Admission(generation, prepare(generation))
             dispatch(admission)
             admission
         } catch (failure: Throwable) {
-            // No concurrent admission can exist under this mutex. A failed
-            // prepare did not commit this reserved generation, so roll it back.
-            newestGeneration = durableGeneration
+            val prepared = admission?.prepared
+            if (prepared == null) {
+                // Preparation did not commit the reserved generation.
+                newestGeneration = durableGeneration
+            } else {
+                // A committed generation remains ordered even when dispatch
+                // fails. Compensation is non-cancellable and exact-token fenced.
+                withContext(NonCancellable) {
+                    runCatching { abandon(prepared, failure) }
+                        .onFailure(failure::addSuppressed)
+                }
+            }
             throw failure
         }
     }

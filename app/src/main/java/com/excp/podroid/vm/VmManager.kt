@@ -160,6 +160,15 @@ interface VmManager {
         operation: LifecycleOperation,
         expectedCommandGeneration: Long? = null,
     ): LifecycleTransactionToken
+    /**
+     * Prevents execution of the exact locally prepared, unclaimed command and
+     * best-effort records its stable pre-effect failure.
+     */
+    suspend fun abandonPrepared(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+        errorCode: LifecycleErrorCode,
+    ): Boolean
     /** Durably claims id + closed operation before service coordinator effects. */
     suspend fun acceptPrepared(
         vmId: VmId,
@@ -402,6 +411,7 @@ class DefaultVmManager internal constructor(
                 LocalCommandState.PREPARED,
                 LocalCommandState.READY,
                 LocalCommandState.EXECUTING,
+                LocalCommandState.ABANDONING,
                 -> ReconciliationAdmission.Skip(ReconciliationOutcome.SUPERSEDED)
                 null -> supervisor.begin(trigger)
             }
@@ -445,6 +455,29 @@ class DefaultVmManager internal constructor(
             "Prepared service commands cannot carry a remove policy"
         }
         return prepareCommand(operation, expectedCommandGeneration)
+    }
+
+    override suspend fun abandonPrepared(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+        errorCode: LifecycleErrorCode,
+    ): Boolean = withContext(NonCancellable) {
+        requireDefault(vmId)
+        require(errorCode in setOf(LifecycleErrorCode.CANCELLED, LifecycleErrorCode.INVALID_STATE)) {
+            "Prepared command abandonment requires a closed pre-effect error code"
+        }
+        commandAuthorityMutex.withLock {
+            if (activeLocalCommand != ActiveLocalCommand(command, LocalCommandState.PREPARED)) {
+                return@withLock false
+            }
+            activeLocalCommand = ActiveLocalCommand(command, LocalCommandState.ABANDONING)
+            try {
+                supervisor.abandon(command, errorCode)
+            } finally {
+                commandClaimMutex.withLock { claimedCommands.remove(command) }
+                clearActiveLocalCommand(command)
+            }
+        }
     }
 
     override suspend fun acceptPrepared(
@@ -503,12 +536,14 @@ class DefaultVmManager internal constructor(
         require(command.operation != LifecycleOperation.REMOVE) {
             "Prepared service commands cannot execute removal without its policy"
         }
-        val mayExecute = commandAuthorityMutex.withLock {
-            commandClaimMutex.withLock claim@{
-                if (claimedCommands[command] != CommandClaimState.READY) return@claim false
-                claimedCommands[command] = CommandClaimState.EXECUTING
-                updateActiveLocalCommand(command, LocalCommandState.EXECUTING)
-                true
+        val mayExecute = withContext(NonCancellable) {
+            commandAuthorityMutex.withLock {
+                commandClaimMutex.withLock claim@{
+                    if (claimedCommands[command] != CommandClaimState.READY) return@claim false
+                    claimedCommands[command] = CommandClaimState.EXECUTING
+                    updateActiveLocalCommand(command, LocalCommandState.EXECUTING)
+                    true
+                }
             }
         }
         if (!mayExecute) return false
@@ -556,12 +591,14 @@ class DefaultVmManager internal constructor(
         errorCode: LifecycleErrorCode,
     ): Boolean {
         requireDefault(vmId)
-        val mayFail = commandAuthorityMutex.withLock {
-            commandClaimMutex.withLock claim@{
-                if (claimedCommands[command] != CommandClaimState.READY) return@claim false
-                claimedCommands[command] = CommandClaimState.EXECUTING
-                updateActiveLocalCommand(command, LocalCommandState.EXECUTING)
-                true
+        val mayFail = withContext(NonCancellable) {
+            commandAuthorityMutex.withLock {
+                commandClaimMutex.withLock claim@{
+                    if (claimedCommands[command] != CommandClaimState.READY) return@claim false
+                    claimedCommands[command] = CommandClaimState.EXECUTING
+                    updateActiveLocalCommand(command, LocalCommandState.EXECUTING)
+                    true
+                }
             }
         }
         if (!mayFail) return false
@@ -577,7 +614,24 @@ class DefaultVmManager internal constructor(
         command: LifecycleTransactionToken,
     ): Boolean {
         if (!acceptPrepared(vmId, command)) return false
-        return executeAccepted(vmId, command)
+        return try {
+            executeAccepted(vmId, command)
+        } catch (failure: Throwable) {
+            withContext(NonCancellable) {
+                runCatching {
+                    failAccepted(
+                        vmId,
+                        command,
+                        if (failure is CancellationException) {
+                            LifecycleErrorCode.CANCELLED
+                        } else {
+                            LifecycleErrorCode.INVALID_STATE
+                        },
+                    )
+                }.onFailure(failure::addSuppressed)
+            }
+            throw failure
+        }
     }
 
     override suspend fun ensureInstalled(vmId: VmId) = prepareAndExecute(
@@ -653,7 +707,12 @@ class DefaultVmManager internal constructor(
 
     private suspend fun prepareAndExecute(vmId: VmId, operation: LifecycleOperation) {
         val command = prepareLifecycleCommand(vmId, operation)
-        if (!executePrepared(vmId, command)) throw staleCommand(command)
+        try {
+            if (!executePrepared(vmId, command)) throw staleCommand(command)
+        } catch (failure: Throwable) {
+            abandonBeforeAcceptedExecution(command, failure)
+            throw failure
+        }
     }
 
     private suspend fun lifecycleTransaction(
@@ -663,13 +722,18 @@ class DefaultVmManager internal constructor(
     ) {
         requireDefault(vmId)
         val command = prepareCommand(operation)
-        beforeDirectCommandClaim(command)
-        claimDirectCommand(command)
+        var claimed = false
         try {
+            beforeDirectCommandClaim(command)
+            claimDirectCommand(command)
+            claimed = true
             beforeDirectCommandEffect(command)
             if (!preparedTransaction(command) { effect(command) }) throw staleCommand(command)
+        } catch (failure: Throwable) {
+            if (!claimed) abandonBeforeAcceptedExecution(command, failure)
+            throw failure
         } finally {
-            finishLocalCommandTracking(command, trackClaim = false)
+            if (claimed) finishLocalCommandTracking(command, trackClaim = false)
         }
     }
 
@@ -701,20 +765,27 @@ class DefaultVmManager internal constructor(
     private suspend fun finishLocalCommandTracking(
         command: LifecycleTransactionToken,
         trackClaim: Boolean,
-    ) = commandAuthorityMutex.withLock {
-        val completionUncertain = runCatching { supervisor.isCurrent(command) }.getOrDefault(true)
-        if (trackClaim) {
-            commandClaimMutex.withLock {
-                if (completionUncertain) {
-                    // Retain bounded in-process evidence when the completion
-                    // write may have failed after the effect.
-                    claimedCommands[command] = CommandClaimState.COMPLETION_UNCERTAIN
-                } else {
-                    claimedCommands.remove(command)
-                }
-            }
+    ) = withContext(NonCancellable) {
+        commandAuthorityMutex.withLock {
+            // Process-local ownership ends with the coroutine that could perform
+            // effects. Durable PENDING/FAILED state alone is reconciliation evidence,
+            // including when a completion write could not be confirmed.
+            if (trackClaim) commandClaimMutex.withLock { claimedCommands.remove(command) }
+            clearActiveLocalCommand(command)
         }
-        if (!completionUncertain) clearActiveLocalCommand(command)
+    }
+
+    private suspend fun abandonBeforeAcceptedExecution(
+        command: LifecycleTransactionToken,
+        failure: Throwable,
+    ) {
+        val errorCode = if (failure is CancellationException) {
+            LifecycleErrorCode.CANCELLED
+        } else {
+            LifecycleErrorCode.INVALID_STATE
+        }
+        runCatching { abandonPrepared(VmId.DEFAULT, command, errorCode) }
+            .onFailure(failure::addSuppressed)
     }
 
     private fun updateActiveLocalCommand(
@@ -1078,12 +1149,12 @@ class DefaultVmManager internal constructor(
     }
 
     private enum class StopWait { QUIESCENT, FORCE, TIMEOUT }
-    private enum class LocalCommandState { PREPARED, READY, EXECUTING }
+    private enum class LocalCommandState { PREPARED, READY, EXECUTING, ABANDONING }
     private data class ActiveLocalCommand(
         val token: LifecycleTransactionToken,
         val state: LocalCommandState,
     )
-    private enum class CommandClaimState { READY, EXECUTING, COMPLETION_UNCERTAIN }
+    private enum class CommandClaimState { READY, EXECUTING }
 
     companion object {
         const val SSH_HOST_PORT = 9922

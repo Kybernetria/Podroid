@@ -519,6 +519,52 @@ class HostSupervisorRepositoryTest {
     }
 
     @Test
+    fun `abandon fails only the current unclaimed token without effect evidence`() = runBlocking {
+        val repository = enabledRunningRepository(AtomicLong(1_000))
+        val abandoned = repository.prepare(LifecycleOperation.START)
+
+        assertTrue(repository.abandon(abandoned, LifecycleErrorCode.INVALID_STATE))
+        val failed = repository.snapshot().latestTransaction!!
+
+        assertEquals(LifecycleOutcome.FAILED, failed.outcome)
+        assertEquals(LifecycleErrorCode.INVALID_STATE, failed.errorCode)
+        assertFalse(failed.effectStarted)
+        assertFalse(repository.claim(abandoned))
+    }
+
+    @Test
+    fun `abandoned unclaimed stop retains possible-live cleanup evidence`() = runBlocking {
+        val repository = enabledRunningRepository(AtomicLong(1_000))
+        val stop = repository.prepare(LifecycleOperation.STOP)
+
+        assertTrue(repository.abandon(stop, LifecycleErrorCode.CANCELLED))
+        val failed = repository.snapshot()
+
+        assertFalse(failed.latestTransaction!!.effectStarted)
+        assertTrue(failed.runtimeMayBeLive)
+        assertEquals(1L, failed.runtimeEvidenceVersion)
+        assertTrue(
+            repository.begin(ReconciliationTrigger.PROCESS_RESTART) is
+                ReconciliationAdmission.Execute,
+        )
+    }
+
+    @Test
+    fun `stale abandon cannot fail a newer prepared token`() = runBlocking {
+        val repository = enabledRunningRepository(AtomicLong(1_000))
+        val stale = repository.prepare(LifecycleOperation.STOP)
+        val newer = repository.prepare(LifecycleOperation.START)
+
+        assertFalse(repository.abandon(stale, LifecycleErrorCode.CANCELLED))
+        val current = repository.snapshot().latestTransaction!!
+
+        assertEquals(newer.id, current.id)
+        assertEquals(LifecycleOperation.START, current.operation)
+        assertEquals(LifecycleOutcome.PENDING, current.outcome)
+        assertFalse(current.effectStarted)
+    }
+
+    @Test
     fun `current remove prepare claim and failure keep evidence and admit stopped cleanup`() = runBlocking {
         val repository = repository(FakeAtomicStore(), AtomicLong(1_000))
 

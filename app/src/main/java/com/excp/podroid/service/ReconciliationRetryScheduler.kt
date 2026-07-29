@@ -8,6 +8,7 @@ import android.app.AlarmManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import com.excp.podroid.vm.HostReconciliationPolicy
 import com.excp.podroid.vm.HostSupervisorState
 import com.excp.podroid.vm.ReconciliationMetadata
 import com.excp.podroid.vm.ReconciliationOutcome
@@ -45,8 +46,7 @@ internal sealed interface ReconciliationRetryDirective {
 
         fun fromPersistedState(state: HostSupervisorState): ReconciliationRetryDirective {
             val reconciliation = state.reconciliation
-            val retryRequired = state.runtimeMayBeLive ||
-                (state.hostEnabled && state.desiredState == VmDesiredState.RUNNING)
+            val retryRequired = retryRequired(state)
             return if (retryRequired &&
                 reconciliation.consecutiveAttempts in 1 until ReconciliationMetadata.MAX_ATTEMPTS &&
                 reconciliation.nextEligibleEpochMs > 0 && reconciliation.lastOutcome in setOf(
@@ -57,6 +57,35 @@ internal sealed interface ReconciliationRetryDirective {
                 Schedule(reconciliation.nextEligibleEpochMs)
             } else Cancel
         }
+
+        /** Rearms a consumed delivery when completion could not leave schedulable metadata. */
+        fun afterReconciliationFailure(
+            state: HostSupervisorState,
+            nowEpochMs: Long,
+        ): ReconciliationRetryDirective {
+            require(nowEpochMs in 0..ReconciliationMetadata.MAX_EPOCH_MS)
+            val persisted = fromPersistedState(state)
+            if (persisted is Schedule || !retryRequired(state)) return persisted
+            val reconciliation = state.reconciliation
+            return if (reconciliation.lastOutcome == ReconciliationOutcome.ATTEMPTING &&
+                reconciliation.consecutiveAttempts in 1 until ReconciliationMetadata.MAX_ATTEMPTS
+            ) {
+                val delayMs = HostReconciliationPolicy.backoffDelayMs(
+                    reconciliation.consecutiveAttempts,
+                )
+                Schedule(
+                    if (nowEpochMs > ReconciliationMetadata.MAX_EPOCH_MS - delayMs) {
+                        ReconciliationMetadata.MAX_EPOCH_MS
+                    } else {
+                        nowEpochMs + delayMs
+                    },
+                )
+            } else persisted
+        }
+
+        private fun retryRequired(state: HostSupervisorState): Boolean =
+            state.runtimeMayBeLive ||
+                (state.hostEnabled && state.desiredState == VmDesiredState.RUNNING)
     }
 }
 

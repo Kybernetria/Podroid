@@ -383,6 +383,37 @@ class HostSupervisorRepository internal constructor(
         return claimed
     }
 
+    override suspend fun abandon(
+        token: LifecycleTransactionToken,
+        errorCode: LifecycleErrorCode,
+    ): Boolean {
+        require(errorCode in setOf(LifecycleErrorCode.CANCELLED, LifecycleErrorCode.INVALID_STATE)) {
+            "Unclaimed command failure requires a closed pre-effect error code"
+        }
+        var abandoned = false
+        mutate { current ->
+            val transaction = current.latestTransaction
+            if (transaction.matchesPending(token) && transaction?.effectStarted == false) {
+                abandoned = true
+                current.copy(latestTransaction = transaction.copy(
+                    outcome = LifecycleOutcome.FAILED,
+                    completedAtEpochMs = maxOf(now(), transaction.requestedAtEpochMs),
+                    errorCode = errorCode,
+                )).let { abandonedState ->
+                    if (token.operation in setOf(
+                            LifecycleOperation.STOP,
+                            LifecycleOperation.FORCE_STOP,
+                            LifecycleOperation.REMOVE,
+                        )
+                    ) {
+                        abandonedState.withRuntimeEvidence(true)
+                    } else abandonedState
+                }
+            } else current
+        }
+        return abandoned
+    }
+
     override suspend fun isCurrent(token: LifecycleTransactionToken): Boolean {
         val raw = withTimeout(datastoreTimeoutMs) { store.read() }
         val current = HostSupervisorRecordCodec.decodeV0AbsentOrCurrent(raw)
