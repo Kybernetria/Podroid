@@ -3,9 +3,8 @@
  * Copyright (C) 2024-2026 Podroid contributors
  *
  * Per-rule TCP listener that bridges Android-side connections to a vsock port
- * on the guest. Listens on 0.0.0.0:hostPort so LAN devices (`ssh root@<phone-IP>
- * -p 9922`, `vncviewer <phone-IP>:5900`) can reach the VM without going through
- * 127.0.0.1.
+ * on the guest. Explicit user rules listen on 0.0.0.0:hostPort so LAN clients
+ * can reach the VM without going through 127.0.0.1.
  *
  * Lifecycle is bounded by the caller's scope: cancelling the scope tears down
  * the accept loop and every per-connection pump. Use [close] for the explicit
@@ -40,8 +39,8 @@ class VsockPortForwarder(
     private val guestVsockPort: Int,
     private val vm: Any,
     private val scope: CoroutineScope,
-    // 127.0.0.1 for the implicit VNC/audio forwards (off the network);
-    // 0.0.0.0 for user rules so a PC on the LAN can reach them.
+    // Explicit user rules default to 0.0.0.0; callers may narrow an internal
+    // rule to 127.0.0.1. No display/audio listeners are auto-created.
     private val bindAddress: String = "0.0.0.0",
 ) : Forwarder {
     companion object {

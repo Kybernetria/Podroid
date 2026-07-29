@@ -61,25 +61,21 @@ class EngineHolderDiffTest {
     }
 
     @Test
-    fun `implicit always-on forwards are never removed`() {
-        // SSH/VNC/audio are injected into the launch set by PodroidService but
-        // never persisted to the DataStore, so they appear in launchRules yet
-        // not in `rules`. The diff loop folds them back in (desired = rules +
-        // implicit) so they are never computed as removed. Without that fold the
-        // first →Running diff tore them down, racing the engine's own initial
-        // setup and surfacing as intermittent SSH/VNC/audio dropout.
-        val ssh = rule(9922, 22); val vnc = rule(5900); val audio = rule(4713)
-        val launch = setOf(ssh, vnc, audio)             // appliedRules at →Running
-        val persisted = emptySet<PortForwardRule>()     // DataStore: no user rules
-        val implicit = launch - persisted               // captured at →Running edge
-        val desired = persisted + implicit              // the fold
+    fun `launch-only ssh is never removed`() {
+        // Enabled SSH is injected into the launch set but not persisted as a user
+        // rule. The diff loop folds that launch-only rule back into desired.
+        val ssh = rule(9922, 22)
+        val launch = setOf(ssh)                          // appliedRules at →Running
+        val persisted = emptySet<PortForwardRule>()      // DataStore: no user rules
+        val implicit = launch - persisted                // captured at →Running edge
+        val desired = persisted + implicit               // the fold
         val (added, removed) = computeRuleDiff(applied = launch, desired = desired)
         assertEquals(emptySet<PortForwardRule>(), removed)
         assertEquals(emptySet<PortForwardRule>(), added)
     }
 
     @Test
-    fun `user rule removed mid-session is torn down while implicit forwards survive`() {
+    fun `user rule removed mid-session is torn down while launch-only ssh survives`() {
         val ssh = rule(9922, 22)
         val user = rule(8000)
         val launch = setOf(ssh, user)
@@ -89,5 +85,13 @@ class EngineHolderDiffTest {
         val (added, removed) = computeRuleDiff(applied = launch, desired = desired)
         assertEquals(setOf(user), removed)              // user rule gone; ssh not removed
         assertEquals(emptySet<PortForwardRule>(), added)
+    }
+
+    @Test
+    fun `former display and audio ports are ordinary explicit rules`() {
+        val explicit = setOf(rule(5900), rule(4713))
+        val (added, removed) = computeRuleDiff(applied = emptySet(), desired = explicit)
+        assertEquals(explicit, added)
+        assertEquals(emptySet<PortForwardRule>(), removed)
     }
 }

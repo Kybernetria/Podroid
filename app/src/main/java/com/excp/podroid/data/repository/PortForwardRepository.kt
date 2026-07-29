@@ -10,7 +10,6 @@ import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringSetPreferencesKey
-import com.excp.podroid.x11.X11Constants
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -26,11 +25,8 @@ import javax.inject.Singleton
  * @param hostPort Port on the Android device
  * @param guestPort Port inside the VM
  * @param protocol "tcp" or "udp"
- * @param loopbackOnly Bind the host listener to 127.0.0.1 instead of 0.0.0.0.
- *   Set for the implicit VNC/audio forwards (the in-app viewer dials loopback),
- *   so an unauthenticated X session + raw PCM aren't exposed to the whole LAN.
- *   NOT serialized — implicit rules are never persisted; user-created rules keep
- *   the default (0.0.0.0) so they remain reachable from a PC.
+ * @param loopbackOnly Bind an internal, non-persisted rule to 127.0.0.1 instead
+ *   of 0.0.0.0. User-created rules are ordinary explicit LAN-reachable rules.
  */
 data class PortForwardRule(
     val hostPort: Int,
@@ -38,8 +34,8 @@ data class PortForwardRule(
     val protocol: String = "tcp",
     val loopbackOnly: Boolean = false,
 ) {
-    // serialize/deserialize intentionally omit loopbackOnly: persistence format
-    // is unchanged (sacred) and only user rules (loopbackOnly=false) persist.
+    // serialize/deserialize intentionally omit loopbackOnly so the persistent
+    // user-rule format remains unchanged.
     fun serialize(): String = "$protocol:$hostPort:$guestPort"
 
     companion object {
@@ -87,18 +83,6 @@ class PortForwardRepository @Inject constructor(
 ) {
     companion object {
         private val KEY_PORT_FORWARDS = stringSetPreferencesKey("port_forwards")
-
-        /**
-         * Host ports owned by the implicit, loopback-bound X11 display/audio
-         * forwards (injected at launch, never persisted). A user rule on one of
-         * these would shadow the implicit rule and bind 0.0.0.0, exposing the
-         * no-auth X session + raw PCM to the whole LAN. They are rejected on add
-         * and filtered from reads here — the single chokepoint feeding the launch
-         * snapshot, the EngineHolder live-diff, and the Settings UI — so a stale
-         * rule persisted by an older build can never be surfaced or applied.
-         * SSH (9922) is intentionally LAN-reachable and is NOT reserved.
-         */
-        val RESERVED_HOST_PORTS = setOf(X11Constants.VNC_PORT, X11Constants.AUDIO_PORT)
     }
 
     val rules: Flow<List<PortForwardRule>> = context.dataStore.data
@@ -106,14 +90,12 @@ class PortForwardRepository @Inject constructor(
         .map { prefs ->
             prefs[KEY_PORT_FORWARDS]
                 ?.mapNotNull { PortForwardRule.deserialize(it) }
-                ?.filter { it.hostPort !in RESERVED_HOST_PORTS }
                 ?.sortedWith(compareBy({ it.hostPort }, { it.protocol }))
                 ?: emptyList()
         }
         .distinctUntilChanged()
 
     suspend fun addRule(rule: PortForwardRule) {
-        if (rule.hostPort in RESERVED_HOST_PORTS) return
         context.dataStore.edit { prefs ->
             val current = prefs[KEY_PORT_FORWARDS] ?: emptySet()
             prefs[KEY_PORT_FORWARDS] = deduplicatePortForwards(current, rule)
@@ -134,7 +116,6 @@ class PortForwardRepository @Inject constructor(
             .map { prefs ->
                 prefs[KEY_PORT_FORWARDS]
                     ?.mapNotNull { PortForwardRule.deserialize(it) }
-                    ?.filter { it.hostPort !in RESERVED_HOST_PORTS }
                     ?: emptyList()
             }.first()
 }

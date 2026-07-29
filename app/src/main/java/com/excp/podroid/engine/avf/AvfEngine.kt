@@ -678,8 +678,8 @@ class AvfEngine @Inject constructor(
         // TCP keeps vport == hostPort (unchanged); UDP is offset so a TCP and a
         // UDP rule on the same host port don't collide on the vsock port space.
         val vport = AvfVport.forRule(rule)
-        // Implicit VNC/audio forwards bind loopback so an authless X session +
-        // raw PCM aren't exposed to the LAN; user rules stay 0.0.0.0.
+        // Explicit user rules stay LAN-reachable. loopbackOnly is retained for
+        // narrowly scoped internal rules, but no display/audio rules are seeded.
         val bindAddr = if (rule.loopbackOnly) "127.0.0.1" else "0.0.0.0"
         try {
             val fw: Forwarder = if (rule.protocol == "udp") {

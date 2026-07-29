@@ -2,7 +2,9 @@
 set -eu
 ROOTFS=/work/rootfs
 MINIMAL_PACKAGES=/work/minimal-packages.txt
+RESOLVED_PACKAGES_LOCK=/work/resolved-packages.lock
 MAX_EXPLICIT_PACKAGES=32
+MAX_RESOLVED_PACKAGES=128
 
 # ALPINE_VERSION comes from the Dockerfile ENV (full release like 3.23.4).
 # Strip the patch component to get the major branch (e.g. 3.23) used in repo URLs.
@@ -38,6 +40,21 @@ apk -X "https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_BRANCH}/main" \
     --keys-dir "$ROOTFS/etc/apk/keys" \
     -U --root "$ROOTFS" --initdb add "$@"
 
+# Fail the build if repository drift changes the reviewed 41-package closure.
+# The lock contains package names (not versions) from the successful Alpine
+# 3.23.4 artifact; signature verification still authenticates package bytes.
+resolved_packages=$(apk --root "$ROOTFS" info | LC_ALL=C sort)
+resolved_count=$(printf '%s\n' "$resolved_packages" | wc -l)
+[ "$resolved_count" -le "$MAX_RESOLVED_PACKAGES" ] || {
+    echo "resolved package closure exceeds $MAX_RESOLVED_PACKAGES entries" >&2
+    exit 1
+}
+[ "$resolved_packages" = "$(cat "$RESOLVED_PACKAGES_LOCK")" ] || {
+    echo "resolved package closure differs from reviewed lock" >&2
+    printf '%s\n' "$resolved_packages" >&2
+    exit 1
+}
+
 # Keep root usable for public-key SSH without shipping a known password. This
 # executes the same narrowly scoped entropy generator exercised by verification.
 ROOT_HASH=$(/work/generate-root-password-hash.sh)
@@ -63,7 +80,8 @@ done
 # host CLIs are argv[0]-dispatch symlinks onto one multi-call binary.
 chmod +x "$ROOTFS/usr/local/bin/podroid-vsock-agent" \
          "$ROOTFS/usr/local/bin/podroid-hostd" \
-         "$ROOTFS/usr/local/bin/podroid-overlay-normalize"
+         "$ROOTFS/usr/local/bin/podroid-overlay-normalize" \
+         "$ROOTFS/usr/local/bin/podroid-migrate-safe"
 for cli in notify forward open power headless server; do
     ln -sf podroid-hostd "$ROOTFS/usr/local/bin/podroid-$cli"
 done
@@ -79,11 +97,14 @@ mkdir -p "$ROOTFS/etc/podroid"
 cp /work/files/etc/podroid/forwards.conf "$ROOTFS/etc/podroid/forwards.conf"
 chmod 0644 "$ROOTFS/etc/podroid/forwards.conf"
 
-# Migration anchor and versioned idempotent hooks.
+# Migration anchor, immutable bounded index, runner, and idempotent hooks.
 mkdir -p "$ROOTFS/etc/podroid/migrations"
 cp /work/files/etc/podroid/migrations/README "$ROOTFS/etc/podroid/migrations/README"
+cp /work/files/etc/podroid/migrations/index "$ROOTFS/etc/podroid/migrations/index"
 cp /work/files/etc/podroid/migrations/31.sh "$ROOTFS/etc/podroid/migrations/31.sh"
-chmod 0755 "$ROOTFS/etc/podroid/migrations/31.sh"
+cp /work/files/usr/local/bin/podroid-migrate-runner "$ROOTFS/usr/local/bin/podroid-migrate-runner"
+chmod 0644 "$ROOTFS/etc/podroid/migrations/index"
+chmod 0755 "$ROOTFS/etc/podroid/migrations/31.sh" "$ROOTFS/usr/local/bin/podroid-migrate-runner"
 printf '%s\n' "${SYSTEM_VERSION:-0}" > "$ROOTFS/etc/podroid/system-version"
 chmod 0644 "$ROOTFS/etc/podroid/system-version"
 

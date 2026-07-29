@@ -94,12 +94,9 @@ class EngineHolder @Inject constructor(
     // removed during the boot window is still torn down.
     @Volatile private var launchRules: Set<PortForwardRule> = emptySet()
 
-    // Always-on forwards that PodroidService injects into the launch set but
-    // never persists to the DataStore (SSH 9922→22 when enabled, plus the X11
-    // viewer's VNC 5900 and audio 4713). They live in launchRules but not in the
-    // DataStore `rules`, so a diff of `desired = rules` computes them as removed
-    // on the first →Running edge and tears them down — racing the engine's own
-    // initial setup, which surfaced as intermittent SSH/VNC/audio dropout.
+    // Launch-only forwards that PodroidService injects but never persists (SSH
+    // 9922→22 when enabled). They live in launchRules but not DataStore `rules`,
+    // so a plain desired=rules diff would remove SSH on the first →Running edge.
     // Captured once on the →Running edge (launchRules - rules) and folded into
     // `desired` so they are never removed; explicit user rules still diff live.
     @Volatile private var implicitRules: Set<PortForwardRule> = emptySet()
@@ -160,17 +157,16 @@ class EngineHolder @Inject constructor(
                     // launch cmdline, so treat them as applied. Unchanged boot →
                     // added/removed empty; a rule removed mid-boot → removed.
                     appliedRules = launchRules
-                    // The implicit always-on forwards (in launchRules but never
-                    // persisted to the DataStore) must never be torn down by the
-                    // diff. Capture them once here so they can be folded into
+                    // Launch-only forwards (currently enabled SSH) must never
+                    // be torn down merely because they are not in DataStore.
+                    // Capture them once here so they can be folded into
                     // `desired` below — without this they'd be computed as
                     // removed and race the engine's initial setup.
                     implicitRules = launchRules - rules
                     wasRunning = true
                 }
-                // Persisted user rules plus the implicit always-on forwards, so
-                // SSH/VNC/audio are never in `removed`. User rules still add and
-                // remove live as the DataStore changes.
+                // Persisted user rules plus launch-only SSH. User-created rules
+                // still add and remove live as DataStore changes.
                 val desired = rules + implicitRules
                 val (added, removed) = computeRuleDiff(applied = appliedRules, desired = desired)
                 // Track what is actually live so a transient add/remove failure

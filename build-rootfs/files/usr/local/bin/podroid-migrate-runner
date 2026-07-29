@@ -1,0 +1,76 @@
+#!/bin/sh
+# Execute the immutable, explicitly indexed migration set from the squashfs.
+set -eu
+
+readonly_root=${1:?immutable lower root is required}
+persist_root=${2:?persistent mount root is required}
+target_root=${3:-/}
+case "$readonly_root:$persist_root:$target_root" in
+    /*:/*:/*) ;;
+    *) echo "podroid-migrate: roots must be absolute" >&2; exit 1 ;;
+esac
+
+migrations_dir="$readonly_root/etc/podroid/migrations"
+index_file="$migrations_dir/index"
+system_version_file="$readonly_root/etc/podroid/system-version"
+helper="$readonly_root/usr/local/bin/podroid-migrate-safe"
+max_migrations=256
+max_index_bytes=4096
+
+fail() {
+    echo "podroid-migrate: $*" >&2
+    exit 1
+}
+
+valid_version() {
+    case "$1" in ''|0|0*|*[!0-9]*) return 1 ;; esac
+    [ "${#1}" -le 9 ]
+}
+
+[ -f "$index_file" ] && [ ! -L "$index_file" ] || fail "immutable migration index is missing or not regular"
+[ -f "$system_version_file" ] && [ ! -L "$system_version_file" ] || fail "immutable system version is missing or not regular"
+[ -f "$helper" ] && [ ! -L "$helper" ] && [ -x "$helper" ] || fail "immutable migration helper is missing or not executable"
+index_bytes=$(wc -c < "$index_file")
+case "$index_bytes" in ''|*[!0-9]*) fail "cannot size migration index" ;; esac
+[ "$index_bytes" -le "$max_index_bytes" ] || fail "migration index exceeds $max_index_bytes bytes"
+
+current=$(cat "$system_version_file")
+valid_version "$current" || fail "invalid system version"
+
+# First pass validates the complete immutable index before any migration effect.
+count=0
+previous=0
+while IFS= read -r version || [ -n "$version" ]; do
+    valid_version "$version" || fail "malformed migration index entry"
+    count=$((count + 1))
+    [ "$count" -le "$max_migrations" ] || fail "migration index exceeds $max_migrations entries"
+    [ "$version" -gt "$previous" ] || fail "duplicate or out-of-order migration index entry"
+    script="$migrations_dir/$version.sh"
+    [ -f "$script" ] && [ ! -L "$script" ] || fail "indexed migration $version is missing or not regular"
+    previous=$version
+done < "$index_file"
+[ "$count" -gt 0 ] || fail "migration index is empty"
+[ "$previous" -eq "$current" ] || fail "migration index does not end at system version"
+
+applied=$("$helper" read-applied "$persist_root") || fail "cannot read applied-version safely"
+[ -n "$applied" ] || applied=0
+case "$applied" in ''|*[!0-9]*|0[0-9]*) fail "invalid applied version" ;; esac
+[ "${#applied}" -le 9 ] || fail "invalid applied version"
+
+[ "$current" -gt "$applied" ] || exit 0
+
+# The index and scripts are on the immutable lower squashfs, so the second pass
+# cannot change after validation. No glob, sort, or temporary list is involved.
+while IFS= read -r version || [ -n "$version" ]; do
+    if [ "$version" -gt "$applied" ] && [ "$version" -le "$current" ]; then
+        echo "podroid-migrate: applying $version" >&2
+        PODROID_IMMUTABLE_ROOT="$readonly_root" \
+        PODROID_MIGRATION_TARGET_ROOT="$target_root" \
+            sh "$migrations_dir/$version.sh" || fail "migration $version failed"
+    fi
+done < "$index_file"
+
+# Commit only after all selected idempotent hooks complete. The helper opens the
+# persistent mount and .podroid directory without following symlinks and uses an
+# O_EXCL temporary plus renameat for the atomic marker replacement.
+"$helper" write-applied "$persist_root" "$current" || fail "cannot advance applied-version safely"

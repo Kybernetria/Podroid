@@ -2,7 +2,7 @@
 
 # ── Stage 1: cross-compile podroid-vsock-agent (musl-static aarch64) ────────
 # Uses qemu-user under the hood — no separate cross-toolchain needed.
-FROM --platform=linux/arm64 alpine:3.23 AS vsock-builder
+FROM --platform=linux/arm64 alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40 AS vsock-builder
 RUN apk add --no-cache musl-dev gcc make linux-headers
 WORKDIR /work
 COPY vsock-agent /work/vsock-agent
@@ -11,18 +11,22 @@ COPY host-bridge /work/host-bridge
 RUN cd /work/host-bridge && make CC=gcc
 COPY overlay-normalize /work/overlay-normalize
 RUN cd /work/overlay-normalize && make CC=gcc
+COPY migrate-safe /work/migrate-safe
+RUN cd /work/migrate-safe && make CC=gcc
 
 # ── Stage 2: build the Alpine rootfs squashfs ───────────────────────────────
-FROM alpine:3.23 AS builder
+FROM alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40 AS builder
 
-ARG ALPINE_RELEASE=3.23.4
-ARG ALPINE_ARCH=aarch64
+ENV ALPINE_RELEASE=3.23.4 \
+    ALPINE_ARCH=aarch64 \
+    ALPINE_MINIROOTFS_SHA256=9250667a8affac8f1e98086392f80f43f086626701e9bce33398eb9b6c0bd64c
 
 RUN apk add --no-cache curl squashfs-tools tar openssl libcap-utils
 
 WORKDIR /work
-RUN curl -L -o minirootfs.tar.gz \
+RUN curl --fail --location --proto '=https' --tlsv1.2 -o minirootfs.tar.gz \
     "https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_RELEASE%.*}/releases/${ALPINE_ARCH}/alpine-minirootfs-${ALPINE_RELEASE}-${ALPINE_ARCH}.tar.gz" \
+ && printf '%s  %s\n' "$ALPINE_MINIROOTFS_SHA256" minirootfs.tar.gz | sha256sum -c - \
  && mkdir rootfs \
  && tar -xzf minirootfs.tar.gz -C rootfs \
  && cp /etc/apk/keys/*.pub /work/rootfs/etc/apk/keys/ \
@@ -32,6 +36,7 @@ RUN curl -L -o minirootfs.tar.gz \
 COPY --from=vsock-builder /work/vsock-agent/podroid-vsock-agent /work/rootfs/usr/local/bin/podroid-vsock-agent
 COPY --from=vsock-builder /work/host-bridge/podroid-hostd /work/rootfs/usr/local/bin/podroid-hostd
 COPY --from=vsock-builder /work/overlay-normalize/podroid-overlay-normalize /work/rootfs/usr/local/bin/podroid-overlay-normalize
+COPY --from=vsock-builder /work/migrate-safe/podroid-migrate-safe /work/rootfs/usr/local/bin/podroid-migrate-safe
 
 ARG SYSTEM_VERSION=0
 ENV SYSTEM_VERSION=${SYSTEM_VERSION}
@@ -39,6 +44,7 @@ ENV SYSTEM_VERSION=${SYSTEM_VERSION}
 ENV ALPINE_VERSION=${ALPINE_RELEASE}
 COPY files /work/files
 COPY minimal-packages.txt /work/minimal-packages.txt
+COPY resolved-packages.lock /work/resolved-packages.lock
 COPY build-rootfs.sh /work/build-rootfs.sh
 COPY generate-root-password-hash.sh /work/generate-root-password-hash.sh
 RUN chmod +x /work/build-rootfs.sh /work/generate-root-password-hash.sh \

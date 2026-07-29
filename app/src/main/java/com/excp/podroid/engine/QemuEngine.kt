@@ -636,9 +636,8 @@ class QemuEngine @Inject constructor(
         val netdevArg = buildString {
             append("user,id=net0,ipv6=off")
             for (rule in portForwards) {
-                // hostfwd hostaddr: empty = 0.0.0.0 (LAN-reachable, user rules);
-                // 127.0.0.1 for loopbackOnly rules (implicit VNC/audio) so they
-                // aren't exposed to the network.
+                // Explicit user rules use 0.0.0.0; loopbackOnly remains available
+                // for narrowly scoped internal rules but none are auto-created.
                 val hostAddr = if (rule.loopbackOnly) "127.0.0.1" else ""
                 append(",hostfwd=${rule.protocol}:$hostAddr:${rule.hostPort}-:${rule.guestPort}")
             }

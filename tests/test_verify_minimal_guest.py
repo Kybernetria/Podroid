@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
-import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -26,23 +26,19 @@ class MinimalGuestVerifierTest(unittest.TestCase):
             with self.subTest(data=data), self.assertRaises(verifier.VerificationError):
                 verifier.parse_explicit_packages(data)
 
-    def test_resolved_package_closure_rejects_removed_feature_families(self):
-        required = tuple(sorted(verifier.REQUIRED_RESOLVED_PACKAGES))
-        verifier.verify_package_closure(required)
-        for forbidden in (
-            "podman",
-            "docker-openrc",
-            "lxc",
-            "tigervnc",
-            "pulseaudio-utils",
-            "font-misc-misc",
-            "libx11",
-            "xfce4-session",
-        ):
-            with self.subTest(package=forbidden), self.assertRaisesRegex(
-                verifier.VerificationError, "forbidden package"
+    def test_resolved_package_closure_requires_exact_reviewed_lock(self):
+        expected = verifier.EXPECTED_RESOLVED_PACKAGES
+        verifier.verify_package_closure(expected)
+        for changed in (expected[:-1], tuple(sorted((*expected, "podman")))):
+            with self.subTest(changed=changed), self.assertRaisesRegex(
+                verifier.VerificationError, "exact reviewed lock"
             ):
-                verifier.verify_package_closure(tuple(sorted((*required, forbidden))))
+                verifier.verify_package_closure(changed)
+
+    def test_resolved_package_lock_matches_successful_41_package_artifact(self):
+        data = (REPO_ROOT / "build-rootfs/resolved-packages.lock").read_bytes()
+        self.assertEqual(verifier.parse_resolved_package_lock(data), verifier.EXPECTED_RESOLVED_PACKAGES)
+        self.assertEqual(len(verifier.EXPECTED_RESOLVED_PACKAGES), 41)
 
     def test_package_database_bounds_and_record_shape_are_enforced(self):
         database = b"P:alpine-base\nV:1\n\nP:openrc\nV:1\n"
@@ -65,8 +61,17 @@ class MinimalGuestVerifierTest(unittest.TestCase):
         with self.assertRaisesRegex(verifier.VerificationError, "escapes"):
             verifier.listing_paths(confused, 2)
 
+    def build_migration_helper(self, destination: Path) -> Path:
+        compiler = shutil.which("cc")
+        self.assertIsNotNone(compiler, "cc is required for migration helper regressions")
+        source = REPO_ROOT / "build-rootfs/migrate-safe/podroid-migrate-safe.c"
+        subprocess.run(
+            [compiler, "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(destination), str(source)],
+            check=True,
+        )
+        return destination
+
     def test_migration_31_is_idempotent_and_preserves_user_data(self):
-        migration = REPO_ROOT / "build-rootfs/files/etc/podroid/migrations/31.sh"
         stale_paths = (
             "etc/runlevels/default/podroid-x11",
             "etc/runlevels/default/docker",
@@ -85,18 +90,123 @@ class MinimalGuestVerifierTest(unittest.TestCase):
             "home/user/document",
         )
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            base = Path(temporary)
+            root = base / "root"
+            helper = self.build_migration_helper(base / "podroid-migrate-safe")
             for relative in (*stale_paths, *preserved_paths):
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("keep only when user data")
-            environment = {**os.environ, "PODROID_MIGRATION_ROOT": str(root)}
+            forwards = root / "etc/podroid/forwards.conf"
+            forwards.parent.mkdir(parents=True, exist_ok=True)
+            forwards.write_text("9100 ctl\n5900 tcp 127.0.0.1 5900\n4713 tcp 127.0.0.1 4713\n")
             for _ in range(2):
-                subprocess.run(["sh", str(migration)], check=True, env=environment)
+                subprocess.run([str(helper), "apply-31", str(root)], check=True)
             for relative in stale_paths:
                 self.assertFalse((root / relative).exists(), relative)
             for relative in preserved_paths:
                 self.assertEqual((root / relative).read_text(), "keep only when user data")
+            self.assertEqual(forwards.read_text(), "9100 ctl\n")
+
+    def test_migration_31_rejects_hostile_parent_symlink_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "root"
+            outside = base / "outside"
+            (root / "etc").mkdir(parents=True)
+            outside.mkdir()
+            victim = outside / "podroid-x11"
+            victim.write_text("outside")
+            (root / "etc/init.d").symlink_to(outside)
+            helper = self.build_migration_helper(base / "podroid-migrate-safe")
+            result = subprocess.run([str(helper), "apply-31", str(root)], capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(victim.read_text(), "outside")
+
+    def test_migration_31_rejects_hostile_test_root_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            actual = base / "actual"
+            (actual / "etc/podroid").mkdir(parents=True)
+            (actual / "etc/podroid/forwards.conf").write_text("5900 tcp x 5900\n")
+            hostile_root = base / "root"
+            hostile_root.symlink_to(actual, target_is_directory=True)
+            helper = self.build_migration_helper(base / "podroid-migrate-safe")
+            result = subprocess.run([str(helper), "apply-31", str(hostile_root)], capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((actual / "etc/podroid/forwards.conf").read_text(), "5900 tcp x 5900\n")
+
+    def test_immutable_runner_applies_indexed_migration_and_commits_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            lower = base / "lower"
+            persist = base / "persist"
+            target = base / "target"
+            migrations = lower / "etc/podroid/migrations"
+            binaries = lower / "usr/local/bin"
+            migrations.mkdir(parents=True)
+            binaries.mkdir(parents=True)
+            persist.mkdir()
+            stale = target / "etc/init.d/podroid-x11"
+            stale.parent.mkdir(parents=True)
+            stale.write_text("obsolete")
+            forwards = target / "etc/podroid/forwards.conf"
+            forwards.parent.mkdir(parents=True)
+            forwards.write_text("9100 ctl\n5900 tcp 127.0.0.1 5900\n4713 tcp 127.0.0.1 4713\n")
+            (lower / "etc/podroid/system-version").write_text("31\n")
+            shutil.copy2(REPO_ROOT / "build-rootfs/files/etc/podroid/migrations/index", migrations / "index")
+            shutil.copy2(REPO_ROOT / "build-rootfs/files/etc/podroid/migrations/31.sh", migrations / "31.sh")
+            self.build_migration_helper(binaries / "podroid-migrate-safe")
+            runner = REPO_ROOT / "build-rootfs/files/usr/local/bin/podroid-migrate-runner"
+            subprocess.run(["sh", str(runner), str(lower), str(persist), str(target)], check=True)
+            self.assertFalse(stale.exists())
+            self.assertEqual(forwards.read_text(), "9100 ctl\n")
+            marker = persist / ".podroid/applied-version"
+            self.assertEqual(marker.read_text(), "31\n")
+            marker.write_text("031\n")
+            malformed = subprocess.run(
+                ["sh", str(runner), str(lower), str(persist), str(target)],
+                capture_output=True,
+            )
+            self.assertNotEqual(malformed.returncode, 0)
+            self.assertEqual(marker.read_text(), "031\n")
+
+    def test_migration_index_rejects_malformed_duplicate_and_out_of_order_entries(self):
+        for index in (b"031\n", b"31\n31\n", b"32\n31\n", b"31 extra\n"):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                lower = base / "lower"
+                persist = base / "persist"
+                target = base / "target"
+                migrations = lower / "etc/podroid/migrations"
+                binaries = lower / "usr/local/bin"
+                migrations.mkdir(parents=True)
+                binaries.mkdir(parents=True)
+                persist.mkdir()
+                (target / "etc/podroid").mkdir(parents=True)
+                (target / "etc/podroid/forwards.conf").write_text("9100 ctl\n")
+                (lower / "etc/podroid/system-version").write_text("31\n")
+                (migrations / "index").write_bytes(index)
+                for version in (31, 32):
+                    (migrations / f"{version}.sh").write_text("#!/bin/sh\nexit 0\n")
+                self.build_migration_helper(binaries / "podroid-migrate-safe")
+                runner = REPO_ROOT / "build-rootfs/files/usr/local/bin/podroid-migrate-runner"
+                result = subprocess.run(["sh", str(runner), str(lower), str(persist), str(target)], capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((persist / ".podroid/applied-version").exists())
+
+    def test_applied_marker_directory_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            persist = base / "persist"
+            outside = base / "outside"
+            persist.mkdir()
+            outside.mkdir()
+            (persist / ".podroid").symlink_to(outside, target_is_directory=True)
+            helper = self.build_migration_helper(base / "podroid-migrate-safe")
+            result = subprocess.run([str(helper), "write-applied", str(persist), "31"], capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((outside / "applied-version").exists())
 
     def test_artifact_symlink_is_rejected_before_tool_execution(self):
         with tempfile.TemporaryDirectory() as temporary:
