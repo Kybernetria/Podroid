@@ -11,8 +11,7 @@ pub const MAX_UPTIME_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 pub struct HostId(String);
 
 impl HostId {
-    pub fn parse(raw: impl Into<String>) -> Result<Self, ValidationError> {
-        let raw = raw.into();
+    pub fn parse(raw: &str) -> Result<Self, ValidationError> {
         if raw.is_empty() || raw.len() > MAX_HOST_ID_BYTES {
             return Err(ValidationError::InvalidHostId);
         }
@@ -22,7 +21,7 @@ impl HostId {
         {
             return Err(ValidationError::InvalidHostId);
         }
-        Ok(Self(raw))
+        Ok(Self(raw.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -126,7 +125,7 @@ impl VmStatus {
         backend: VmBackend,
         boot_stage: BootStage,
         uptime_seconds: Option<u64>,
-        error: Option<String>,
+        error: Option<&str>,
     ) -> Result<Self, ValidationError> {
         if uptime_seconds.is_some_and(|seconds| seconds > MAX_UPTIME_SECONDS) {
             return Err(ValidationError::UptimeOutOfRange);
@@ -135,9 +134,7 @@ impl VmStatus {
             return Err(ValidationError::UptimeRequiresRunningVm);
         }
         if lifecycle == VmLifecycle::Error {
-            let message = error
-                .as_deref()
-                .ok_or(ValidationError::ErrorMessageRequired)?;
+            let message = error.ok_or(ValidationError::ErrorMessageRequired)?;
             validate_error(message)?;
         } else if error.is_some() {
             return Err(ValidationError::UnexpectedErrorMessage);
@@ -162,7 +159,7 @@ impl VmStatus {
             backend,
             boot_stage,
             uptime_seconds,
-            error,
+            error: error.map(str::to_owned),
         })
     }
 
@@ -254,10 +251,9 @@ impl ActionPolicy {
 pub struct BoundaryMessage(String);
 
 impl BoundaryMessage {
-    pub fn parse(message: impl Into<String>) -> Result<Self, ValidationError> {
-        let message = message.into();
-        validate_error(&message)?;
-        Ok(Self(message))
+    pub fn parse(message: &str) -> Result<Self, ValidationError> {
+        validate_error(message)?;
+        Ok(Self(message.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -272,7 +268,7 @@ pub enum BoundaryError {
 }
 
 impl BoundaryError {
-    pub fn internal(message: impl Into<String>) -> Result<Self, ValidationError> {
+    pub fn internal(message: &str) -> Result<Self, ValidationError> {
         Ok(Self::Internal(BoundaryMessage::parse(message)?))
     }
 }
@@ -422,7 +418,7 @@ mod tests {
             VmLifecycle::Starting => (BootStage::Installing, None, None),
             VmLifecycle::Running => (BootStage::Ready, Some(4), None),
             VmLifecycle::Stopping => (BootStage::Ready, None, None),
-            VmLifecycle::Error => (BootStage::Failed, None, Some("preview failure".to_owned())),
+            VmLifecycle::Error => (BootStage::Failed, None, Some("preview failure")),
         };
         ControllerSnapshot::new(
             host,
@@ -435,11 +431,15 @@ mod tests {
         assert!(HostId::parse("phone-01.example").is_ok());
         assert_eq!(HostId::parse(""), Err(ValidationError::InvalidHostId));
         assert_eq!(
-            HostId::parse("x".repeat(MAX_HOST_ID_BYTES + 1)),
+            HostId::parse(&"x".repeat(MAX_HOST_ID_BYTES + 1)),
             Err(ValidationError::InvalidHostId)
         );
         assert_eq!(
             HostId::parse("phone\nspoof"),
+            Err(ValidationError::InvalidHostId)
+        );
+        assert_eq!(
+            HostId::parse("phone-é"),
             Err(ValidationError::InvalidHostId)
         );
         assert_eq!(
@@ -448,6 +448,91 @@ mod tests {
                 Some(HostId::parse("stale-host").unwrap())
             ),
             Err(ValidationError::DisconnectedIdentityNotAllowed)
+        );
+    }
+
+    #[test]
+    fn text_dto_apis_borrow_and_reject_oversized_input_before_retaining_it() {
+        let _: fn(&str) -> Result<HostId, ValidationError> = HostId::parse;
+        let _: fn(&str) -> Result<BoundaryMessage, ValidationError> = BoundaryMessage::parse;
+        let _: fn(&str) -> Result<BoundaryError, ValidationError> = BoundaryError::internal;
+        let _: fn(
+            VmLifecycle,
+            VmBackend,
+            BootStage,
+            Option<u64>,
+            Option<&str>,
+        ) -> Result<VmStatus, ValidationError> = VmStatus::new;
+
+        // The only large allocation belongs to this test caller. Each DTO receives a borrow and
+        // rejects it, so no constructor can consume and retain the caller's unbounded allocation.
+        let very_large = "x".repeat(4 * 1024 * 1024);
+        assert_eq!(
+            HostId::parse(&very_large),
+            Err(ValidationError::InvalidHostId)
+        );
+        assert_eq!(
+            BoundaryMessage::parse(&very_large),
+            Err(ValidationError::InvalidErrorMessage)
+        );
+        assert_eq!(
+            BoundaryError::internal(&very_large),
+            Err(ValidationError::InvalidErrorMessage)
+        );
+        assert_eq!(
+            VmStatus::new(
+                VmLifecycle::Error,
+                VmBackend::Unknown,
+                BootStage::Failed,
+                None,
+                Some(&very_large),
+            ),
+            Err(ValidationError::InvalidErrorMessage)
+        );
+
+        let maximum_host_id = "h".repeat(MAX_HOST_ID_BYTES);
+        assert_eq!(
+            HostId::parse(&maximum_host_id).unwrap().as_str().len(),
+            MAX_HOST_ID_BYTES
+        );
+        let maximum_message = "m".repeat(MAX_ERROR_BYTES);
+        assert_eq!(
+            BoundaryMessage::parse(&maximum_message)
+                .unwrap()
+                .as_str()
+                .len(),
+            MAX_ERROR_BYTES
+        );
+        assert_eq!(
+            BoundaryMessage::parse("line one\nline two"),
+            Err(ValidationError::InvalidErrorMessage)
+        );
+        let maximum_multibyte_message = "é".repeat(MAX_ERROR_BYTES / "é".len());
+        assert_eq!(
+            BoundaryMessage::parse(&maximum_multibyte_message)
+                .unwrap()
+                .as_str()
+                .len(),
+            MAX_ERROR_BYTES
+        );
+        let oversized_multibyte_message = format!("{maximum_multibyte_message}é");
+        assert_eq!(
+            BoundaryMessage::parse(&oversized_multibyte_message),
+            Err(ValidationError::InvalidErrorMessage)
+        );
+        assert_eq!(
+            VmStatus::new(
+                VmLifecycle::Error,
+                VmBackend::Unknown,
+                BootStage::Failed,
+                None,
+                Some(&maximum_message),
+            )
+            .unwrap()
+            .error()
+            .unwrap()
+            .len(),
+            MAX_ERROR_BYTES
         );
     }
 
@@ -494,7 +579,7 @@ mod tests {
             Err(ValidationError::InvalidBootStage)
         );
         assert_eq!(
-            BoundaryError::internal("x".repeat(MAX_ERROR_BYTES + 1)),
+            BoundaryError::internal(&"x".repeat(MAX_ERROR_BYTES + 1)),
             Err(ValidationError::InvalidErrorMessage)
         );
     }
