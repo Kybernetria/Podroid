@@ -59,6 +59,8 @@ class QemuEngine @Inject constructor(
     override val vmId: VmId = vmPaths.vmId
     private val _state = MutableStateFlow<VmState>(VmState.Idle)
     override val state: StateFlow<VmState> = _state.asStateFlow()
+    private val _quiescent = MutableStateFlow(true)
+    override val quiescent: StateFlow<Boolean> = _quiescent.asStateFlow()
 
     private val _consoleText = MutableStateFlow("")
     override val consoleText: StateFlow<String> = _consoleText.asStateFlow()
@@ -120,7 +122,7 @@ class QemuEngine @Inject constructor(
 
     private val qmpSocketPath: String get() = vmPaths.qmpSocket.absolutePath
 
-    override val qmpClient: QmpClient? by lazy { QmpClient(qmpSocketPath) }
+    override val qmpController: QmpController? by lazy { QmpClient(qmpSocketPath) }
 
     private var ioScope: CoroutineScope? = null
 
@@ -283,11 +285,13 @@ class QemuEngine @Inject constructor(
         // I/O, so two concurrent ACTION_STARTs can't both pass the guard and
         // launch a second QEMU. Held only across the guard + state flip.
         startMutex.withLock {
-            if (_state.value is VmState.Starting || _state.value is VmState.Running) {
-                Log.w(TAG, "start() called while VM is ${_state.value}, ignoring")
+            if (!_quiescent.value || _state.value is VmState.Starting || _state.value is VmState.Running) {
+                Log.w(TAG, "start() called before prior cleanup completed (${_state.value}), ignoring")
                 return
             }
             cleanedUp.set(false)
+            // Publish before disk/process/socket resources can be acquired.
+            _quiescent.value = false
             bootStartTime = System.currentTimeMillis()
             _stopping.value = false
             _state.value = VmState.Starting
@@ -301,6 +305,7 @@ class QemuEngine @Inject constructor(
             cleanedUp.set(true)
             bootStartTime = 0L
             _state.value = VmState.Error("QEMU binary not found.")
+            _quiescent.value = true
             return
         }
 
@@ -314,6 +319,7 @@ class QemuEngine @Inject constructor(
             cleanedUp.set(true)
             bootStartTime = 0L
             _state.value = VmState.Error(e.message ?: "Could not prepare the VM disk image.")
+            _quiescent.value = true
             return
         }
 
@@ -510,7 +516,7 @@ class QemuEngine @Inject constructor(
 
     override suspend fun addPortForward(rule: PortForwardRule) {
         if (_state.value !is VmState.Running) return
-        val qmp = qmpClient ?: return
+        val qmp = qmpController ?: return
         // QmpClient returns Result and never throws, so the failure lives INSIDE
         // the returned Result — unwrap it. getOrThrow rethrows so EngineHolder
         // records this rule as not-applied and retries on the next diff (a
@@ -523,7 +529,7 @@ class QemuEngine @Inject constructor(
 
     override suspend fun removePortForward(rule: PortForwardRule) {
         if (_state.value !is VmState.Running) return
-        val qmp = qmpClient ?: return
+        val qmp = qmpController ?: return
         qmp.removePortForward(rule.hostPort, rule.protocol, rule.loopbackOnly)
             .onFailure { Log.w(TAG, "QMP removePortForward failed for $rule", it) }
             .getOrThrow()
@@ -549,6 +555,9 @@ class QemuEngine @Inject constructor(
         _runningSinceMs = null
         qemuRuntimeSockets().forEach { it.delete() }
         _bootStage.value = ""
+        // Last cleanup write: terminal UI state may have changed earlier, but
+        // destructive manager operations are released only after this point.
+        _quiescent.value = true
     }
 
     private fun qemuRuntimeSockets(): List<File> = listOf(

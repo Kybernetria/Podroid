@@ -75,12 +75,20 @@ class PodroidApplication : Application() {
      * extraction and may be called again after an explicit installation remove;
      * missing assets are then restored through the same atomic NOFOLLOW path.
      */
-    suspend fun installVmAssets() = withContext(Dispatchers.IO) {
+    private suspend fun installVmAssets() = withContext(Dispatchers.IO) {
         assetInstallMutex.withLock { extractAssets() }
     }
 
-    /** Wait until any initial/reinstall extraction has released its file tree. */
-    suspend fun awaitVmAssetInstallerIdle() = assetInstallMutex.withLock { Unit }
+    /**
+     * Application-wide asset-tree lease used by VmManager. Initial extraction,
+     * retries, launch-time file reads, console reads, and removal all use this
+     * same mutex, so a queued extraction cannot overtake removal or launch.
+     */
+    internal suspend fun <T> withVmAssetTreeLease(
+        action: suspend (installAssets: suspend () -> Unit) -> T,
+    ): T = withContext(Dispatchers.IO) {
+        assetInstallMutex.withLock { action { extractAssets() } }
+    }
 
     // Android 14+ hides @SystemApi reflection lookups (returning NoSuchMethod
     // even via getDeclared*). Prefixes needing exemption:

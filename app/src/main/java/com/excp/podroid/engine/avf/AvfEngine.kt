@@ -22,7 +22,8 @@ import androidx.annotation.RequiresApi
 import com.excp.podroid.data.repository.PortForwardRule
 import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.engine.BootStageDetector
-import com.excp.podroid.engine.QmpClient
+import com.excp.podroid.engine.BoundedRunLog
+import com.excp.podroid.engine.QmpController
 import com.excp.podroid.engine.VmConfig
 import com.excp.podroid.engine.VmEngine
 import com.excp.podroid.engine.VmState
@@ -82,6 +83,7 @@ class AvfEngine @Inject constructor(
         // hung guest can never block the stop path; the caller proceeds to kill
         // the VM if no SYNCED ack arrives.
         private const val SYNC_TIMEOUT_MS = 8_000L
+        private const val FRAMEWORK_STOP_CALLBACK_TIMEOUT_MS = 5_000L
         // VirtualMachineCallback.STOP_REASON_REBOOT — a guest-requested reboot,
         // which during early boot is the MATCH_HOST topology crash (issue #29).
         private const val STOP_REASON_REBOOT = 5
@@ -89,6 +91,8 @@ class AvfEngine @Inject constructor(
 
     private val _state = MutableStateFlow<VmState>(VmState.Idle)
     override val state: StateFlow<VmState> = _state.asStateFlow()
+    private val _quiescent = MutableStateFlow(true)
+    override val quiescent: StateFlow<Boolean> = _quiescent.asStateFlow()
 
     private val _bootStage = MutableStateFlow("")
     override val bootStage: StateFlow<String> = _bootStage.asStateFlow()
@@ -115,8 +119,8 @@ class AvfEngine @Inject constructor(
 
     override val backendId: String = "avf"
 
-    /** AVF has no QMP socket; port forwarding is deferred to a future milestone. */
-    override val qmpClient: QmpClient? = null
+    /** AVF has no QMP socket. */
+    override val qmpController: QmpController? = null
 
     override var sessionClientDelegate: TerminalSessionClient? = null
 
@@ -168,6 +172,8 @@ class AvfEngine @Inject constructor(
      * user-initiated stop and never downgrades a clean Stopped to Error.
      */
     @Volatile private var stopRequested = false
+    /** Invalidates a graceful sync coroutine when forceStop preempts it. */
+    @Volatile private var stopSequence = 0L
     /** Runs cleanup() exactly once per VM lifetime (every terminal path routes through it). */
     private val cleanedUp = AtomicBoolean(true)
     /** Guards the StringBuilder mutated on the fanout pump thread vs cleared in start(). */
@@ -182,7 +188,7 @@ class AvfEngine @Inject constructor(
     // surfaced by the diagnostic exporter.
     private val consoleBuilder = StringBuilder()
     private val maxConsoleSize = 64 * 1024
-    private var logOut: java.io.FileOutputStream? = null
+    private var logOut: java.io.OutputStream? = null
     @Volatile private var control: VsockControlChannel? = null
     /** Live AVF Downloads share (9p over vsock); started in bringUpControlChannel(), torn down in cleanup(). */
     @Volatile private var downloadsShare: AvfDownloadsShare? = null
@@ -299,14 +305,17 @@ class AvfEngine @Inject constructor(
     override suspend fun start(portForwards: List<PortForwardRule>, config: VmConfig) {
         require(config.vmId == vmId) { "AVF engine ${vmId.serialized} cannot start ${config.vmId.serialized}" }
         startMutex.withLock {
-            if (_state.value is VmState.Running || _state.value is VmState.Starting) return
+            if (!_quiescent.value || _state.value is VmState.Running || _state.value is VmState.Starting) return
             // Remember the launch args so the adaptive multi-vCPU fallback (issue
             // #29) can re-launch with fewer cores after an early-boot reset WITHOUT
             // routing through a terminal state (Error/Stopped tears the foreground
             // service down — see PodroidService.observeStateForShutdown). Claim
             // Starting under the lock so a re-entrant start() is rejected.
             lastConfig = config
+            stopRequested = false
             synchronized(lastPortForwards) { lastPortForwards.clear(); lastPortForwards.addAll(portForwards) }
+            // Publish before AVF manager/config/stream resources can be acquired.
+            _quiescent.value = false
             _stopping.value = false
             _state.value = VmState.Starting
         }
@@ -327,8 +336,14 @@ class AvfEngine @Inject constructor(
         // prior VM is ignored, clear the user-stop flag, and arm cleanup() to run
         // once on this run's first terminal transition.
         val generation = ++vmGeneration
-        stopRequested = false
         cleanedUp.set(false)
+        _quiescent.value = false
+        // A stop that landed after adaptive cleanup but before this relaunch must
+        // not be erased. Abort before reacquiring AVF resources.
+        if (stopRequested) {
+            onVmTerminal(generation, VmState.Stopped)
+            return
+        }
         // Reset console capture from any prior run before we start emitting.
         // Guarded against the prior run's fanout pump still appending (a fast
         // Stop → Start can leave the old vm→bridge pump alive a moment).
@@ -372,7 +387,7 @@ class AvfEngine @Inject constructor(
             if (useExplicitCpuCount && !AvfReflect.installExplicitCpuCount(vm, attemptedCpus)) {
                 Log.w(TAG, "explicit vCPU hook unavailable at install time; " +
                     "relaunching on the nr_cpus fallback path")
-                cleanup()
+                cleanup(publishQuiescent = false)
                 launchAttempt(portForwards, config, bootMsg)
                 return
             }
@@ -437,7 +452,9 @@ class AvfEngine @Inject constructor(
             // reboot on Pixel 8a. Tee inside ConsoleFanout's vm→bridge pump.
             val logFile = vmPaths.consoleLog
             runCatching { logFile.delete() }
-            val log = runCatching { java.io.FileOutputStream(logFile, false) }
+            val log = runCatching {
+                BoundedRunLog(java.io.FileOutputStream(logFile, false))
+            }
                 .onFailure { Log.w(TAG, "console.log open failed (continuing without capture)", it) }
                 .getOrNull()
             logOut = log
@@ -579,7 +596,7 @@ class AvfEngine @Inject constructor(
                 .onFailure { Log.w(TAG, "persisting AVF cpu cap failed (continuing)", it) }
             // Free the dead VM's resources without a terminal transition: cleanup()
             // never touches _state, and launchAttempt re-arms cleanedUp.
-            cleanup()
+            cleanup(publishQuiescent = false)
             // A user Stop landing between the callback-thread check above and here
             // must win: cleanup() ran, so honour the stop instead of relaunching.
             if (stopRequested) {
@@ -624,57 +641,56 @@ class AvfEngine @Inject constructor(
     }
 
     override fun stop() {
-        // Mark the stop as user-initiated FIRST so any in-flight launchAttempt
-        // (which checks stopRequested before AvfReflect.run) and any resulting
-        // onStopped/onDied/onError is mapped to Stopped, never downgraded to
-        // Error. Set on the null-handle path too: a stop landing in the window
-        // between _state=Starting and vmHandle=vm must not let launchAttempt
-        // proceed to run() a VM the user already asked to stop.
         stopRequested = true
         val vm = vmHandle
         if (vm == null) {
-            // Nothing running (or already torn down, or start hasn't reached
-            // vmHandle assignment). Make sure state is terminal so
-            // EngineHolder.trySwap can release, then run the idempotent cleanup.
             onVmTerminal(vmGeneration, VmState.Stopped)
             return
         }
-        // A live VM will tear down asynchronously (sync flush + framework stop +
-        // terminal callback). Signal "shutting down" now; cleared in cleanup() on
-        // the →Stopped transition, or below if the framework rejects the stop.
         _stopping.value = true
         val generation = vmGeneration
+        val requestSequence = ++stopSequence
         scope.launch {
-            // Best-effort guest flush so unwritten ext4 data hits storage before
-            // we kill the VM. Bounded so a hung guest can't block the stop.
+            // Graceful only: forceStop deliberately bypasses this guest round-trip.
             runCatching { control?.syncAndWait(SYNC_TIMEOUT_MS) }
-            if (generation != vmGeneration || cleanedUp.get()) return@launch
-            // Surface (don't swallow) a framework stop() failure: if rejected the
-            // VM is still alive, and we must NOT null the handle.
-            val requested = runCatching { AvfReflect.stop(vm) }
-                .onFailure { Log.w(TAG, "AVF stop() request failed; VM may still be running", it) }
-                .isSuccess
-            if (!requested) {
-                // The framework rejected stop(): the VM is still live. Forcing
-                // Stopped + cleanup() here would null vmHandle, stranding an
-                // unkillable crosvm (see AvfReflect.stop contract). Surface an
-                // error and KEEP the handle so a later real callback, or a retry,
-                // can still reach the VM. Don't run the watchdog on this path.
-                if (generation == vmGeneration && !cleanedUp.get()) {
-                    // VM still alive (handle kept); clear "shutting down" so the UI
-                    // shows the error rather than a stuck spinner.
-                    _stopping.value = false
-                    _state.value = VmState.Error("AVF stop request rejected; VM may still be running")
-                }
-                return@launch
-            }
-            // Drive the final Stopped + cleanup from onStopped/onDied. If no
-            // terminal callback arrives, a bounded watchdog forces the transition
-            // so we never strand in Running.
-            kotlinx.coroutines.delay(5_000L)
+            if (generation != vmGeneration || requestSequence != stopSequence || cleanedUp.get()) return@launch
+            requestFrameworkStop(vm, generation)
+        }
+    }
+
+    /** Immediate AVF force path: no guest sync, directly request framework stop. */
+    override fun forceStop() {
+        stopRequested = true
+        ++stopSequence // invalidate any graceful guest-sync waiter immediately
+        val vm = vmHandle
+        if (vm == null) {
+            onVmTerminal(vmGeneration, VmState.Stopped)
+            return
+        }
+        _stopping.value = true
+        requestFrameworkStop(vm, vmGeneration)
+    }
+
+    private fun requestFrameworkStop(vm: Any, generation: Long) {
+        if (generation != vmGeneration || cleanedUp.get()) return
+        val requested = runCatching { AvfReflect.stop(vm) }
+            .onFailure { Log.w(TAG, "AVF framework stop request rejected; retaining live handle", it) }
+            .isSuccess
+        if (!requested) {
             if (generation == vmGeneration && !cleanedUp.get()) {
-                Log.w(TAG, "AVF stop: no terminal callback within timeout — forcing Stopped")
-                onVmTerminal(generation, VmState.Stopped)
+                _stopping.value = false
+                // Keep vmHandle and non-quiescent. A retry can request stop again,
+                // and a later real terminal callback must still run cleanup.
+                _state.value = VmState.Error("AVF stop request rejected; VM may still be running")
+            }
+            return
+        }
+        scope.launch {
+            kotlinx.coroutines.delay(FRAMEWORK_STOP_CALLBACK_TIMEOUT_MS)
+            if (generation == vmGeneration && !cleanedUp.get()) {
+                Log.w(TAG, "AVF stop callback timeout — retaining handle for retry")
+                _stopping.value = false
+                _state.value = VmState.Error("AVF stop callback timed out; cleanup is incomplete")
             }
         }
     }
@@ -801,23 +817,33 @@ class AvfEngine @Inject constructor(
      */
     @Synchronized
     private fun onVmTerminal(generation: Long, newState: VmState) {
-        if (generation != vmGeneration) {
-            Log.d(TAG, "ignoring stale VM callback (gen $generation != current $vmGeneration)")
-            return
+        when (AvfTerminalPolicy.decide(
+            generation, vmGeneration, _state.value, cleanedUp.get(),
+        )) {
+            AvfTerminalPolicy.Decision.IGNORE -> {
+                if (generation != vmGeneration) {
+                    Log.d(TAG, "ignoring stale VM callback (gen $generation != current $vmGeneration)")
+                }
+            }
+            AvfTerminalPolicy.Decision.CLEANUP_RETAIN_ERROR -> {
+                // Error may represent a rejected/timed-out stop while AVF still
+                // owns a live handle. This real callback is authoritative evidence
+                // that teardown happened; retain diagnostics but finish cleanup.
+                cleanup()
+            }
+            AvfTerminalPolicy.Decision.TRANSITION_AND_CLEANUP -> {
+                _state.value = if (stopRequested) VmState.Stopped else newState
+                cleanup()
+            }
         }
-        val current = _state.value
-        if (current is VmState.Stopped || current is VmState.Idle || current is VmState.Error) {
-            // Already terminal; don't let a trailing onError clobber a clean stop.
-            return
-        }
-        // A user-initiated stop already decided the outcome is Stopped; a late
-        // framework Error/exit for that same teardown must not downgrade it.
-        _state.value = if (stopRequested) VmState.Stopped else newState
-        cleanup()
     }
 
-    private fun cleanup() {
-        if (cleanedUp.getAndSet(true)) return
+    @Synchronized
+    private fun cleanup(publishQuiescent: Boolean = true) {
+        if (cleanedUp.getAndSet(true)) {
+            if (publishQuiescent) _quiescent.value = true
+            return
+        }
         _stopping.value = false
         _runningSinceMs = null
         bootTimeoutJob?.cancel()
@@ -865,6 +891,9 @@ class AvfEngine @Inject constructor(
         runCatching { terminalSession?.finishIfRunning() }
         terminalSession = null
         vmHandle = null
+        // Last cleanup write. Internal adaptive relaunches keep this false so no
+        // manager operation can enter between teardown and the replacement run.
+        if (publishQuiescent) _quiescent.value = true
     }
 
     /**

@@ -15,6 +15,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.withLock
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -54,7 +55,7 @@ class VmManagerTest {
         val active = AtomicInteger()
         var maxActive = 0
         var calls = 0
-        val installer = object : VmInstaller {
+        val installer = object : TestInstaller() {
             override suspend fun install(vmId: VmId) {
                 calls++
                 maxActive = maxOf(maxActive, active.incrementAndGet())
@@ -81,11 +82,14 @@ class VmManagerTest {
 
     @Test
     fun `installation fails closed while active`() = runBlocking {
-        val runtime = FakeRuntime().apply { state.value = VmState.Running }
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+        }
         var installCalls = 0
         val manager = manager(
             runtime = runtime,
-            installer = object : VmInstaller {
+            installer = object : TestInstaller() {
                 override suspend fun install(vmId: VmId) { installCalls++ }
             },
         )
@@ -111,9 +115,8 @@ class VmManagerTest {
 
         val first = async(Dispatchers.Default) { manager.start(VmId.DEFAULT) }
         startEntered.await()
-        val duplicate = async(Dispatchers.Default) { manager.start(VmId.DEFAULT) }
         first.await()
-        duplicate.await()
+        assertTrue(runCatching { manager.start(VmId.DEFAULT) }.exceptionOrNull() is IllegalStateException)
         releaseStart.complete(Unit)
 
         assertEquals(1, runtime.startCalls)
@@ -122,7 +125,9 @@ class VmManagerTest {
 
     @Test
     fun `start fails when backend returns without becoming active`() {
-        val runtime = FakeRuntime().apply { onStart = { state.value = VmState.Idle } }
+        val runtime = FakeRuntime().apply {
+            onStart = { state.value = VmState.Idle; quiescent.value = true }
+        }
         val manager = manager(runtime = runtime)
 
         expectFailure<IllegalStateException> {
@@ -141,8 +146,9 @@ class VmManagerTest {
     fun `graceful QEMU stop uses typed powerdown before bounded inherited escalation`() = runBlocking {
         val runtime = FakeRuntime().apply {
             state.value = VmState.Running
+            quiescent.value = false
             qmpAvailableValue = true
-            onStop = { state.value = VmState.Stopped }
+            onStop = { state.value = VmState.Stopped; quiescent.value = true }
         }
         val manager = manager(runtime = runtime, guestTimeoutMs = 20)
 
@@ -158,8 +164,9 @@ class VmManagerTest {
     fun `graceful powerdown completion avoids process stop escalation`() = runBlocking {
         val runtime = FakeRuntime().apply {
             state.value = VmState.Running
+            quiescent.value = false
             qmpAvailableValue = true
-            onPowerdown = { state.value = VmState.Stopped; Result.success(Unit) }
+            onPowerdown = { state.value = VmState.Stopped; quiescent.value = true; Result.success(Unit) }
         }
         val manager = manager(runtime = runtime)
 
@@ -172,7 +179,10 @@ class VmManagerTest {
 
     @Test
     fun `restart stops then starts under the lifecycle policy`() = runBlocking {
-        val runtime = FakeRuntime().apply { state.value = VmState.Running }
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+        }
         val manager = manager(runtime = runtime)
 
         manager.restart(VmId.DEFAULT)
@@ -184,7 +194,10 @@ class VmManagerTest {
 
     @Test
     fun `duplicate restart while replacement is starting is idempotent`() = runBlocking {
-        val runtime = FakeRuntime().apply { state.value = VmState.Starting }
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Starting
+            quiescent.value = false
+        }
         val manager = manager(runtime = runtime)
 
         manager.restart(VmId.DEFAULT)
@@ -195,7 +208,10 @@ class VmManagerTest {
 
     @Test
     fun `force stop is distinct and duplicate force stop is idempotent`() = runBlocking {
-        val runtime = FakeRuntime().apply { state.value = VmState.Running }
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+        }
         val manager = manager(runtime = runtime)
 
         manager.forceStop(VmId.DEFAULT)
@@ -207,7 +223,10 @@ class VmManagerTest {
 
     @Test
     fun `remove fails while active and forwards only explicit data policy`() = runBlocking {
-        val runtime = FakeRuntime().apply { state.value = VmState.Running }
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+        }
         val files = FakeFiles()
         val manager = manager(runtime = runtime, files = files)
 
@@ -217,6 +236,7 @@ class VmManagerTest {
         assertTrue(files.removePolicies.isEmpty())
 
         runtime.state.value = VmState.Stopped
+        runtime.quiescent.value = true
         manager.remove(VmId.DEFAULT, VmRemovePolicy.PRESERVE_DATA)
         manager.remove(VmId.DEFAULT, VmRemovePolicy.DELETE_DATA)
         assertEquals(
@@ -229,6 +249,7 @@ class VmManagerTest {
     fun `typed QMP allowlist maps status and version and rejects unavailable backend`() = runBlocking {
         val runtime = FakeRuntime().apply {
             state.value = VmState.Running
+            quiescent.value = false
             qmpAvailableValue = true
         }
         val manager = manager(runtime = runtime)
@@ -255,6 +276,7 @@ class VmManagerTest {
         assertNull(stopped.endpoint)
 
         runtime.state.value = VmState.Running
+        runtime.quiescent.value = false
         val running = manager.discoverSshEndpoint(VmId.DEFAULT)
         assertEquals(SshEndpoint("127.0.0.1", 9922), running.endpoint)
         assertTrue(running.reachable)
@@ -264,6 +286,119 @@ class VmManagerTest {
         assertFalse(disabled.enabled)
         assertFalse(disabled.reachable)
         assertNull(disabled.endpoint)
+    }
+
+    @Test
+    fun `error is not safe and destructive operations reject until cleanup completes`() = runBlocking {
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Error("stop rejected")
+            quiescent.value = false
+        }
+        val files = FakeFiles()
+        var installs = 0
+        val manager = manager(
+            runtime = runtime,
+            files = files,
+            installer = object : TestInstaller() {
+                override suspend fun install(vmId: VmId) { installs++; files.installed = true }
+            },
+        )
+
+        assertTrue(runCatching { manager.start(VmId.DEFAULT) }.exceptionOrNull() is IllegalStateException)
+        assertTrue(runCatching { manager.ensureInstalled(VmId.DEFAULT) }.exceptionOrNull() is IllegalStateException)
+        assertTrue(runCatching {
+            manager.remove(VmId.DEFAULT, VmRemovePolicy.PRESERVE_DATA)
+        }.exceptionOrNull() is IllegalStateException)
+        assertEquals(0, installs)
+        assertTrue(files.removePolicies.isEmpty())
+
+        runtime.quiescent.value = true
+        manager.remove(VmId.DEFAULT, VmRemovePolicy.PRESERVE_DATA)
+        assertEquals(listOf(VmRemovePolicy.PRESERVE_DATA), files.removePolicies)
+    }
+
+    @Test
+    fun `force stop preempts graceful wait and both callers share one operation`() = runBlocking {
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+            qmpAvailableValue = true
+        }
+        val manager = manager(runtime = runtime, guestTimeoutMs = 1_000)
+
+        val graceful = async(Dispatchers.Default) { manager.stop(VmId.DEFAULT) }
+        while (runtime.powerdownCalls == 0) delay(5)
+        val forced = async(Dispatchers.Default) { manager.forceStop(VmId.DEFAULT) }
+        forced.await()
+        graceful.await()
+
+        assertEquals(1, runtime.powerdownCalls)
+        assertEquals(0, runtime.stopCalls)
+        assertEquals(1, runtime.forceStopCalls)
+        assertTrue(runtime.quiescent.value)
+    }
+
+    @Test
+    fun `rejected force remains non-quiescent and a later retry can clean up`() = runBlocking {
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+            onForceStop = { state.value = VmState.Error("AVF rejected") }
+        }
+        val manager = manager(runtime = runtime)
+
+        assertTrue(runCatching { manager.forceStop(VmId.DEFAULT) }.exceptionOrNull() is IllegalStateException)
+        assertFalse(runtime.quiescent.value)
+        runtime.onForceStop = { runtime.quiescent.value = true }
+        manager.forceStop(VmId.DEFAULT)
+
+        assertEquals(2, runtime.forceStopCalls)
+        assertTrue(runtime.quiescent.value)
+    }
+
+    @Test
+    fun `initial extraction and exclusive lease order removal after queued install`() = runBlocking {
+        val files = FakeFiles(installed = false)
+        val initial = CompletableDeferred<Unit>()
+        val installEntered = CompletableDeferred<Unit>()
+        val releaseInstall = CompletableDeferred<Unit>()
+        val treeMutex = kotlinx.coroutines.sync.Mutex()
+        val events = mutableListOf<String>()
+        val installer = object : VmInstaller {
+            override suspend fun awaitInitial(vmId: VmId) { initial.await() }
+            override suspend fun <T> withExclusiveTree(
+                vmId: VmId,
+                action: suspend (VmAssetTreeLease) -> T,
+            ): T = treeMutex.withLock {
+                events += "lease"
+                action(object : VmAssetTreeLease {
+                    override suspend fun install(vmId: VmId) {
+                        events += "install"
+                        installEntered.complete(Unit)
+                        releaseInstall.await()
+                        files.installed = true
+                    }
+                })
+            }
+        }
+        val manager = manager(files = files, installer = installer)
+
+        val install = async(Dispatchers.Default) { manager.ensureInstalled(VmId.DEFAULT) }
+        delay(30)
+        assertTrue(events.isEmpty())
+        initial.complete(Unit)
+        installEntered.await()
+        val remove = async(Dispatchers.Default) {
+            manager.remove(VmId.DEFAULT, VmRemovePolicy.PRESERVE_DATA)
+            events += "remove"
+        }
+        delay(30)
+        assertTrue(files.removePolicies.isEmpty())
+        releaseInstall.complete(Unit)
+        install.await()
+        remove.await()
+
+        assertEquals(listOf("lease", "install", "lease", "remove"), events)
     }
 
     @Test
@@ -333,7 +468,9 @@ class VmManagerTest {
     private fun manager(
         runtime: FakeRuntime = FakeRuntime(),
         files: FakeFiles = FakeFiles(),
-        installer: VmInstaller = object : VmInstaller { override suspend fun install(vmId: VmId) { files.installed = true } },
+        installer: VmInstaller = object : TestInstaller() {
+            override suspend fun install(vmId: VmId) { files.installed = true }
+        },
         configuration: FakeConfiguration = FakeConfiguration(),
         guestTimeoutMs: Long = 50,
     ): DefaultVmManager {
@@ -352,9 +489,21 @@ class VmManagerTest {
         )
     }
 
+    private abstract class TestInstaller : VmInstaller {
+        override suspend fun awaitInitial(vmId: VmId) = Unit
+        abstract suspend fun install(vmId: VmId)
+        override suspend fun <T> withExclusiveTree(
+            vmId: VmId,
+            action: suspend (VmAssetTreeLease) -> T,
+        ): T = action(object : VmAssetTreeLease {
+            override suspend fun install(vmId: VmId) = this@TestInstaller.install(vmId)
+        })
+    }
+
     private class FakeRuntime : ManagedVmRuntime {
         override val vmId = VmId.DEFAULT
         override val state = MutableStateFlow<VmState>(VmState.Idle)
+        override val quiescent = MutableStateFlow(true)
         override val backendId = "qemu"
         var qmpAvailableValue = false
         override val qmpAvailable: Boolean get() = qmpAvailableValue
@@ -366,17 +515,25 @@ class VmManagerTest {
         var maxConcurrentStarts = 0
         val qmpOperations = mutableListOf<VmQmpOperation>()
         var onStart: suspend () -> Unit = { state.value = VmState.Running }
-        var onStop: () -> Unit = { state.value = VmState.Stopped }
+        var onStop: () -> Unit = { state.value = VmState.Stopped; quiescent.value = true }
         var onPowerdown: suspend () -> Result<Unit> = { Result.success(Unit) }
+        var onForceStop: () -> Unit = {
+            state.value = VmState.Stopped
+            quiescent.value = true
+        }
 
         override suspend fun start(plan: VmLaunchPlan) {
+            quiescent.value = false
             startCalls++
             concurrentStarts++
             maxConcurrentStarts = maxOf(maxConcurrentStarts, concurrentStarts)
             try { onStart() } finally { concurrentStarts-- }
         }
         override fun stop() { stopCalls++; onStop() }
-        override fun forceStop() { forceStopCalls++; state.value = VmState.Stopped }
+        override fun forceStop() {
+            forceStopCalls++
+            onForceStop()
+        }
         override suspend fun systemPowerdown(): Result<Unit> { powerdownCalls++; return onPowerdown() }
         override suspend fun executeQmp(operation: VmQmpOperation): Result<VmQmpResult> {
             qmpOperations.add(operation)

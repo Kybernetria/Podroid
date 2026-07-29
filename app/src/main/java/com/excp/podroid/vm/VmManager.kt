@@ -5,7 +5,7 @@
 package com.excp.podroid.vm
 
 import com.excp.podroid.data.repository.PortForwardRule
-import com.excp.podroid.engine.QmpClient
+import com.excp.podroid.engine.QmpController
 import com.excp.podroid.engine.VmConfig
 import com.excp.podroid.engine.VmEngine
 import com.excp.podroid.engine.VmState
@@ -18,6 +18,7 @@ import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.ArrayDeque
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
@@ -26,6 +27,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -116,6 +118,7 @@ internal data class VmLaunchPlan(
 internal interface ManagedVmRuntime {
     val vmId: VmId
     val state: StateFlow<VmState>
+    val quiescent: StateFlow<Boolean>
     val backendId: String
     val qmpAvailable: Boolean
     suspend fun start(plan: VmLaunchPlan)
@@ -125,9 +128,19 @@ internal interface ManagedVmRuntime {
     suspend fun executeQmp(operation: VmQmpOperation): Result<VmQmpResult>
 }
 
-internal interface VmInstaller {
+internal interface VmAssetTreeLease {
     suspend fun install(vmId: VmId)
-    suspend fun awaitIdle(vmId: VmId) = Unit
+}
+
+internal interface VmInstaller {
+    /** One authoritative initial extraction result; failure is sticky and fail-closed. */
+    suspend fun awaitInitial(vmId: VmId)
+
+    /** Exclusive application-wide lease shared by extraction, launch reads, and removal. */
+    suspend fun <T> withExclusiveTree(
+        vmId: VmId,
+        action: suspend (VmAssetTreeLease) -> T,
+    ): T
 }
 
 internal interface VmConfigurationSource {
@@ -150,12 +163,14 @@ class DefaultVmManager internal constructor(
     private val scope: CoroutineScope,
     private val startAcceptanceTimeoutMs: Long = 5_000L,
     private val guestShutdownTimeoutMs: Long = 5_000L,
-    private val backendStopTimeoutMs: Long = 10_000L,
-    private val forceStopTimeoutMs: Long = 2_000L,
+    private val backendStopTimeoutMs: Long = 15_000L,
+    private val forceStopTimeoutMs: Long = 7_000L,
     private val qmpTimeoutMs: Long = 5_000L,
 ) : VmManager {
     private val lifecycleMutex = Mutex()
-    @Volatile private var startTask: Deferred<Unit>? = null
+    private val stopTaskMutex = Mutex()
+    @Volatile private var stopTask: Deferred<Unit>? = null
+    @Volatile private var stopForceSignal: CompletableDeferred<Unit>? = null
     private var installationEnsured = false
     private val launchPending = MutableStateFlow(false)
 
@@ -174,15 +189,13 @@ class DefaultVmManager internal constructor(
         return lifecycleFlow
     }
 
-    override suspend fun list(vmId: VmId): List<VmSummary> {
-        requireDefault(vmId)
-        return listOf(VmSummary(vmId, files.isInstalled(vmId), effectiveLifecycle(runtime.state.value, launchPending.value)))
+    override suspend fun list(vmId: VmId): List<VmSummary> = withTree(vmId) {
+        listOf(VmSummary(vmId, files.isInstalled(vmId), effectiveLifecycle(runtime.state.value, launchPending.value)))
     }
 
-    override suspend fun status(vmId: VmId): VmStatus {
-        requireDefault(vmId)
+    override suspend fun status(vmId: VmId): VmStatus = withTree(vmId) {
         val state = runtime.state.value
-        return VmStatus(
+        VmStatus(
             vmId = vmId,
             installed = files.isInstalled(vmId),
             lifecycle = effectiveLifecycle(state, launchPending.value),
@@ -191,57 +204,66 @@ class DefaultVmManager internal constructor(
         )
     }
 
-    override suspend fun ensureInstalled(vmId: VmId) = lifecycleMutex.withLock {
-        requireDefault(vmId)
-        check(!isActive()) { "Cannot install while VM '${vmId.serialized}' is active" }
-        ensureInstalledLocked(vmId)
+    override suspend fun ensureInstalled(vmId: VmId) {
+        awaitInitial(vmId)
+        lifecycleMutex.withLock {
+            check(runtime.quiescent.value) { "Cannot install while VM cleanup is incomplete" }
+            installer.withExclusiveTree(vmId) { lease -> ensureInstalledLocked(vmId, lease) }
+        }
     }
 
-    override suspend fun start(vmId: VmId) = lifecycleMutex.withLock {
-        requireDefault(vmId)
-        if (isActive()) return@withLock
-        ensureInstalledLocked(vmId)
-        startLocked(vmId)
+    override suspend fun start(vmId: VmId) {
+        awaitInitial(vmId)
+        lifecycleMutex.withLock {
+            check(runtime.quiescent.value) { "Cannot start while previous VM cleanup is incomplete" }
+            installer.withExclusiveTree(vmId) { lease ->
+                ensureInstalledLocked(vmId, lease)
+                startLocked(vmId)
+            }
+        }
     }
 
-    override suspend fun stop(vmId: VmId) = lifecycleMutex.withLock {
-        requireDefault(vmId)
-        if (!isActive()) return@withLock
-        gracefulStopLocked()
+    override suspend fun stop(vmId: VmId) {
+        awaitInitial(vmId)
+        requestStop(force = false).await()
     }
 
-    override suspend fun forceStop(vmId: VmId) = lifecycleMutex.withLock {
-        requireDefault(vmId)
-        if (!isActive()) return@withLock
-        runtime.forceStop()
-        check(awaitTerminal(forceStopTimeoutMs)) { "VM did not reach a terminal state after force stop" }
+    override suspend fun forceStop(vmId: VmId) {
+        awaitInitial(vmId)
+        requestStop(force = true).await()
     }
 
-    override suspend fun restart(vmId: VmId) = lifecycleMutex.withLock {
-        requireDefault(vmId)
-        // A duplicate restart delivered while the replacement is still starting
-        // is already satisfied by that in-flight replacement.
-        if (runtime.state.value is VmState.Starting) return@withLock
-        if (isActive()) gracefulStopLocked()
-        ensureInstalledLocked(vmId)
-        startLocked(vmId)
+    override suspend fun restart(vmId: VmId) {
+        awaitInitial(vmId)
+        // Duplicate delivery while the replacement boot is already in progress
+        // is satisfied by that in-flight replacement; do not stop it again.
+        if (runtime.state.value is VmState.Starting && !runtime.quiescent.value) return
+        requestStop(force = false).await()
+        lifecycleMutex.withLock {
+            check(runtime.quiescent.value) { "Cannot restart while VM cleanup is incomplete" }
+            installer.withExclusiveTree(vmId) { lease ->
+                ensureInstalledLocked(vmId, lease)
+                startLocked(vmId)
+            }
+        }
     }
 
-    override suspend fun remove(vmId: VmId, policy: VmRemovePolicy) = lifecycleMutex.withLock {
-        requireDefault(vmId)
-        check(!isActive()) { "Cannot remove VM '${vmId.serialized}' while active" }
-        installer.awaitIdle(vmId)
-        files.remove(vmId, policy)
-        installationEnsured = false
+    override suspend fun remove(vmId: VmId, policy: VmRemovePolicy) {
+        awaitInitial(vmId)
+        lifecycleMutex.withLock {
+            check(runtime.quiescent.value) { "Cannot remove VM while backend cleanup is incomplete" }
+            installer.withExclusiveTree(vmId) {
+                files.remove(vmId, policy)
+                installationEnsured = false
+            }
+        }
     }
 
-    override suspend fun readConsoleLog(vmId: VmId, request: ConsoleLogRequest): ConsoleLog {
-        requireDefault(vmId)
-        return files.readConsole(vmId, request)
-    }
+    override suspend fun readConsoleLog(vmId: VmId, request: ConsoleLogRequest): ConsoleLog =
+        withTree(vmId) { files.readConsole(vmId, request) }
 
     override suspend fun executeQmp(vmId: VmId, operation: VmQmpOperation): VmQmpResult {
-        requireDefault(vmId)
+        awaitInitial(vmId)
         check(runtime.state.value is VmState.Running) { "QMP requires a running VM" }
         check(runtime.qmpAvailable) { "QMP is unavailable for backend '${runtime.backendId}'" }
         return withTimeoutOrNull(qmpTimeoutMs) { runtime.executeQmp(operation).getOrThrow() }
@@ -249,9 +271,9 @@ class DefaultVmManager internal constructor(
     }
 
     override suspend fun discoverSshEndpoint(vmId: VmId): SshEndpointDiscovery {
-        requireDefault(vmId)
+        awaitInitial(vmId)
         val enabled = configuration.sshEnabled(vmId)
-        val reachable = enabled && runtime.state.value is VmState.Running
+        val reachable = enabled && runtime.state.value is VmState.Running && !runtime.quiescent.value
         return SshEndpointDiscovery(
             enabled = enabled,
             reachable = reachable,
@@ -259,11 +281,9 @@ class DefaultVmManager internal constructor(
         )
     }
 
-    private suspend fun ensureInstalledLocked(vmId: VmId) {
+    private suspend fun ensureInstalledLocked(vmId: VmId, lease: VmAssetTreeLease) {
         if (installationEnsured && files.isInstalled(vmId)) return
-        // Always cross the installer seam once per manager lifetime so an app
-        // upgrade cannot launch old assets while initial extraction is in flight.
-        installer.install(vmId)
+        lease.install(vmId)
         check(files.isInstalled(vmId)) { "VM installer completed without a valid installation" }
         installationEnsured = true
     }
@@ -274,7 +294,6 @@ class DefaultVmManager internal constructor(
             val plan = configuration.launchPlan(vmId)
             require(plan.config.vmId == vmId) { "Launch plan VM id mismatch" }
             val task = scope.async { runtime.start(plan) }
-            startTask = task
 
             val accepted = withTimeoutOrNull(startAcceptanceTimeoutMs) {
                 while (!isRuntimeActive() && runtime.state.value !is VmState.Error && !task.isCompleted) {
@@ -285,6 +304,9 @@ class DefaultVmManager internal constructor(
             if (!accepted) {
                 task.cancel()
                 runtime.forceStop()
+                // Keep the start deadline bounded, but give the backend's force
+                // behavior its documented cleanup window before returning.
+                awaitQuiescence(forceStopTimeoutMs)
                 throw IOException("VM start was not accepted within ${startAcceptanceTimeoutMs}ms")
             }
             if (task.isCompleted) task.await()
@@ -305,34 +327,91 @@ class DefaultVmManager internal constructor(
         }
     }
 
-    private suspend fun gracefulStopLocked() {
-        val qmpRequested = if (runtime.state.value is VmState.Running && runtime.qmpAvailable) {
-            withTimeoutOrNull(qmpTimeoutMs) { runtime.systemPowerdown().isSuccess } == true
+    private suspend fun requestStop(force: Boolean): Deferred<Unit> = stopTaskMutex.withLock {
+        val existing = stopTask
+        if (existing != null && existing.isActive) {
+            if (force) stopForceSignal?.complete(Unit)
+            return@withLock existing
+        }
+        val forceSignal = CompletableDeferred<Unit>()
+        if (force) forceSignal.complete(Unit)
+        stopForceSignal = forceSignal
+        scope.async {
+            lifecycleMutex.withLock { coordinatedStopLocked(forceSignal) }
+        }.also { stopTask = it }
+    }
+
+    private suspend fun coordinatedStopLocked(forceSignal: CompletableDeferred<Unit>) {
+        if (runtime.quiescent.value) return
+        if (forceSignal.isCompleted) {
+            forceAndAwaitQuiescence()
+            return
+        }
+
+        val powerdown = if (runtime.state.value is VmState.Running && runtime.qmpAvailable) {
+            val task = scope.async { runtime.systemPowerdown().isSuccess }
+            val completed = withTimeoutOrNull(qmpTimeoutMs) {
+                while (!task.isCompleted && !forceSignal.isCompleted) delay(STOP_POLL_MS)
+                !forceSignal.isCompleted
+            } == true
+            if (!completed) task.cancel()
+            if (forceSignal.isCompleted) {
+                forceAndAwaitQuiescence()
+                return
+            }
+            if (task.isCompleted) runCatching { task.await() }.getOrDefault(false) else false
         } else {
             false
         }
-        if (qmpRequested && awaitTerminal(guestShutdownTimeoutMs)) return
+        if (powerdown) {
+            when (awaitQuiescenceOrForce(guestShutdownTimeoutMs, forceSignal)) {
+                StopWait.QUIESCENT -> return
+                StopWait.FORCE -> { forceAndAwaitQuiescence(); return }
+                StopWait.TIMEOUT -> Unit
+            }
+        }
 
-        // Preserve the inherited backend stop path: QEMU sends SIGTERM and has
-        // its own bounded escalation; AVF performs its bounded guest sync first.
         runtime.stop()
-        if (awaitTerminal(backendStopTimeoutMs)) return
+        when (awaitQuiescenceOrForce(backendStopTimeoutMs, forceSignal)) {
+            StopWait.QUIESCENT -> return
+            StopWait.FORCE -> { forceAndAwaitQuiescence(); return }
+            StopWait.TIMEOUT -> Unit
+        }
+        forceAndAwaitQuiescence()
+    }
 
-        // QEMU is a real immediate hard kill. AVF intentionally maps this back to
-        // its safe framework stop because no distinct hard-kill API is available.
+    private suspend fun forceAndAwaitQuiescence() {
         runtime.forceStop()
-        check(awaitTerminal(forceStopTimeoutMs)) { "VM did not stop within the bounded escalation window" }
+        check(awaitQuiescence(forceStopTimeoutMs)) {
+            "VM backend cleanup did not complete within the force-stop deadline"
+        }
     }
 
-    private suspend fun awaitTerminal(timeoutMs: Long): Boolean {
-        if (!isRuntimeActive()) return true
+    private suspend fun awaitQuiescenceOrForce(
+        timeoutMs: Long,
+        forceSignal: CompletableDeferred<Unit>,
+    ): StopWait {
+        if (runtime.quiescent.value) return StopWait.QUIESCENT
         return withTimeoutOrNull(timeoutMs) {
-            while (isRuntimeActive()) delay(10L)
-            true
-        } == true
+            while (!runtime.quiescent.value && !forceSignal.isCompleted) delay(STOP_POLL_MS)
+            if (runtime.quiescent.value) StopWait.QUIESCENT else StopWait.FORCE
+        } ?: StopWait.TIMEOUT
     }
 
-    private fun isActive(): Boolean = launchPending.value || isRuntimeActive() || startTask?.isActive == true
+    private suspend fun awaitQuiescence(timeoutMs: Long): Boolean {
+        if (runtime.quiescent.value) return true
+        return withTimeoutOrNull(timeoutMs) { runtime.quiescent.first { it }; true } == true
+    }
+
+    private suspend fun awaitInitial(vmId: VmId) {
+        requireDefault(vmId)
+        installer.awaitInitial(vmId)
+    }
+
+    private suspend fun <T> withTree(vmId: VmId, action: suspend () -> T): T {
+        awaitInitial(vmId)
+        return installer.withExclusiveTree(vmId) { action() }
+    }
 
     private fun isRuntimeActive(): Boolean = when (runtime.state.value) {
         is VmState.Starting, is VmState.Running -> true
@@ -343,9 +422,12 @@ class DefaultVmManager internal constructor(
         require(vmId == VmId.DEFAULT) { "Only the default VM is supported" }
     }
 
+    private enum class StopWait { QUIESCENT, FORCE, TIMEOUT }
+
     companion object {
         const val SSH_HOST_PORT = 9922
         const val SSH_HOST = "127.0.0.1"
+        private const val STOP_POLL_MS = 10L
 
         internal fun mapLifecycle(state: VmState): VmLifecycleState = when (state) {
             is VmState.Idle -> VmLifecycleState.IDLE
@@ -368,17 +450,18 @@ class DefaultVmManager internal constructor(
 internal class EngineManagedVmRuntime(private val engine: VmEngine) : ManagedVmRuntime {
     override val vmId: VmId get() = engine.vmId
     override val state: StateFlow<VmState> get() = engine.state
+    override val quiescent: StateFlow<Boolean> get() = engine.quiescent
     override val backendId: String get() = engine.backendId
-    override val qmpAvailable: Boolean get() = engine.qmpClient != null
+    override val qmpAvailable: Boolean get() = engine.qmpController != null
 
     override suspend fun start(plan: VmLaunchPlan) = engine.start(plan.portForwards, plan.config)
     override fun stop() = engine.stop()
     override fun forceStop() = engine.forceStop()
     override suspend fun systemPowerdown(): Result<Unit> =
-        engine.qmpClient?.systemPowerdown() ?: Result.failure(UnsupportedOperationException("QMP unavailable"))
+        engine.qmpController?.systemPowerdown() ?: Result.failure(UnsupportedOperationException("QMP unavailable"))
 
     override suspend fun executeQmp(operation: VmQmpOperation): Result<VmQmpResult> {
-        val qmp: QmpClient = engine.qmpClient
+        val qmp: QmpController = engine.qmpController
             ?: return Result.failure(UnsupportedOperationException("QMP unavailable"))
         return when (operation) {
             VmQmpOperation.QueryStatus -> qmp.queryStatus().mapCatching {
@@ -396,7 +479,13 @@ internal class EngineManagedVmRuntime(private val engine: VmEngine) : ManagedVmR
     }
 }
 
-/** Bounded NOFOLLOW installation/removal/log access over the authoritative VmPaths. */
+/**
+ * Bounded NOFOLLOW installation/removal/log access over authoritative VmPaths.
+ * Manager calls hold the application asset-tree lease, and descriptor/path
+ * identity is revalidated around reads/deletes. A same-UID arbitrary-code
+ * compromise is explicitly outside this file-manager boundary: such code
+ * already has direct read/write access to the complete app-private filesDir.
+ */
 internal class VmPathFiles(private val paths: VmPaths) : VmFiles {
     private val instanceRoot = paths.instanceDirectory.toPath().toAbsolutePath().normalize()
     private val runtimeEndpoints = setOf(
@@ -418,16 +507,24 @@ internal class VmPathFiles(private val paths: VmPaths) : VmFiles {
     override fun remove(vmId: VmId, policy: VmRemovePolicy) {
         requireVm(vmId)
         if (!instanceExistsSafely()) return
+        val rootIdentity = attrs(instanceRoot)
         val storage = paths.storageImage.toPath().toAbsolutePath().normalize()
         if (exists(storage) && !regular(storage)) {
             throw IOException("Persistent storage is not a regular no-follow file")
         }
         val entries = scanForRemoval()
         for (entry in entries) {
-            if (policy == VmRemovePolicy.PRESERVE_DATA && entry == storage) continue
-            Files.delete(entry)
+            if (policy == VmRemovePolicy.PRESERVE_DATA && entry.path == storage) continue
+            revalidateForDeletion(entry)
+            Files.delete(entry.path)
         }
-        if (policy == VmRemovePolicy.DELETE_DATA || !exists(storage)) Files.delete(instanceRoot)
+        if (policy == VmRemovePolicy.DELETE_DATA || !exists(storage)) {
+            requireSameIdentity(instanceRoot, rootIdentity, attrs(instanceRoot))
+            Files.newDirectoryStream(instanceRoot).use { stream ->
+                if (stream.iterator().hasNext()) throw IOException("VM root changed during removal")
+            }
+            Files.delete(instanceRoot)
+        }
         VmPathSecurity.forceDirectory(paths.instancesDirectory.toPath())
     }
 
@@ -438,16 +535,25 @@ internal class VmPathFiles(private val paths: VmPaths) : VmFiles {
         if (!exists(log)) return ConsoleLog("", 0, 0, false)
         if (!regular(log)) throw IOException("Console log is not a regular no-follow file")
 
-        val length = Files.size(log)
-        val bytesToRead = minOf(length, request.maxBytes.toLong()).toInt()
-        val bytes = ByteArray(bytesToRead)
+        val beforeOpen = attrs(log)
+        val bytes: ByteArray
+        val length: Long
         FileChannel.open(log, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS).use { channel ->
+            val afterOpen = attrs(log)
+            requireSameIdentity(log, beforeOpen, afterOpen)
+            // channel.size() is descriptor-relative: it proves the bounded read
+            // below uses the same open file that was identity-checked at the path.
+            length = channel.size()
+            val bytesToRead = minOf(length, request.maxBytes.toLong()).toInt()
+            bytes = ByteArray(bytesToRead)
             channel.position(length - bytesToRead)
             val buffer = ByteBuffer.wrap(bytes)
             while (buffer.hasRemaining()) {
                 if (channel.read(buffer) < 0) throw IOException("Console log changed during bounded read")
             }
+            requireSameIdentity(log, afterOpen, attrs(log))
         }
+        val bytesToRead = bytes.size
         var text = bytes.toString(Charsets.UTF_8)
         var truncated = length > bytesToRead
         if (length > bytesToRead) {
@@ -470,9 +576,11 @@ internal class VmPathFiles(private val paths: VmPaths) : VmFiles {
         return ConsoleLog(text, text.toByteArray(Charsets.UTF_8).size, lineCount, truncated)
     }
 
-    private fun scanForRemoval(): List<Path> {
+    private data class RemovalEntry(val path: Path, val attributes: BasicFileAttributes)
+
+    private fun scanForRemoval(): List<RemovalEntry> {
         var count = 0
-        val result = ArrayList<Path>()
+        val result = ArrayList<RemovalEntry>()
         val pending = ArrayDeque<Pair<Path, Int>>()
         pending.add(instanceRoot to 0)
         while (pending.isNotEmpty()) {
@@ -496,11 +604,46 @@ internal class VmPathFiles(private val paths: VmPaths) : VmFiles {
                         entry in runtimeEndpoints -> Unit
                         else -> throw IOException("Special file rejected during VM removal: $entry")
                     }
-                    result.add(entry)
+                    result.add(RemovalEntry(entry, attrs))
                 }
             }
         }
-        return result.sortedByDescending { it.nameCount }
+        return result.sortedByDescending { it.path.nameCount }
+    }
+
+    private fun revalidateForDeletion(entry: RemovalEntry) {
+        val current = attrs(entry.path)
+        requireSameIdentity(entry.path, entry.attributes, current)
+        if (current.isRegularFile) {
+            FileChannel.open(entry.path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS).use { channel ->
+                requireSameIdentity(entry.path, current, attrs(entry.path))
+                if (channel.size() != current.size()) {
+                    throw IOException("VM removal file changed after descriptor open: ${entry.path}")
+                }
+            }
+        } else if (current.isDirectory) {
+            Files.newDirectoryStream(entry.path).use { stream ->
+                if (stream.iterator().hasNext()) throw IOException("VM removal directory changed after scan: ${entry.path}")
+            }
+        }
+    }
+
+    private fun requireSameIdentity(
+        path: Path,
+        expected: BasicFileAttributes,
+        actual: BasicFileAttributes,
+    ) {
+        val expectedKey = expected.fileKey()
+        val actualKey = actual.fileKey()
+        val same = if (expectedKey != null && actualKey != null) {
+            expectedKey == actualKey
+        } else {
+            expected.creationTime() == actual.creationTime() &&
+                expected.isDirectory == actual.isDirectory &&
+                expected.isRegularFile == actual.isRegularFile &&
+                expected.isOther == actual.isOther
+        }
+        if (!same) throw IOException("VM path identity changed during operation: $path")
     }
 
     private fun instanceExistsSafely(): Boolean {

@@ -26,6 +26,15 @@ interface VmEngine {
     val vmId: VmId
 
     val state: StateFlow<VmState>
+
+    /**
+     * Authoritative backend resource-lifetime signal. False is published before
+     * a launch can acquire resources; true is published only after every handle,
+     * stream, socket, worker, and process owned by that run has been released.
+     * A terminal [state], including Error, does not imply quiescence.
+     */
+    val quiescent: StateFlow<Boolean>
+
     val bootStage: StateFlow<String>
     val consoleText: StateFlow<String>
 
@@ -56,8 +65,8 @@ interface VmEngine {
     /** Emulator process PID on the Android host; null when not tracked (e.g. AVF). */
     fun emulatorPid(): Int? = null
 
-    /** QEMU-specific. Null on backends that don't use QMP (e.g. AVF). */
-    val qmpClient: QmpClient?
+    /** Typed QEMU control surface. Null on backends that do not use QMP. */
+    val qmpController: QmpController?
 
     /**
      * Open a guest -> Android host-bridge connection for the current session, or
@@ -75,11 +84,7 @@ interface VmEngine {
     suspend fun start(portForwards: List<PortForwardRule>, config: VmConfig)
     fun stop()
 
-    /**
-     * Immediately terminate the backend when it supports a distinct force path.
-     * AVF deliberately inherits [stop] because the framework exposes no safer
-     * hard-kill primitive; QEMU overrides this with Process.destroyForcibly().
-     */
+    /** Immediately request backend termination without guest-side preparation. */
     fun forceStop() = stop()
 
     /** Create (or return the pre-started) terminal session wired to the bridge. */

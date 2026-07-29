@@ -85,13 +85,14 @@ class QemuBootMonitor(
         val byteBuf = ByteBuffer.allocate(8192)
         val charBuf = CharBuffer.allocate(8192)
         consoleLog.delete()
-        FileOutputStream(consoleLog, false).use { logOut ->
+        BoundedRunLog(FileOutputStream(consoleLog, false)).use { logOut ->
             val readBuf = ByteArray(4096)
             while (true) {
                 val n = try { input.read(readBuf) } catch (_: Exception) { break }
                 if (n < 0) break
 
-                // Raw bytes to disk for the diagnostic log.
+                // Raw diagnostic bytes are capped per run; detector and the
+                // in-memory tail continue consuming after the disk cap.
                 logOut.write(readBuf, 0, n)
                 logOut.flush()
 

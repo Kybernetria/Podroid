@@ -42,7 +42,6 @@ import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 
@@ -94,7 +93,7 @@ class UsbPassthroughManager @Inject constructor(
      */
     fun start() {
         if (started) return
-        if (engine.qmpClient == null) {
+        if (engine.qmpController == null) {
             // No QMP channel means no way to hand an fd to the guest (e.g. the AVF
             // backend). USB passthrough is QEMU-only, so don't arm the receiver or
             // pop a permission dialog that would lead nowhere.
@@ -161,7 +160,7 @@ class UsbPassthroughManager @Inject constructor(
             if (!started || engine.state.value !is VmState.Running) return
             if (active.containsKey(device.deviceName)) return
 
-            val qmp = engine.qmpClient
+            val qmp = engine.qmpController
             if (qmp == null) {
                 Log.w(TAG, "No QMP client — USB passthrough needs the QEMU backend")
                 return
@@ -180,19 +179,9 @@ class UsbPassthroughManager @Inject constructor(
             // UsbDeviceConnection itself stays open in `active` until detach().
             val pfd = ParcelFileDescriptor.fromFd(connection.fileDescriptor)
             try {
-                val fdSetId = qmp.addFd(pfd.fileDescriptor).getOrElse { e ->
-                    Log.w(TAG, "add-fd failed for ${device.deviceName}", e)
-                    connection.close()
-                    return
-                }
                 val qemuId = "podroid_usb_${device.deviceId}"
-                val args = JSONObject()
-                    .put("driver", "usb-host")
-                    .put("id", qemuId)
-                    .put("hostdevice", "/dev/fdset/$fdSetId")
-                qmp.deviceAdd(args).onFailure { e ->
-                    Log.w(TAG, "device_add usb-host failed for ${device.deviceName}", e)
-                    qmp.removeFd(fdSetId)
+                val fdSetId = qmp.attachUsb(pfd.fileDescriptor, qemuId).getOrElse { e ->
+                    Log.w(TAG, "QMP USB attach failed for ${device.deviceName}", e)
                     connection.close()
                     return
                 }
@@ -215,12 +204,8 @@ class UsbPassthroughManager @Inject constructor(
     private suspend fun detach(deviceName: String) {
         mutex.withLock {
             val entry = active.remove(deviceName) ?: return
-            engine.qmpClient?.let { qmp ->
-                qmp.deviceDel(entry.qemuId)
-                    .onFailure { Log.w(TAG, "device_del failed for $deviceName (${entry.qemuId})", it) }
-                qmp.removeFd(entry.fdSetId)
-                    .onFailure { Log.w(TAG, "remove-fd failed for fdset ${entry.fdSetId}", it) }
-            }
+            engine.qmpController?.detachUsb(entry.fdSetId, entry.qemuId)
+                ?.onFailure { Log.w(TAG, "QMP USB detach failed for $deviceName (${entry.qemuId})", it) }
             runCatching { entry.connection.close() }
             Log.i(TAG, "Released USB device $deviceName from guest")
         }

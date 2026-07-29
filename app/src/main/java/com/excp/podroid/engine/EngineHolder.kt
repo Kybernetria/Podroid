@@ -10,7 +10,7 @@
  * Also owns the cross-cutting rule-diff loop: it watches
  * PortForwardRepository.rules and dispatches add/remove to whichever engine
  * is current. This removes the special-case calls SettingsViewModel used to
- * make directly into QemuEngine.qmpClient.
+ * make directly into QEMU's typed QMP controller.
  */
 package com.excp.podroid.engine
 
@@ -279,9 +279,9 @@ class EngineHolder @Inject constructor(
         // pick is published; firstPick is already resolved by the time a user
         // changes the backend chip. Defensive: also wait for a swappable state
         // even though Settings UI gates chips.
-        currentFlow.value.state.first {
-            it is VmState.Stopped || it is VmState.Idle || it is VmState.Error
-        }
+        // Backend state can become Error before a rejected stop has released
+        // its framework handle. Swap only on the authoritative cleanup signal.
+        currentFlow.value.quiescent.first { it }
         // A swap is the authoritative selection from here on. Mark first-pick
         // published so a late init/start publish (firstPick that hadn't resolved
         // when this swap fired — only possible if the user changed the backend
@@ -289,14 +289,6 @@ class EngineHolder @Inject constructor(
         firstPickPublished.set(true)
         val next = pick(newSel)
         if (next === currentFlow.value) return
-        // NOTE: AvfEngine.stop() flips state to Stopped before cleanup() finishes
-        // (socket delete + coroutine cancel), so publishing `next` here can
-        // briefly overlap the old engine's teardown. This is the lower-risk
-        // choice: the @Singleton engines mean `next` is never a fresh instance,
-        // the UI gates the chips while Running/Starting, and no two VMs run at
-        // once (state is already terminal). Forcing stop()+cleanup ordering would
-        // require touching the engine classes (out of scope) and risks the
-        // happy-path swap. The residual window is teardown-only, not dual-run.
         android.util.Log.i(TAG, "swap: ${currentFlow.value.backendId} → ${next.backendId}")
         appliedRules = emptySet()
         // Fresh selection: the swapped-in @Singleton engine may retain a stale
@@ -322,6 +314,10 @@ class EngineHolder @Inject constructor(
         .flatMapLatest { eng -> eng.state.map { st -> normalizeCycleState(eng, st) } }
         .stateIn(scope, SharingStarted.Eagerly, VmState.Idle)
 
+    override val quiescent: StateFlow<Boolean> = currentFlow
+        .flatMapLatest { it.quiescent }
+        .stateIn(scope, SharingStarted.Eagerly, current.quiescent.value)
+
     override val bootStage: StateFlow<String> = currentFlow
         .flatMapLatest { it.bootStage }
         .stateIn(scope, SharingStarted.Eagerly, "")
@@ -337,7 +333,7 @@ class EngineHolder @Inject constructor(
     // ── VmEngine: imperative members — pass through to current engine ──────
     override val terminalSession: TerminalSession? get() = current.terminalSession
     override val backendId: String get() = current.backendId
-    override val qmpClient: QmpClient? get() = current.qmpClient
+    override val qmpController: QmpController? get() = current.qmpController
     override var sessionClientDelegate: TerminalSessionClient?
         get() = current.sessionClientDelegate
         set(v) { current.sessionClientDelegate = v }

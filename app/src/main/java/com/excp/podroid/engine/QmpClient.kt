@@ -1,60 +1,97 @@
 /*
  * Podroid - Rootless Podman for Android
  * Copyright (C) 2024-2026 Podroid contributors
- *
- * Minimal QMP (QEMU Machine Protocol) client for runtime VM management.
- * Used for adding/removing port forwards and hot-plugging USB passthrough
- * devices while the VM is running.
  */
 package com.excp.podroid.engine
 
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.util.Log
+import java.io.FileDescriptor
+import java.io.IOException
+import java.io.InputStream
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.DisposableHandle
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.FileDescriptor
-import java.io.InputStreamReader
 
-class QmpClient(private val socketPath: String) {
+/** Typed QMP capability exposed to engine consumers. Raw command execution stays private. */
+interface QmpController {
+    suspend fun systemPowerdown(): Result<Unit>
+    suspend fun queryStatus(): Result<String>
+    suspend fun queryVersion(): Result<Triple<Int, Int, Int>>
+    suspend fun addPortForward(hostPort: Int, guestPort: Int, protocol: String, loopbackOnly: Boolean): Result<Unit>
+    suspend fun removePortForward(hostPort: Int, protocol: String, loopbackOnly: Boolean): Result<Unit>
+    suspend fun attachUsb(fd: FileDescriptor, qemuId: String): Result<Int>
+    suspend fun detachUsb(fdSetId: Int, qemuId: String): Result<Unit>
+}
+
+/**
+ * Budget shared by every phase of one QMP transaction. The clock is monotonic;
+ * greeting, capability negotiation, events, and the command reply all consume
+ * the same absolute deadline and byte/event ceilings.
+ */
+internal class QmpTransactionBudget(
+    timeoutMs: Long,
+    private val maxLineBytes: Int,
+    private val maxTotalBytes: Int,
+    private val maxEvents: Int,
+    private val nanoTime: () -> Long = System::nanoTime,
+) {
+    private val deadlineNanos = nanoTime() + timeoutMs * 1_000_000L
+    private var totalBytes = 0
+    private var events = 0
+
+    init {
+        require(timeoutMs > 0 && maxLineBytes > 0 && maxTotalBytes >= maxLineBytes && maxEvents >= 0)
+    }
+
+    fun remainingTimeoutMs(): Int {
+        val remaining = deadlineNanos - nanoTime()
+        if (remaining <= 0) throw IOException("QMP transaction deadline exceeded")
+        return ((remaining + 999_999L) / 1_000_000L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+    }
+
+    fun consumeByte(lineBytes: Int) {
+        if (lineBytes > maxLineBytes) throw IOException("QMP response line exceeds $maxLineBytes bytes")
+        totalBytes++
+        if (totalBytes > maxTotalBytes) throw IOException("QMP transaction exceeds $maxTotalBytes response bytes")
+    }
+
+    fun consumeEvent() {
+        events++
+        if (events > maxEvents) throw IOException("QMP transaction exceeds $maxEvents asynchronous events")
+    }
+}
+
+internal class QmpClient(
+    private val socketPath: String,
+    private val timeoutMs: Long = SOCKET_TIMEOUT_MS,
+    private val nanoTime: () -> Long = System::nanoTime,
+) : QmpController {
 
     companion object {
         private const val TAG = "QmpClient"
-        private const val SOCKET_TIMEOUT_MS = 5000
-        private const val MAX_QMP_LINE_CHARS = 256 * 1024
+        internal const val SOCKET_TIMEOUT_MS = 5_000L
+        internal const val MAX_QMP_LINE_BYTES = 256 * 1024
+        internal const val MAX_QMP_TOTAL_BYTES = 512 * 1024
+        internal const val MAX_QMP_EVENTS = 128
+        private const val MAX_COMMAND_BYTES = 16 * 1024
 
-        /** Verdict for one QMP reply line. */
         sealed class QmpVerdict {
-            /** Terminal reply: the command succeeded. */
             object Success : QmpVerdict()
-            /** Terminal reply: the command failed (carries a human-readable reason). */
             data class Failure(val reason: String) : QmpVerdict()
-            /** Async event line — not the reply to our command; keep reading. */
             object SkipEvent : QmpVerdict()
         }
 
-        /**
-         * Pure classification of an already-decomposed QMP reply. No org.json /
-         * I/O dependency, so it is directly unit-testable.
-         *
-         *  - top-level `"error"`             → Failure (QMP-level rejection)
-         *  - `"event"` key                   → SkipEvent (async event, keep reading)
-         *  - `"return"` string carrying a    → Failure: human-monitor-command never
-         *    hostfwd error                      sets a QMP-level error, so a busy
-         *                                       port / bad spec arrives as return text
-         *  - anything else                   → Success
-         *
-         * @param hasError   whether the reply object has a top-level "error" key
-         * @param hasEvent   whether the reply object has an "event" key
-         * @param returnValue the value of the "return" key, if present (the String
-         *                    body matters for human-monitor-command failures)
-         */
         fun classifyQmpFields(hasError: Boolean, hasEvent: Boolean, returnValue: Any?): QmpVerdict {
             if (hasError) return QmpVerdict.Failure("QMP error")
-            // Async events (SHUTDOWN, RESET, ...) can interleave with replies.
             if (hasEvent) return QmpVerdict.SkipEvent
             if (returnValue is String && isHostfwdError(returnValue)) {
                 return QmpVerdict.Failure("QMP human-monitor error: ${returnValue.trim()}")
@@ -62,170 +99,202 @@ class QmpClient(private val socketPath: String) {
             return QmpVerdict.Success
         }
 
-        /**
-         * Classify one parsed QMP reply object. Thin org.json adapter over
-         * [classifyQmpFields]; returns null for async-event lines so the read
-         * loop knows to keep reading for the real reply.
-         */
-        fun classifyQmpResponse(json: JSONObject): Result<JSONObject>? =
-            when (val v = classifyQmpFields(json.has("error"), json.has("event"), json.opt("return"))) {
+        internal fun classifyQmpResponse(json: JSONObject): Result<JSONObject>? =
+            when (val verdict = classifyQmpFields(json.has("error"), json.has("event"), json.opt("return"))) {
                 is QmpVerdict.Success -> Result.success(json)
-                is QmpVerdict.Failure -> Result.failure(RuntimeException(v.reason))
+                is QmpVerdict.Failure -> Result.failure(IOException(verdict.reason))
                 is QmpVerdict.SkipEvent -> null
             }
 
-        private fun readBoundedLine(reader: BufferedReader): String? {
-            val line = StringBuilder()
-            while (true) {
-                val next = reader.read()
-                if (next < 0) return if (line.isEmpty()) null else line.toString()
-                if (next.toChar() == '\n') return line.toString()
-                if (line.length >= MAX_QMP_LINE_CHARS) {
-                    throw java.io.IOException("QMP response line exceeds $MAX_QMP_LINE_CHARS characters")
-                }
-                if (next.toChar() != '\r') line.append(next.toChar())
-            }
-        }
+        private fun isHostfwdError(returnText: String): Boolean =
+            returnText.trim().contains("could not", ignoreCase = true)
 
-        /**
-         * human-monitor-command (hostfwd_add/remove) reports failures as plain
-         * text in the `"return"` field. Match the QEMU SLIRP/hostfwd error
-         * prefixes ("could not set up host forwarding rule", "Could not ...").
-         */
-        private fun isHostfwdError(returnText: String): Boolean {
-            val t = returnText.trim()
-            if (t.isEmpty()) return false
-            // Robustly case-insensitive: QEMU/SLIRP casing isn't guaranteed
-            // across versions, so a single ignoreCase contains() catches both
-            // "Could not set up host forwarding rule ..." and lowercase variants
-            // rather than mixing an anchored phrase with a case-sensitive prefix.
-            return t.contains("could not", ignoreCase = true)
+        internal fun closeOnCancellation(job: Job?, close: () -> Unit): DisposableHandle? =
+            job?.invokeOnCompletion { cause -> if (cause is CancellationException) close() }
+
+        internal fun readBoundedLine(input: InputStream, budget: QmpTransactionBudget): String? {
+            val bytes = java.io.ByteArrayOutputStream()
+            var lineBytes = 0
+            while (true) {
+                budget.remainingTimeoutMs()
+                val next = input.read()
+                if (next < 0) return if (bytes.size() == 0) null else bytes.toByteArray().toString(Charsets.UTF_8)
+                lineBytes++
+                budget.consumeByte(lineBytes)
+                if (next == '\n'.code) return bytes.toByteArray().toString(Charsets.UTF_8)
+                if (next != '\r'.code) bytes.write(next)
+            }
         }
     }
 
-    /**
-     * Run one QMP command over a fresh connection. When [sendFd] is non-null it
-     * is handed to QEMU as SCM_RIGHTS ancillary data on the command write — the
-     * mechanism `add-fd` needs to ingest a file descriptor (e.g. an Android
-     * UsbDeviceConnection fd for usb-host passthrough).
-     */
     private suspend fun exec(
         command: String,
         arguments: JSONObject?,
         sendFd: FileDescriptor? = null,
+    ): Result<JSONObject> = try {
+        // Covers connect, bounded writes, handshake, events, and reply as one
+        // operation. Cancellation closes the active socket in executeIo.
+        withTimeout(timeoutMs) { executeIo(command, arguments, sendFd) }
+    } catch (timeout: TimeoutCancellationException) {
+        Result.failure(IOException("QMP transaction deadline exceeded", timeout))
+    }
+
+    private suspend fun executeIo(
+        command: String,
+        arguments: JSONObject?,
+        sendFd: FileDescriptor?,
     ): Result<JSONObject> = withContext(Dispatchers.IO) {
+        val socket = LocalSocket()
+        val cancellationHandle = closeOnCancellation(coroutineContext[Job]) {
+            runCatching { socket.close() }
+        }
         try {
-            LocalSocket().use { socket ->
-                socket.connect(
-                    LocalSocketAddress(socketPath, LocalSocketAddress.Namespace.FILESYSTEM)
-                )
-                socket.soTimeout = SOCKET_TIMEOUT_MS
+            val budget = QmpTransactionBudget(
+                timeoutMs, MAX_QMP_LINE_BYTES, MAX_QMP_TOTAL_BYTES, MAX_QMP_EVENTS, nanoTime,
+            )
+            socket.soTimeout = budget.remainingTimeoutMs()
+            socket.connect(
+                LocalSocketAddress(socketPath, LocalSocketAddress.Namespace.FILESYSTEM),
+                budget.remainingTimeoutMs(),
+            )
+            val input = socket.inputStream
+            val output = socket.outputStream
 
-                val reader = BufferedReader(InputStreamReader(socket.inputStream))
-                val out = socket.outputStream
+            socket.soTimeout = budget.remainingTimeoutMs()
+            val greeting = readBoundedLine(input, budget)
+                ?: throw IOException("QMP connection closed before greeting")
+            Log.v(TAG, "QMP greeting received (${greeting.length} chars)")
 
-                // Read QMP greeting, then enter command mode.
-                Log.v(TAG, "QMP greeting: ${readBoundedLine(reader)}")
-                out.write("{\"execute\":\"qmp_capabilities\"}\n".toByteArray())
-                out.flush()
-                Log.v(TAG, "Capabilities response: ${readBoundedLine(reader)}")
+            writeCommand(socket, output, "qmp_capabilities", null, null, budget)
+            readReply(input, socket, budget, "qmp_capabilities")
 
-                val cmd = JSONObject().apply {
-                    put("execute", command)
-                    if (arguments != null) put("arguments", arguments)
-                }
-                // The fd (if any) must ride on the SAME write that carries the
-                // command JSON: QEMU pairs the SCM_RIGHTS payload with the
-                // add-fd command currently being parsed.
-                if (sendFd != null) socket.setFileDescriptorsForSend(arrayOf(sendFd))
-                out.write((cmd.toString() + "\n").toByteArray())
-                out.flush()
-
-                // Read until a terminal reply (return/error). QMP can emit
-                // async {"event":...} lines at any time — classifyQmpResponse
-                // returns null for those so we skip them. A null line = EOF.
-                var result: Result<JSONObject>? = null
-                while (result == null) {
-                    val response = readBoundedLine(reader)
-                        ?: return@withContext Result.failure(
-                            RuntimeException("QMP connection closed before a reply to $command")
-                        )
-                    Log.d(TAG, "Command response ($command): $response")
-                    result = classifyQmpResponse(JSONObject(response))
-                }
-                result
-            }
-        } catch (e: CancellationException) {
-            throw e
+            writeCommand(socket, output, command, arguments, sendFd, budget)
+            Result.success(readReply(input, socket, budget, command))
+        } catch (c: CancellationException) {
+            throw c
         } catch (e: Exception) {
             Log.e(TAG, "QMP command failed: $command", e)
             Result.failure(e)
+        } finally {
+            cancellationHandle?.dispose()
+            runCatching { socket.close() }
         }
     }
 
-    suspend fun execute(command: String, arguments: JSONObject? = null): Result<JSONObject> =
-        exec(command, arguments)
+    private fun writeCommand(
+        socket: LocalSocket,
+        output: java.io.OutputStream,
+        command: String,
+        arguments: JSONObject?,
+        sendFd: FileDescriptor?,
+        budget: QmpTransactionBudget,
+    ) {
+        budget.remainingTimeoutMs()
+        val json = JSONObject().apply {
+            put("execute", command)
+            if (arguments != null) put("arguments", arguments)
+        }.toString().toByteArray(Charsets.UTF_8)
+        if (json.size > MAX_COMMAND_BYTES) throw IOException("QMP command exceeds $MAX_COMMAND_BYTES bytes")
+        if (sendFd != null) socket.setFileDescriptorsForSend(arrayOf(sendFd))
+        output.write(json)
+        output.write('\n'.code)
+        output.flush()
+        budget.remainingTimeoutMs()
+    }
 
-    /** Typed lifecycle command used by VmManager's bounded graceful-stop path. */
-    suspend fun systemPowerdown(): Result<Unit> =
-        exec("system_powerdown", null).map { Unit }
-
-    /** Typed observational commands exposed through VmManager's QMP allowlist. */
-    suspend fun queryStatus(): Result<String> =
-        exec("query-status", null).mapCatching {
-            it.getJSONObject("return").getString("status")
+    private fun readReply(
+        input: InputStream,
+        socket: LocalSocket,
+        budget: QmpTransactionBudget,
+        command: String,
+    ): JSONObject {
+        while (true) {
+            socket.soTimeout = budget.remainingTimeoutMs()
+            val line = readBoundedLine(input, budget)
+                ?: throw IOException("QMP connection closed before a reply to $command")
+            val json = JSONObject(line)
+            val result = classifyQmpResponse(json)
+            if (result == null) {
+                budget.consumeEvent()
+                continue
+            }
+            return result.getOrThrow()
         }
+    }
 
-    suspend fun queryVersion(): Result<Triple<Int, Int, Int>> =
-        exec("query-version", null).mapCatching {
-            val qemu = it.getJSONObject("return").getJSONObject("qemu")
-            Triple(qemu.getInt("major"), qemu.getInt("minor"), qemu.getInt("micro"))
-        }
+    override suspend fun systemPowerdown(): Result<Unit> = exec("system_powerdown", null).map { Unit }
 
-    suspend fun addPortForward(
+    override suspend fun queryStatus(): Result<String> = exec("query-status", null).mapCatching {
+        it.getJSONObject("return").getString("status")
+    }
+
+    override suspend fun queryVersion(): Result<Triple<Int, Int, Int>> = exec("query-version", null).mapCatching {
+        val qemu = it.getJSONObject("return").getJSONObject("qemu")
+        Triple(qemu.getInt("major"), qemu.getInt("minor"), qemu.getInt("micro"))
+    }
+
+    override suspend fun addPortForward(
         hostPort: Int,
         guestPort: Int,
-        protocol: String = "tcp",
-        loopbackOnly: Boolean = false,
-    ): Result<JSONObject> {
-        // hostaddr empty = 0.0.0.0; 127.0.0.1 keeps a loopback-only rule off the
-        // network even when applied live (matches the static buildCommand path).
+        protocol: String,
+        loopbackOnly: Boolean,
+    ): Result<Unit> {
         val hostAddr = if (loopbackOnly) "127.0.0.1" else ""
-        val monitorCmd = "hostfwd_add net0 ${protocol}:${hostAddr}:${hostPort}-:${guestPort}"
-        return execute(
-            "human-monitor-command",
-            JSONObject().put("command-line", monitorCmd)
-        )
+        val monitor = "hostfwd_add net0 ${protocol}:${hostAddr}:${hostPort}-:${guestPort}"
+        return exec("human-monitor-command", JSONObject().put("command-line", monitor)).map { Unit }
     }
 
-    suspend fun removePortForward(hostPort: Int, protocol: String = "tcp", loopbackOnly: Boolean = false): Result<JSONObject> {
-        // hostfwd_remove must match the hostaddr used at add time.
+    override suspend fun removePortForward(
+        hostPort: Int,
+        protocol: String,
+        loopbackOnly: Boolean,
+    ): Result<Unit> {
         val hostAddr = if (loopbackOnly) "127.0.0.1" else ""
-        val monitorCmd = "hostfwd_remove net0 ${protocol}:${hostAddr}:${hostPort}"
-        return execute(
-            "human-monitor-command",
-            JSONObject().put("command-line", monitorCmd)
-        )
+        val monitor = "hostfwd_remove net0 ${protocol}:${hostAddr}:${hostPort}"
+        return exec("human-monitor-command", JSONObject().put("command-line", monitor)).map { Unit }
     }
 
-    /**
-     * Pass [fd] to QEMU via SCM_RIGHTS and register it in a freshly-created fd
-     * set. Returns the new fdset-id, referenceable from device properties as
-     * `/dev/fdset/<id>` — used to hot-plug usb-host devices without QEMU ever
-     * needing direct access to /dev/bus/usb (which is unreachable to an
-     * unprivileged Android app).
-     */
-    suspend fun addFd(fd: FileDescriptor): Result<Int> =
-        exec("add-fd", null, fd).mapCatching {
+    override suspend fun attachUsb(fd: FileDescriptor, qemuId: String): Result<Int> {
+        require(qemuId.matches(Regex("[A-Za-z0-9_.-]{1,64}"))) { "Invalid QEMU USB id" }
+        val fdSetId = exec("add-fd", null, fd).mapCatching {
             it.getJSONObject("return").getInt("fdset-id")
+        }.getOrElse { return Result.failure(it) }
+        val args = JSONObject()
+            .put("driver", "usb-host")
+            .put("id", qemuId)
+            .put("hostdevice", "/dev/fdset/$fdSetId")
+        return try {
+            exec("device_add", args).fold(
+                onSuccess = { Result.success(fdSetId) },
+                onFailure = { failure ->
+                    removeFdAfterPartialAttach(fdSetId)
+                    Result.failure(failure)
+                },
+            )
+        } catch (cancelled: CancellationException) {
+            // add-fd completed before this cancellable device_add. Release the
+            // acquired fdset under its own bounded transaction before unwinding.
+            withContext(NonCancellable) { removeFdAfterPartialAttach(fdSetId) }
+            throw cancelled
         }
+    }
 
-    suspend fun removeFd(fdSetId: Int): Result<JSONObject> =
-        execute("remove-fd", JSONObject().put("fdset-id", fdSetId))
+    override suspend fun detachUsb(fdSetId: Int, qemuId: String): Result<Unit> {
+        require(fdSetId >= 0) { "Invalid QMP fdset id" }
+        require(qemuId.matches(Regex("[A-Za-z0-9_.-]{1,64}"))) { "Invalid QEMU USB id" }
+        return try {
+            val deviceResult = exec("device_del", JSONObject().put("id", qemuId)).map { Unit }
+            val fdResult = exec("remove-fd", JSONObject().put("fdset-id", fdSetId)).map { Unit }
+            deviceResult.fold(onSuccess = { fdResult }, onFailure = { Result.failure(it) })
+        } catch (cancelled: CancellationException) {
+            withContext(NonCancellable) { removeFdAfterPartialAttach(fdSetId) }
+            throw cancelled
+        }
+    }
 
-    suspend fun deviceAdd(arguments: JSONObject): Result<JSONObject> =
-        execute("device_add", arguments)
+    private suspend fun removeFdAfterPartialAttach(fdSetId: Int) {
+        exec("remove-fd", JSONObject().put("fdset-id", fdSetId))
+            .onFailure { Log.w(TAG, "QMP remove-fd cleanup failed for fdset $fdSetId", it) }
+    }
 
-    suspend fun deviceDel(id: String): Result<JSONObject> =
-        execute("device_del", JSONObject().put("id", id))
 }

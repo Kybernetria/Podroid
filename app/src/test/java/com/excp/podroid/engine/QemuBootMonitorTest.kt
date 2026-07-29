@@ -90,4 +90,25 @@ class QemuBootMonitorTest {
         m.runLoop(ByteArrayInputStream("hello console\n".toByteArray()))
         assertTrue(ct.value.contains("hello console"))
     }
+
+    @Test fun diskLogCapsAtOneMiBWhileBootDetectionContinues() {
+        val state = MutableStateFlow<VmState>(VmState.Starting)
+        val stage = MutableStateFlow("")
+        val log = Files.createTempFile("bounded-console", ".log").toFile().also { it.deleteOnExit() }
+        val monitor = QemuBootMonitor(
+            "/unused/serial.sock",
+            log,
+            BootStageDetector(stage, state) { },
+            MutableStateFlow(""),
+            1000L,
+        )
+        val bytes = ByteArray(BoundedRunLog.MAX_CONSOLE_LOG_BYTES.toInt() + 4096) { 'x'.code.toByte() }
+        val marker = "\nReady!\n".toByteArray()
+        marker.copyInto(bytes, bytes.size - marker.size)
+
+        monitor.runLoop(ByteArrayInputStream(bytes))
+
+        assertEquals(BoundedRunLog.MAX_CONSOLE_LOG_BYTES, log.length())
+        assertEquals(VmState.Running, state.value)
+    }
 }

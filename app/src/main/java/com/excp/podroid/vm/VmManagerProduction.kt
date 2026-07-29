@@ -14,19 +14,29 @@ import com.excp.podroid.util.NetworkUtils
 
 /** Reuses the application's hardened, atomic extraction path for reinstalls. */
 internal class ApplicationVmInstaller(private val context: Context) : VmInstaller {
-    override suspend fun install(vmId: VmId) {
+    override suspend fun awaitInitial(vmId: VmId) {
         require(vmId == VmId.DEFAULT) { "Only the default VM is supported" }
-        val application = context.applicationContext as? PodroidApplication
-            ?: throw IllegalStateException("Podroid application installer is unavailable")
-        application.installVmAssets()
+        application().awaitAssetsReady()
     }
 
-    override suspend fun awaitIdle(vmId: VmId) {
+    override suspend fun <T> withExclusiveTree(
+        vmId: VmId,
+        action: suspend (VmAssetTreeLease) -> T,
+    ): T {
         require(vmId == VmId.DEFAULT) { "Only the default VM is supported" }
-        val application = context.applicationContext as? PodroidApplication
-            ?: throw IllegalStateException("Podroid application installer is unavailable")
-        application.awaitVmAssetInstallerIdle()
+        return application().withVmAssetTreeLease { installAssets ->
+            action(object : VmAssetTreeLease {
+                override suspend fun install(vmId: VmId) {
+                    require(vmId == VmId.DEFAULT) { "Only the default VM is supported" }
+                    installAssets()
+                }
+            })
+        }
     }
+
+    private fun application(): PodroidApplication =
+        context.applicationContext as? PodroidApplication
+            ?: throw IllegalStateException("Podroid application installer is unavailable")
 }
 
 /** Owns all service-independent settings/network/forward launch assembly. */
@@ -37,23 +47,9 @@ internal class RepositoryVmConfigurationSource(
 ) : VmConfigurationSource {
     override suspend fun launchPlan(vmId: VmId): VmLaunchPlan {
         require(vmId == VmId.DEFAULT) { "Only the default VM is supported" }
-        val rules = portForwards.getRulesSnapshot().toMutableList()
+        val persistedRules = portForwards.getRulesSnapshot()
         val sshEnabled = settings.getSshEnabledSnapshot()
-        if (sshEnabled) {
-            val conflictingSshPort = rules.any {
-                it.protocol == "tcp" && it.hostPort == DefaultVmManager.SSH_HOST_PORT && it.guestPort != 22
-            }
-            check(!conflictingSshPort) {
-                "TCP port ${DefaultVmManager.SSH_HOST_PORT} is reserved for enabled SSH"
-            }
-            if (rules.none {
-                    it.protocol == "tcp" &&
-                        it.hostPort == DefaultVmManager.SSH_HOST_PORT &&
-                        it.guestPort == 22
-                }) {
-                rules.add(PortForwardRule(DefaultVmManager.SSH_HOST_PORT, 22, "tcp"))
-            }
-        }
+        val rules = assembleRules(persistedRules, sshEnabled)
 
         return VmLaunchPlan(
             portForwards = rules,
@@ -78,5 +74,28 @@ internal class RepositoryVmConfigurationSource(
     override suspend fun sshEnabled(vmId: VmId): Boolean {
         require(vmId == VmId.DEFAULT) { "Only the default VM is supported" }
         return settings.getSshEnabledSnapshot()
+    }
+
+    companion object {
+        internal fun assembleRules(
+            persistedRules: List<PortForwardRule>,
+            sshEnabled: Boolean,
+        ): List<PortForwardRule> {
+            if (!sshEnabled) return persistedRules.toList()
+            val implicitSsh = PortForwardRule(
+                hostPort = DefaultVmManager.SSH_HOST_PORT,
+                guestPort = 22,
+                protocol = "tcp",
+                loopbackOnly = true,
+            )
+            check(persistedRules.none {
+                it.protocol == "tcp" &&
+                    it.hostPort == DefaultVmManager.SSH_HOST_PORT &&
+                    it != implicitSsh
+            }) {
+                "TCP ${DefaultVmManager.SSH_HOST}:${DefaultVmManager.SSH_HOST_PORT} is reserved for enabled SSH"
+            }
+            return if (implicitSsh in persistedRules) persistedRules.toList() else persistedRules + implicitSsh
+        }
     }
 }
