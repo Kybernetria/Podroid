@@ -27,6 +27,8 @@ import com.excp.podroid.engine.VmConfig
 import com.excp.podroid.engine.VmEngine
 import com.excp.podroid.engine.VmState
 import com.excp.podroid.util.LogProxy
+import com.excp.podroid.vm.VmId
+import com.excp.podroid.vm.VmPaths
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -54,7 +56,9 @@ import javax.inject.Singleton
 class AvfEngine @Inject constructor(
     @ApplicationContext private val context: Context,
     private val settingsRepository: SettingsRepository,
+    private val vmPaths: VmPaths,
 ) : VmEngine {
+    override val vmId: VmId = vmPaths.vmId
 
     companion object {
         private const val TAG = "AvfEngine"
@@ -212,8 +216,8 @@ class AvfEngine @Inject constructor(
     @Volatile private var launchConfigSummary: String = "(VM not started this session)"
     private var resizeDebounceJob: kotlinx.coroutines.Job? = null
 
-    val terminalSockPath: String get() = "${context.filesDir.absolutePath}/avf-terminal.sock"
-    val ctrlSockPath: String get() = "${context.filesDir.absolutePath}/avf-ctrl.sock"
+    val terminalSockPath: String get() = vmPaths.avfTerminalSocket.absolutePath
+    val ctrlSockPath: String get() = vmPaths.avfControlSocket.absolutePath
 
     // Per-run detector (re-created each launchAttempt, not reset-and-reused).
     // A fresh instance means a prior run's still-draining ConsoleFanout pump
@@ -291,6 +295,7 @@ class AvfEngine @Inject constructor(
     }
 
     override suspend fun start(portForwards: List<PortForwardRule>, config: VmConfig) {
+        require(config.vmId == vmId) { "AVF engine ${vmId.serialized} cannot start ${config.vmId.serialized}" }
         startMutex.withLock {
             if (_state.value is VmState.Running || _state.value is VmState.Starting) return
             // Remember the launch args so the adaptive multi-vCPU fallback (issue
@@ -426,7 +431,7 @@ class AvfEngine @Inject constructor(
             // The diagnostic exporter cats this path; on AVF it was previously
             // always empty, masking kernel panics like issue #29's reason=5
             // reboot on Pixel 8a. Tee inside ConsoleFanout's vm→bridge pump.
-            val logFile = File(context.filesDir, "console.log")
+            val logFile = vmPaths.consoleLog
             runCatching { logFile.delete() }
             val log = runCatching { java.io.FileOutputStream(logFile, false) }
                 .onFailure { Log.w(TAG, "console.log open failed (continuing without capture)", it) }
@@ -598,7 +603,7 @@ class AvfEngine @Inject constructor(
             }
             val sess = com.excp.podroid.engine.ResizeNotifyingSession(
                 shellPath = bridgeExe.absolutePath,
-                cwd = context.filesDir.absolutePath,
+                cwd = vmPaths.avfWorkingDirectory.absolutePath,
                 args = arrayOf(bridgeExe.absolutePath, terminalSockPath, ctrlSockPath),
                 env = null,
                 transcriptRows = 2000,
@@ -767,7 +772,7 @@ class AvfEngine @Inject constructor(
         }
         val sess = com.excp.podroid.engine.ResizeNotifyingSession(
             shellPath = bridgeExe.absolutePath,
-            cwd = context.filesDir.absolutePath,
+            cwd = vmPaths.avfWorkingDirectory.absolutePath,
             args = arrayOf(bridgeExe.absolutePath, terminalSockPath, ctrlSockPath),
             env = null,
             transcriptRows = 2000,
@@ -863,7 +868,7 @@ class AvfEngine @Inject constructor(
      * boot via the standard initramfs path.
      */
     private fun ensureStorageImage(storageSizeGb: Int): File {
-        val storageFile = File(context.filesDir, "storage.img")
+        val storageFile = vmPaths.storageImage
         val desiredBytes = storageSizeGb.toLong() * 1024L * 1024L * 1024L
         if (storageFile.exists()) {
             val current = storageFile.length()
@@ -914,7 +919,7 @@ class AvfEngine @Inject constructor(
         val isGzip = magic[0] == 0x1f.toByte() && magic[1] == 0x8b.toByte()
         if (!isGzip) return source
 
-        val raw = File(source.parentFile, "${source.name}.raw")
+        val raw = vmPaths.rawKernel
         if (raw.exists() && raw.lastModified() >= source.lastModified()) return raw
 
         Log.d(TAG, "Decompressing ${source.name} → ${raw.name}")
@@ -952,15 +957,15 @@ class AvfEngine @Inject constructor(
         // NOT rewrite this launch's topology back up (issue #29).
         if (!useExplicitCpuCount) AvfReflect.disarmExplicitCpuCount()
 
-        val kernelSrc = File(context.filesDir, "vmlinuz-virt").also {
+        val kernelSrc = vmPaths.kernel.also {
             require(it.exists()) { "kernel missing at ${it.absolutePath}" }
         }
         val kernel = ensureRawKernel(kernelSrc)
-        val initrd = File(context.filesDir, "initrd.img").also {
+        val initrd = vmPaths.initrd.also {
             require(it.exists()) { "initrd missing at ${it.absolutePath}" }
         }
         val storage = ensureStorageImage(config.storageSizeGb)
-        val squashfs = File(context.filesDir, "alpine-rootfs.squashfs").also {
+        val squashfs = vmPaths.rootfs.also {
             require(it.exists()) { "rootfs missing at ${it.absolutePath}" }
         }
 

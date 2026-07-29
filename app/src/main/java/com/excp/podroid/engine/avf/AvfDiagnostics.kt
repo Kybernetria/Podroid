@@ -14,12 +14,13 @@
  * (Pixel 8/9/10) before investing in a real dual-backend rewrite. Reports
  * what's present, what's granted, whether the service is reachable, and
  * (optionally) attempts to create + start a minimal VM using our existing
- * Alpine kernel/initrd in filesDir.
+ * Alpine kernel/initrd in the injected default-instance paths.
  */
 package com.excp.podroid.engine.avf
 
 import android.content.Context
 import android.content.pm.PackageManager
+import com.excp.podroid.vm.VmPaths
 import java.io.File
 
 /** One-line entries in the diagnostic report; UI just joins them. */
@@ -139,15 +140,15 @@ object AvfDiagnostics {
      * framework — it does not stream the console or wait for guest boot.
      * The VM is stopped/deleted immediately.
      */
-    fun runSmokeTest(context: Context): String {
+    fun runSmokeTest(context: Context, vmPaths: VmPaths): String {
         val pre = probe(context)
         if (!pre.featureSupported)   return "skipped: feature flag not present (device does not ship AVF)"
         if (!pre.managePermissionGranted) return "skipped: MANAGE_VIRTUAL_MACHINE not granted (run: adb shell pm grant ${context.packageName} $PERM_MANAGE)"
         if (!pre.customPermissionGranted) return "skipped: USE_CUSTOM_VIRTUAL_MACHINE not granted (run: adb shell pm grant ${context.packageName} $PERM_CUSTOM)"
         if (!pre.managerClassPresent) return "FAILED: $CLS_MANAGER not on the boot classpath — system stub missing"
 
-        val kernelSrc = File(context.filesDir, "vmlinuz-virt")
-        val initrd = File(context.filesDir, "initrd.img")
+        val kernelSrc = vmPaths.kernel
+        val initrd = vmPaths.initrd
         if (!kernelSrc.exists()) return "FAILED: kernel not extracted yet at ${kernelSrc.absolutePath}"
         if (!initrd.exists()) return "FAILED: initrd not extracted yet at ${initrd.absolutePath}"
 
@@ -166,7 +167,7 @@ object AvfDiagnostics {
             // exactly like AvfEngine.ensureRawKernel (and reuse its cached .raw).
             // Without this, crosvm fails to load the kernel ("invalid magic
             // number") the moment it gets past arg parsing.
-            val kernel = ensureRawKernel(kernelSrc)
+            val kernel = ensureRawKernel(kernelSrc, vmPaths.rawKernel)
             val customCfg = buildCustomImageConfig(kernel.absolutePath, initrd.absolutePath)
             val config = buildVirtualMachineConfig(vmm, context, customCfg)
 
@@ -220,11 +221,10 @@ object AvfDiagnostics {
      * the same sibling `.raw` file so the cache is shared with the real VM path.
      * Returns the source untouched if it isn't gzip.
      */
-    private fun ensureRawKernel(source: File): File {
+    private fun ensureRawKernel(source: File, raw: File): File {
         val magic = ByteArray(4)
         source.inputStream().use { it.read(magic) }
         if (magic[0] != 0x1f.toByte() || magic[1] != 0x8b.toByte()) return source
-        val raw = File(source.parentFile, "${source.name}.raw")
         if (raw.exists() && raw.lastModified() >= source.lastModified()) return raw
         java.util.zip.GZIPInputStream(source.inputStream().buffered()).use { gz ->
             raw.outputStream().buffered().use { out -> gz.copyTo(out) }

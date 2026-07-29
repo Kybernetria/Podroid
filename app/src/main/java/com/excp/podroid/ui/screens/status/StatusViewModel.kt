@@ -12,6 +12,7 @@ import com.excp.podroid.util.HostMetrics
 import com.excp.podroid.util.HostMetricsSnapshot
 import com.excp.podroid.util.NetworkUtils
 import com.excp.podroid.util.VmLoadSampler
+import com.excp.podroid.vm.VmPaths
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.delay
@@ -22,7 +23,6 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.io.File
 import javax.inject.Inject
 
 data class StatusUiState(
@@ -58,6 +58,7 @@ data class StatusUiState(
 class StatusViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     private val engine: VmEngine,
+    private val vmPaths: VmPaths,
     private val settingsRepository: SettingsRepository,
     private val portForwardRepository: PortForwardRepository,
 ) : ViewModel() {
@@ -132,7 +133,7 @@ class StatusViewModel @Inject constructor(
     }
 
     fun refreshMetrics() {
-        val storageImg = File(context.filesDir, "storage.img")
+        val storageImg = vmPaths.storageImage
         val rss = if (engine.state.value is VmState.Running) engine.emulatorRssMb() else null
         _metrics.value = HostMetrics.snapshot(context, storageImg, rss)
     }
@@ -162,7 +163,7 @@ class StatusViewModel @Inject constructor(
     }
 
     private fun defaultMetrics(): HostMetricsSnapshot {
-        val storageImg = File(context.filesDir, "storage.img")
+        val storageImg = vmPaths.storageImage
         return HostMetrics.snapshot(context, storageImg, null)
     }
 

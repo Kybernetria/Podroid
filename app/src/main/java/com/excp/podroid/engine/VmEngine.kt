@@ -10,6 +10,7 @@
 package com.excp.podroid.engine
 
 import com.excp.podroid.data.repository.PortForwardRule
+import com.excp.podroid.vm.VmId
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import kotlinx.coroutines.flow.StateFlow
@@ -21,6 +22,9 @@ import kotlinx.coroutines.flow.StateFlow
  * lifetime of the foreground service; swapping requires the VM to be stopped.
  */
 interface VmEngine {
+    /** Stable instance identity carried across the service/engine boundary. */
+    val vmId: VmId
+
     val state: StateFlow<VmState>
     val bootStage: StateFlow<String>
     val consoleText: StateFlow<String>
@@ -96,6 +100,7 @@ interface VmEngine {
  * so existing call sites don't change.
  */
 data class VmConfig(
+    val vmId: VmId = VmId.DEFAULT,
     val ramMb: Int = 512,
     val cpus: Int = 1,
     val sshEnabled: Boolean = false,

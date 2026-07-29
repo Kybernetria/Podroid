@@ -10,6 +10,8 @@ package com.excp.podroid
 import android.app.Application
 import android.os.Build
 import android.util.Log
+import com.excp.podroid.vm.LegacyVmFilesMigration
+import com.excp.podroid.vm.VmPaths
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -20,18 +22,20 @@ import org.lsposed.hiddenapibypass.HiddenApiBypass
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import javax.inject.Inject
 
 @HiltAndroidApp
 class PodroidApplication : Application() {
+
+    @Inject lateinit var vmPaths: VmPaths
 
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // Completion signal for asset extraction. The VM launch path
     // (PodroidService.launchPodroid) reads the extracted files synchronously,
     // so it MUST await this before starting the engine — see awaitAssetsReady.
-    // Completed (never failed) in extractAssets' finally so a waiter can never
-    // hang even if extraction throws; intactness is enforced by the size-check
-    // in QemuEngine/AvfEngine's own asset reads, not by this signal.
+    // Failed migration/extraction completes this exceptionally. The service
+    // then aborts launch instead of booting from a partial or unsafe layout.
     private val assetsReady = CompletableDeferred<Unit>()
 
     override fun onCreate() {
@@ -39,12 +43,20 @@ class PodroidApplication : Application() {
         exemptHiddenApi()
         // Extract off the main thread: the squashfs alone is ~225 MB and
         // blocking onCreate on first install/upgrade would ANR the cold start.
-        appScope.launch { extractAssets() }
+        appScope.launch {
+            try {
+                extractAssets()
+                assetsReady.complete(Unit)
+            } catch (e: Exception) {
+                Log.e(TAG, "VM path migration or asset extraction failed", e)
+                assetsReady.completeExceptionally(e)
+            }
+        }
     }
 
     /**
      * Suspends until the bundled assets (qemu/, kernel, initrd, squashfs) have
-     * finished extracting to [filesDir]. The foreground service awaits this
+     * finished extracting to `filesDir/instances/default`. The foreground service awaits this
      * before launching the VM so QEMU/AVF never read a partial or missing file.
      */
     suspend fun awaitAssetsReady() = assetsReady.await()
@@ -72,80 +84,81 @@ class PodroidApplication : Application() {
     }
 
     private fun extractAssets() {
+        // Migration is deliberately before every extraction and launch. It is
+        // idempotent, so an interrupted prior run continues from whole-file
+        // renames; a collision or symlink fails the readiness gate closed.
+        LegacyVmFilesMigration(filesDir, vmPaths).migrate()
+        val instanceDir = vmPaths.instanceDirectory
+
+        // Asset extraction has a self-healing version stamp: on every install
+        // or upgrade `packageInfo.lastUpdateTime` changes, so we record it in
+        // `.assets_stamp` and force a re-copy on mismatch. Pure size checks
+        // are deceiving because `mksquashfs -all-root -noappend` is
+        // deterministic — changing service scripts inside the rootfs can
+        // produce a byte-identical-size file with different content, which
+        // older extraction logic silently kept stale.
+        val stampFile = vmPaths.assetStamp
+        val currentStamp = runCatching {
+            packageManager.getPackageInfo(packageName, 0).lastUpdateTime
+        }.getOrDefault(0L).toString()
+        val previousStamp = runCatching { stampFile.readText() }.getOrDefault("")
+        val forceCopy = previousStamp != currentStamp
+        if (forceCopy) {
+            Log.i(TAG, "asset stamp drift ($previousStamp → $currentStamp) — forcing re-extract")
+        }
+
+        // Drop any .tmp files left by a process killed mid-copy so they
+        // can't accumulate or shadow a fresh atomic write.
+        deleteStaleTmpFiles(instanceDir)
+
+        // Fan out the four top-level extractions across a small thread pool.
+        // Disk-write throughput is the bottleneck for the squashfs (~225 MB),
+        // but decompression, asset-FD lookup, and skip-when-size-matches all
+        // overlap usefully across threads. Runs on a background coroutine
+        // (not the main thread); the VM launch path awaits awaitAssetsReady.
+        val tasks: List<() -> Unit> = listOf(
+            { copyAssetDir("qemu", instanceDir, forceCopy) },
+            { copyAssetIfNeeded("vmlinuz-virt", instanceDir, forceCopy) },
+            { copyAssetIfNeeded("initrd.img", instanceDir, forceCopy) },
+            { copyAssetIfNeeded("alpine-rootfs.squashfs", instanceDir, forceCopy) },
+        )
+        val pool = Executors.newFixedThreadPool(tasks.size.coerceAtMost(4))
+        var allSucceeded = true
         try {
-            // Asset extraction has a self-healing version stamp: on every install
-            // or upgrade `packageInfo.lastUpdateTime` changes, so we record it in
-            // `.assets_stamp` and force a re-copy on mismatch. Pure size checks
-            // are deceiving because `mksquashfs -all-root -noappend` is
-            // deterministic — changing service scripts inside the rootfs can
-            // produce a byte-identical-size file with different content, which
-            // older extraction logic silently kept stale.
-            val stampFile = File(filesDir, ".assets_stamp")
-            val currentStamp = runCatching {
-                packageManager.getPackageInfo(packageName, 0).lastUpdateTime
-            }.getOrDefault(0L).toString()
-            val previousStamp = runCatching { stampFile.readText() }.getOrDefault("")
-            val forceCopy = previousStamp != currentStamp
-            if (forceCopy) {
-                Log.i(TAG, "asset stamp drift ($previousStamp → $currentStamp) — forcing re-extract")
-            }
-
-            // Drop any .tmp files left by a process killed mid-copy so they
-            // can't accumulate or shadow a fresh atomic write.
-            deleteStaleTmpFiles(filesDir)
-
-            // Fan out the four top-level extractions across a small thread pool.
-            // Disk-write throughput is the bottleneck for the squashfs (~225 MB),
-            // but decompression, asset-FD lookup, and skip-when-size-matches all
-            // overlap usefully across threads. Runs on a background coroutine
-            // (not the main thread); the VM launch path awaits awaitAssetsReady.
-            val tasks: List<() -> Unit> = listOf(
-                { copyAssetDir("qemu", filesDir, forceCopy) },
-                { copyAssetIfNeeded("vmlinuz-virt", filesDir, forceCopy) },
-                { copyAssetIfNeeded("initrd.img", filesDir, forceCopy) },
-                { copyAssetIfNeeded("alpine-rootfs.squashfs", filesDir, forceCopy) },
-            )
-            val pool = Executors.newFixedThreadPool(tasks.size.coerceAtMost(4))
-            var allSucceeded = true
-            try {
-                // invokeAll blocks until every Callable finishes (or times out).
-                // Each Callable wraps the task so a thrown exception is captured
-                // in the returned Future rather than killing the worker silently.
-                val futures = pool.invokeAll(tasks.map { task ->
-                    java.util.concurrent.Callable<Unit> { task() }
-                })
-                for (f in futures) {
-                    try { f.get() } catch (e: Exception) {
-                        // copyAssetIfNeeded / copyAssetFileIfNeeded already log
-                        // their own failures; this catches anything that escaped.
-                        Log.w(TAG, "Asset extraction task failed", e)
-                        allSucceeded = false
-                    }
-                }
-            } finally {
-                pool.shutdown()
-                if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
-                    pool.shutdownNow()
+            // invokeAll blocks until every Callable finishes (or times out).
+            // Each Callable wraps the task so a thrown exception is captured
+            // in the returned Future rather than killing the worker silently.
+            val futures = pool.invokeAll(tasks.map { task ->
+                java.util.concurrent.Callable<Unit> { task() }
+            })
+            for (f in futures) {
+                try { f.get() } catch (e: Exception) {
+                    // copyAssetIfNeeded / copyAssetFileIfNeeded already log
+                    // their own failures; this catches anything that escaped.
+                    Log.w(TAG, "Asset extraction task failed", e)
                     allSucceeded = false
                 }
             }
-
-            // Commit the new stamp ONLY if every extraction task succeeded.
-            // Writing it after a failed copy (e.g. squashfs copy failed on an
-            // upgrade: disk full, killed mid-copy) would mark the OLD file as
-            // current — and because mksquashfs is deterministic the size check
-            // can't catch it either, so a stale rootfs would boot forever. On
-            // failure we leave the stamp stale so the next launch re-extracts.
-            if (allSucceeded) {
-                runCatching { stampFile.writeText(currentStamp) }
-                    .onFailure { Log.w(TAG, "Failed to write assets stamp", it) }
-            } else {
-                Log.w(TAG, "asset extraction incomplete — leaving stamp stale to force re-extract next launch")
-            }
         } finally {
-            // Always release waiters — a failed/partial extract is detected by
-            // the per-file size-check on the next read, not by hanging here.
-            assetsReady.complete(Unit)
+            pool.shutdown()
+            if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
+                pool.shutdownNow()
+                allSucceeded = false
+            }
+        }
+
+        // Commit the new stamp ONLY if every extraction task succeeded.
+        // Writing it after a failed copy (e.g. squashfs copy failed on an
+        // upgrade: disk full, killed mid-copy) would mark the OLD file as
+        // current — and because mksquashfs is deterministic the size check
+        // can't catch it either, so a stale rootfs would boot forever. On
+        // failure we leave the stamp stale so the next launch re-extracts.
+        if (allSucceeded) {
+            runCatching { stampFile.writeText(currentStamp) }
+                .onFailure { Log.w(TAG, "Failed to write assets stamp", it) }
+        } else {
+            Log.w(TAG, "asset extraction incomplete — leaving stamp stale to force re-extract next launch")
+            throw java.io.IOException("One or more VM asset extraction tasks failed")
         }
     }
 
@@ -178,6 +191,7 @@ class PodroidApplication : Application() {
             copyAssetAtomically(assetName, destFile)
         } catch (e: Exception) {
             Log.w(TAG, "Failed to extract $assetName", e)
+            throw e
         }
     }
 
@@ -209,6 +223,7 @@ class PodroidApplication : Application() {
             copyAssetAtomically(assetPath, destFile)
         } catch (e: Exception) {
             Log.w(TAG, "Failed to extract $assetPath", e)
+            throw e
         }
     }
 

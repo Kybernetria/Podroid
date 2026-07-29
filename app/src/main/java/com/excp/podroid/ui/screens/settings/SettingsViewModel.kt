@@ -14,6 +14,7 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.excp.podroid.BuildConfig
+import com.excp.podroid.PodroidApplication
 import com.excp.podroid.R
 import com.excp.podroid.data.repository.LanguageManager
 import com.excp.podroid.data.repository.PortForwardRepository
@@ -25,6 +26,7 @@ import com.excp.podroid.engine.VmEngine
 import com.excp.podroid.engine.VmState
 import com.excp.podroid.util.DeviceResourcePolicy
 import com.excp.podroid.util.NetworkUtils
+import com.excp.podroid.vm.VmPaths
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
@@ -73,6 +75,7 @@ class SettingsViewModel @Inject constructor(
     private val settingsRepository: SettingsRepository,
     private val portForwardRepository: PortForwardRepository,
     private val engine: VmEngine,
+    private val vmPaths: VmPaths,
     private val languageManager: LanguageManager,
     @ApplicationScope private val externalScope: CoroutineScope,
 ) : ViewModel() {
@@ -304,6 +307,17 @@ class SettingsViewModel @Inject constructor(
 
     fun clearExportError() { _exportError.value = null }
 
+    suspend fun runAvfSmokeTest(): String = withContext(Dispatchers.IO) {
+        val app = context.applicationContext as? PodroidApplication
+            ?: return@withContext "FAILED: Podroid application readiness gate unavailable"
+        val readiness = runCatching { app.awaitAssetsReady() }
+        if (readiness.isFailure) {
+            return@withContext "FAILED: default VM migration/assets unavailable: " +
+                (readiness.exceptionOrNull()?.message ?: "unknown error")
+        }
+        com.excp.podroid.engine.avf.AvfDiagnostics.runSmokeTest(context, vmPaths)
+    }
+
     fun removePortForward(rule: PortForwardRule) {
         viewModelScope.launch { portForwardRepository.removeRule(rule) }
     }
@@ -411,9 +425,11 @@ class SettingsViewModel @Inject constructor(
             appendLine()
 
             appendLine("=== VM State ===")
+            appendLine("VM id:       ${engine.vmId.serialized}")
+            appendLine("Instance:    ${vmPaths.instanceDirectory.absolutePath}")
             appendLine("State:       ${engine.state.value}")
             appendLine("Boot stage:  ${engine.bootStage.value.ifEmpty { "(none)" }}")
-            val storageFile = File(context.filesDir, "storage.img")
+            val storageFile = vmPaths.storageImage
             appendLine(
                 "Storage img: " + if (storageFile.exists())
                     "${storageFile.absolutePath} (${storageFile.length() / (1024 * 1024)} MB)"
@@ -451,7 +467,7 @@ class SettingsViewModel @Inject constructor(
             appendLine()
 
             appendLine("=== VM Console Log (backend=${activeBackendId()}) ===")
-            val consoleFile = File(context.filesDir, "console.log")
+            val consoleFile = vmPaths.consoleLog
             if (consoleFile.exists() && consoleFile.length() > 0) {
                 val text = consoleFile.readText()
                 append(text)

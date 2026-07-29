@@ -31,6 +31,7 @@ Docker, Podman, LXC, X11/VNC, PulseAudio, desktop/font packages, predefined work
 - OpenRC-managed boot with the app-owned `hvc0` console/getty and stable `Ready!` boot markers
 - QEMU and AVF networking, terminal control, Downloads/9p sharing, and guest-to-Android host bridge
 - Read-only SquashFS system image plus persistent ext4 overlay and versioned migrations
+- Validated MVP VM identity `default`, with all VM files confined to `filesDir/instances/default`; legacy root-level VM files move there without overwrite before launch
 - `/dev/net/tun`, FUSE, shared-mount, cgroup v2, ZRAM, and basic OOM prerequisites for later guest-side orchestration
 - No default password, bundled SSH key, or generated host key in source
 

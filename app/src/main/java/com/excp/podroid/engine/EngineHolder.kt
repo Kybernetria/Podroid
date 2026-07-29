@@ -21,6 +21,7 @@ import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.engine.avf.AvfCapabilities
 import com.excp.podroid.engine.avf.AvfDiagnostics
 import com.excp.podroid.engine.avf.AvfEngine
+import com.excp.podroid.vm.VmId
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -305,6 +306,7 @@ class EngineHolder @Inject constructor(
         _currentFlow.value = next
     }
 
+    override val vmId: VmId get() = current.vmId
     override val runningSinceMs: Long? get() = current.runningSinceMs
     override fun emulatorRssMb(): Long? = current.emulatorRssMb()
     override fun emulatorPid(): Int? = current.emulatorPid()
@@ -341,6 +343,7 @@ class EngineHolder @Inject constructor(
         set(v) { current.sessionClientDelegate = v }
 
     override suspend fun start(portForwards: List<PortForwardRule>, config: VmConfig) {
+        require(config.vmId == vmId) { "Engine holder ${vmId.serialized} cannot start ${config.vmId.serialized}" }
         // Guarantee the first Start runs on the correctly-picked engine even on a
         // fast cold launch where Start beats the init publish coroutine. start()
         // is always called off-main (PodroidService.launchPodroid → withContext

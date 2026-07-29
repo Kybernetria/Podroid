@@ -74,10 +74,8 @@ import com.excp.podroid.data.repository.PortForwardRule
 import com.excp.podroid.engine.EngineSelection
 import com.excp.podroid.engine.VmState
 import com.excp.podroid.engine.avf.AvfDiagnostics
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.rememberCoroutineScope
-import kotlinx.coroutines.withContext
 import com.excp.podroid.ui.components.AdaptiveContainer
 import com.excp.podroid.ui.components.PodroidDestructiveButton
 import com.excp.podroid.ui.components.PodroidGhostButton
@@ -394,7 +392,7 @@ fun SettingsScreen(
                         avfScope.launch {
                             val probe = AvfDiagnostics.probe(ctx)
                             val smoke = if (probe.featureSupported && probe.managePermissionGranted) {
-                                withContext(Dispatchers.IO) { AvfDiagnostics.runSmokeTest(ctx) }
+                                viewModel.runAvfSmokeTest()
                             } else null
                             avfReportText = probe.copy(
                                 smokeTestResult = smoke,

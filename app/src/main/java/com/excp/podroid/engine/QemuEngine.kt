@@ -30,6 +30,8 @@ import android.util.Log
 import com.excp.podroid.data.repository.PortForwardRule
 import com.excp.podroid.util.HostMetrics
 import com.excp.podroid.util.LogProxy
+import com.excp.podroid.vm.VmId
+import com.excp.podroid.vm.VmPaths
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -51,7 +53,9 @@ import javax.inject.Singleton
 class QemuEngine @Inject constructor(
     @ApplicationContext private val context: Context,
     private val settingsRepository: com.excp.podroid.data.repository.SettingsRepository,
+    private val vmPaths: VmPaths,
 ) : VmEngine {
+    override val vmId: VmId = vmPaths.vmId
     private val _state = MutableStateFlow<VmState>(VmState.Idle)
     override val state: StateFlow<VmState> = _state.asStateFlow()
 
@@ -98,10 +102,10 @@ class QemuEngine @Inject constructor(
         private set
 
     /** Unix socket paths exposed to TerminalViewModel for the bridge binary. */
-    val serialSockPath: String get() = "${context.filesDir.absolutePath}/serial.sock"
-    val terminalSockPath: String get() = "${context.filesDir.absolutePath}/terminal.sock"
-    val ctrlSockPath: String get() = "${context.filesDir.absolutePath}/ctrl.sock"
-    val hostSockPath: String get() = "${context.filesDir.absolutePath}/host.sock"
+    val serialSockPath: String get() = vmPaths.serialSocket.absolutePath
+    val terminalSockPath: String get() = vmPaths.terminalSocket.absolutePath
+    val ctrlSockPath: String get() = vmPaths.controlSocket.absolutePath
+    val hostSockPath: String get() = vmPaths.hostSocket.absolutePath
 
     /**
      * Last QEMU process exit code (null until it exits) + a bounded tail of
@@ -113,7 +117,7 @@ class QemuEngine @Inject constructor(
     private var lastExitCode: Int? = null
     private val stderrTail = ArrayDeque<String>()
 
-    private val qmpSocketPath: String get() = "${context.filesDir.absolutePath}/qmp.sock"
+    private val qmpSocketPath: String get() = vmPaths.qmpSocket.absolutePath
 
     override val qmpClient: QmpClient? by lazy { QmpClient(qmpSocketPath) }
 
@@ -218,7 +222,7 @@ class QemuEngine @Inject constructor(
 
             val sess = TerminalSession(
                 bridgeExe.absolutePath,
-                context.filesDir.absolutePath,
+                vmPaths.qemuWorkingDirectory.absolutePath,
                 arrayOf(bridgeExe.absolutePath, terminalSockPath, ctrlSockPath),
                 null,
                 2000,
@@ -257,7 +261,7 @@ class QemuEngine @Inject constructor(
 
         val sess = TerminalSession(
             bridgeExe.absolutePath,
-            context.filesDir.absolutePath,
+            vmPaths.qemuWorkingDirectory.absolutePath,
             arrayOf(bridgeExe.absolutePath, terminalSockPath, ctrlSockPath),
             null,
             2000,
@@ -273,6 +277,7 @@ class QemuEngine @Inject constructor(
     }
 
     override suspend fun start(portForwards: List<PortForwardRule>, config: VmConfig) {
+        require(config.vmId == vmId) { "QEMU engine ${vmId.serialized} cannot start ${config.vmId.serialized}" }
         // Atomically check the re-entrancy guard AND claim Starting before any
         // I/O, so two concurrent ACTION_STARTs can't both pass the guard and
         // launch a second QEMU. Held only across the guard + state flip.
@@ -318,19 +323,15 @@ class QemuEngine @Inject constructor(
         // Clean up stale sockets from a previous run. qmp.sock must be
         // included — a leftover file from a crashed QEMU prevents the new
         // process from binding its QMP server socket.
-        File(serialSockPath).delete()
-        File(terminalSockPath).delete()
-        File(ctrlSockPath).delete()
-        File(qmpSocketPath).delete()
-        File(hostSockPath).delete()
+        qemuRuntimeSockets().forEach { it.delete() }
 
         try {
             val cmd = buildCommand(qemuExe, portForwards, config)
             Log.d(TAG, "Launching QEMU with ${cmd.size} args: $cmd")
 
             val nativeDir = context.applicationInfo.nativeLibraryDir
-            val pb = ProcessBuilder(cmd).directory(context.filesDir)
-            pb.environment()["LD_LIBRARY_PATH"] = "$nativeDir:${context.filesDir.absolutePath}"
+            val pb = ProcessBuilder(cmd).directory(vmPaths.qemuWorkingDirectory)
+            pb.environment()["LD_LIBRARY_PATH"] = "$nativeDir:${vmPaths.qemuDataDirectory.absolutePath}"
             // Discard QEMU's stdout. Nothing routes there today (serial/QMP use
             // sockets), but user extra args like `-monitor stdio` could, and an
             // unread OS pipe would fill its buffer and deadlock the VM. Redirect
@@ -373,7 +374,7 @@ class QemuEngine @Inject constructor(
             // Boot monitor — connects to serial.sock once QEMU creates it and
             // streams the guest console into console.log + the boot-stage detector.
             val monitor = QemuBootMonitor(
-                serialSockPath, File(context.filesDir, "console.log"),
+                serialSockPath, vmPaths.consoleLog,
                 detector, _consoleText, SOCKET_READY_TIMEOUT_MS,
             )
             bootMonitor = monitor
@@ -534,11 +535,17 @@ class QemuEngine @Inject constructor(
         sessionClientDelegate = null
         _consoleText.value = ""
         _runningSinceMs = null
-        File(serialSockPath).delete()
-        File(terminalSockPath).delete()
-        File(ctrlSockPath).delete()
+        qemuRuntimeSockets().forEach { it.delete() }
         _bootStage.value = ""
     }
+
+    private fun qemuRuntimeSockets(): List<File> = listOf(
+        vmPaths.serialSocket,
+        vmPaths.terminalSocket,
+        vmPaths.controlSocket,
+        vmPaths.hostSocket,
+        vmPaths.qmpSocket,
+    )
 
     private fun buildCommand(
         qemuExe: File,
@@ -558,8 +565,8 @@ class QemuEngine @Inject constructor(
         args += "-smp"; args += "${config.cpus}"
         args += "-m";   args += "${config.ramMb}"
 
-        val kernelPath = File(context.filesDir, "vmlinuz-virt")
-        val initrdPath = File(context.filesDir, "initrd.img")
+        val kernelPath = vmPaths.kernel
+        val initrdPath = vmPaths.initrd
 
         if (kernelPath.exists()) {
             args += "-kernel"; args += kernelPath.absolutePath
@@ -583,7 +590,7 @@ class QemuEngine @Inject constructor(
             Log.w(TAG, "Initrd not found!")
         }
 
-        val storagePath = File(context.filesDir, "storage.img")
+        val storagePath = vmPaths.storageImage
         if (storagePath.exists()) {
             // Single dedicated iothread for the writable disk. Multi-iothread
             // fan-out via `iothread-vq-mapping` requires `-device <full-json>`
@@ -600,7 +607,7 @@ class QemuEngine @Inject constructor(
             args += "-drive";  args += "file=${storagePath.absolutePath},if=none,id=drive1,format=raw,cache=writeback,aio=threads,discard=unmap,detect-zeroes=unmap"
         }
 
-        val rootfsImg = File(context.filesDir, "alpine-rootfs.squashfs")
+        val rootfsImg = vmPaths.rootfs
         if (rootfsImg.exists()) {
             // Dedicated iothread for the read-only squashfs so its decompression
             // reads don't queue behind storage.img writes on iothread0.
@@ -671,6 +678,8 @@ class QemuEngine @Inject constructor(
         args += "-device";  args += "virtconsole,chardev=host0,name=org.podroid.host"
 
         args += "-display"; args += "none"
+        // Explicitly confine QEMU firmware/ROM/keymap lookup to this instance.
+        args += "-L";       args += vmPaths.qemuDataDirectory.absolutePath
         args += "-qmp";     args += "unix:$qmpSocketPath,server,nowait"
 
         // User extras appended last so later -cpu / -accel overrides earlier ones.
@@ -691,7 +700,7 @@ class QemuEngine @Inject constructor(
     }
 
     private fun ensureStorageImage(storageSizeGb: Int) {
-        val storageFile = File(context.filesDir, "storage.img")
+        val storageFile = vmPaths.storageImage
         val desiredBytes = storageSizeGb.toLong() * 1024L * 1024L * 1024L
 
         if (storageFile.exists()) {

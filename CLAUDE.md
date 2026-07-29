@@ -64,7 +64,7 @@ Native binaries require **16KB page alignment** (`-Wl,-z,max-page-size=16384`) -
 
 ### Engine abstraction (the most important thing to understand)
 
-Everything VM-related goes through `engine/VmEngine.kt`, a single interface implemented by two backends and one router:
+Everything VM-related goes through `engine/VmEngine.kt`, a single interface implemented by two backends and one router. The MVP instance identity is exactly `VmId.DEFAULT` (`default`), and the injected `vm/VmPaths.kt` confines its files to `filesDir/instances/default`; `PodroidApplication` runs the fail-closed legacy move before extracting assets or allowing launch:
 
 - **`QemuEngine.kt`** - QEMU/TCG. Software emulation, SLIRP user-mode networking, control via QMP and virtio-console Unix sockets. No special permission.
 - **`engine/avf/AvfEngine.kt`** - AVF/pKVM. Uses the Android Virtualization Framework (reached by reflection in `AvfReflect.kt`); networking and control ride **vsock**. Hardware-accelerated; needs `MANAGE_VIRTUAL_MACHINE` + `USE_CUSTOM_VIRTUAL_MACHINE` granted via `pm grant`.
@@ -83,7 +83,7 @@ QmpClient             <->  qmp.sock (QEMU only)        -> runtime port forwards 
 HostRequestServer     <->  host.sock/hvc2 (QEMU) | vsock:9101 (AVF)    <- podroid-notify / podroid-forward
 ```
 
-QEMU exposes these Unix sockets under `context.filesDir`, each with one role:
+QEMU exposes these Unix sockets under `filesDir/instances/default`, each with one role:
 
 - **`terminal.sock`** ↔ virtio-console `/dev/hvc0` - primary terminal I/O. A dedicated getty runs on hvc0 and auto-logs in as guest root; `libpodroid-bridge.so` relays it to a Termux PTY. This is an app-owned guest-console transport, not remote authentication and not an Android shell. Remote Dropbear access remains public-key-only.
 - **`ctrl.sock`** ↔ virtio-console `/dev/hvc1` - resize channel. The bridge debounces SIGWINCH bursts and writes one `RESIZE rows cols\n`; a guest resize daemon `stty`s hvc0.
@@ -141,7 +141,7 @@ Single-activity Compose app: `ui/navigation/NavGraph.kt` routes `setup → home 
 │       │   ├── MainActivity.kt           # single Activity, locale wrap, WindowSizeClass
 │       │   ├── PodroidApplication.kt     # Hilt app, asset extraction on first run
 │       │   ├── engine/
-│       │   │   ├── VmEngine.kt           # backend interface
+│       │   │   ├── VmEngine.kt           # backend interface carrying VmId
 │       │   │   ├── EngineHolder.kt       # Hilt binding; routes to current engine; port-forward diff
 │       │   │   ├── EngineModule.kt, EngineSelection.kt
 │       │   │   ├── QemuEngine.kt         # QEMU/TCG backend, buildCommand()
@@ -151,6 +151,7 @@ Single-activity Compose app: `ui/navigation/NavGraph.kt` routes `setup → home 
 │       │   │   ├── avf/                  # AVF/pKVM backend (engine, reflection, vsock, console)
 │       │   │   ├── hostbridge/           # guest->Android bridge (transport, server, dispatcher, notify)
 │       │   │   └── usb/                  # UsbPassthroughManager
+│       │   ├── vm/                       # validated VmId, confined VmPaths, legacy path migration
 │       │   ├── service/PodroidService.kt # foreground service; owns VM lifecycle, wakelock, notification
 │       │   ├── data/repository/          # Settings, PortForward, Update, Language (all DataStore)
 │       │   ├── di/                       # Hilt module
@@ -219,7 +220,7 @@ In `QemuEngine.buildCommand()`: `tcg,thread=multi`, larger `tb-size` for ≥2GB 
 - **SLIRP has no ICMP** (`ping` fails in the guest) and its DNS forwarder is unreliable on Android (resolv.conf uses public DNS).
 - **Privileged ports**: the app can't bind host ports < 1024 (no `CAP_NET_BIND_SERVICE`), so SSH is on 9922, not 22. Forward to a high host port.
 - **Reflection into the vendored Termux fork** (`mTermSession`, `mEmulator`, `mCurrentDecSetFlags`) is kept by `app/proguard-rules.pro`.
-- **Persistence is sacred**: DataStore keys and `filesDir` paths survive every release; renames need migration. Updates must install in place (same `applicationId` + signing key, monotonic `versionCode`).
+- **Persistence is sacred**: DataStore keys and `filesDir` paths survive every release; renames need migration. Ticket #6 moves legacy VM files atomically and without overwrite into `filesDir/instances/default` before extraction/launch; do not reintroduce VM storage, assets, logs, QMP, or sockets at the shared root. Updates must install in place (same `applicationId` + signing key, monotonic `versionCode`).
 
 ## VM migration / upgrades (how the guest updates without a reset)
 

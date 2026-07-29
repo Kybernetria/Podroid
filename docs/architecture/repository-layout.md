@@ -1,17 +1,19 @@
 # Repository Layout
 
-Milestone 1 adds tracked ownership markers only. No new directory is included by Gradle, and no inherited source is moved.
+Milestone 1 began with tracked ownership markers only. Ticket #6 now implements
+the VM identity and storage-path slices incrementally inside the existing `app/`
+Gradle module; no inherited source is moved and later skeletons remain inactive.
 
 | Area | Intended ownership | Milestone 1 state |
 |---|---|---|
-| `app/` | Existing logical Android application and current runtime | Authoritative, unchanged |
+| `app/` | Existing logical Android application and current runtime | Authoritative; includes ticket #6 VM identity/path implementation |
 | `android-app/platform/` | Android APIs, permissions, networking hooks | README skeleton |
 | `android-app/ui/` | Android presentation and user interaction | README skeleton |
 | `android-app/vm-service/` | Foreground service and one-active-VM coordination | README skeleton |
-| `vm-core/model/` | Distro-neutral VM domain values | README skeleton |
+| `vm-core/model/` | Distro-neutral VM domain values | `VmId` slice implemented in `app/.../vm/`; module extraction deferred |
 | `vm-core/qemu/` | QEMU process adapter | README skeleton |
 | `vm-core/qmp/` | Bounded QMP client contract | README skeleton |
-| `vm-core/storage/` | Guest image and attachment lifecycle | README skeleton |
+| `vm-core/storage/` | Guest image and attachment lifecycle | Instance paths + legacy migration implemented in `app/.../vm/`; module extraction deferred |
 | `vm-core/lifecycle/` | Serialized VM state machine | README skeleton |
 | `transport/api/` | Transport-neutral authenticated connection interfaces | README skeleton |
 | `transport/tailscale-android/` | Official Tailscale/libtailscale Android adapter | README skeleton |

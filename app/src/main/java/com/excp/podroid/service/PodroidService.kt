@@ -331,6 +331,7 @@ class PodroidService : Service() {
                     }
 
                     val config = VmConfig(
+                        vmId = engine.vmId,
                         ramMb = settingsRepository.getVmRamMbSnapshot(),
                         cpus = settingsRepository.getVmCpusSnapshot(),
                         sshEnabled = sshEnabled,

@@ -33,6 +33,6 @@ These are not alternate interpretations of the MVP:
 - Implementations of alternate transports.
 - Patched-Android enablement through `my-avbroot-setup`.
 - Multiple installed VM definitions, if ever needed. They do not relax the one-active-VM invariant.
-- Any feature implementation represented by the Milestone 1 skeleton.
+- Any remaining feature implementation represented only by a Milestone 1 skeleton. Ticket #6 is the first implemented slice: `VmId.DEFAULT` and confined default-instance paths; it does not activate later manager, Binder, desired-state, or reconciliation skeletons.
 
-The current AVF and other inherited features remain where they are; this milestone neither removes nor extends them. QEMU/TCG is the fixed MVP baseline for stock Android.
+The current AVF and other inherited features remain where they are; ticket #6 only routes both backends through the same default-instance paths. QEMU/TCG is the fixed MVP baseline for stock Android.
