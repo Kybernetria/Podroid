@@ -141,7 +141,13 @@ class VmServiceClient @Inject internal constructor(
     suspend fun runtimeMetrics(): VmRuntimeMetrics = call { it.runtimeMetrics() }
     suspend fun diagnostics(request: VmDiagnosticsRequest): VmDiagnostics = call { it.diagnostics(request) }
     suspend fun backendProbe(): VmBackendProbe = call { it.backendProbe() }
-    suspend fun runBackendSmokeTest(): String = call { it.runBackendSmokeTest() }
+    suspend fun runBackendSmokeTest(): String {
+        bind()
+        return state.boundedCommand(
+            timeoutMs = DEFAULT_BACKEND_SMOKE_TOTAL_DEADLINE_MS,
+            timeoutResult = backendSmokeDeadlineResult(DEFAULT_BACKEND_SMOKE_TOTAL_DEADLINE_MS),
+        ) { it.runBackendSmokeTest() }
+    }
     suspend fun setHeadlessMode(active: Boolean) = call { it.setHeadlessMode(active) }
 
     fun createTerminalSession(client: TerminalSessionClient): TerminalSession =

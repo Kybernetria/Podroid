@@ -12,6 +12,12 @@ class UiVmBoundaryVerifierTest(unittest.TestCase):
             path.write_text(source, encoding="utf-8")
             return verify(Path(directory))
 
+    def verify_java_source(self, source: str):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Screen.java"
+            path.write_text(source, encoding="utf-8")
+            return verify(Path(directory))
+
     def assert_rejected(self, source: str):
         self.assertTrue(self.verify_source(source), source)
 
@@ -23,7 +29,7 @@ class UiVmBoundaryVerifierTest(unittest.TestCase):
 
             empty = temporary / "empty"
             empty.mkdir()
-            self.assertTrue(any("no Kotlin sources" in failure for failure in verify(empty)))
+            self.assertTrue(any("no Kotlin or Java sources" in failure for failure in verify(empty)))
 
     def test_project_requires_at_least_one_production_ui_root(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -56,7 +62,19 @@ class UiVmBoundaryVerifierTest(unittest.TestCase):
             repository = Path(directory)
             (repository / "app/src/main/kotlin/com/excp/podroid/ui").mkdir(parents=True)
             failures = verify_project(repository)
-            self.assertTrue(any("no Kotlin sources" in failure for failure in failures))
+            self.assertTrue(any("no Kotlin or Java sources" in failure for failure in failures))
+
+    def test_forbidden_java_ui_source_fails_closed(self):
+        failures = self.verify_java_source(
+            "import com.excp.podroid.engine.VmEngine; class Screen { VmEngine engine; }"
+        )
+        self.assertTrue(any("Java UI source is unsupported" in failure for failure in failures))
+        self.assertTrue(any("Screen.java" in failure for failure in failures))
+
+    def test_benign_java_ui_source_also_fails_closed_and_counts_as_nonempty(self):
+        failures = self.verify_java_source("final class Screen {}")
+        self.assertTrue(any("Java UI source is unsupported" in failure for failure in failures))
+        self.assertFalse(any("no Kotlin or Java sources" in failure for failure in failures))
 
     def test_accepts_service_client_and_reviewed_dtos(self):
         self.assertEqual([], self.verify_source(

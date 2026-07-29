@@ -18,6 +18,8 @@ import com.excp.podroid.vm.VmSummary
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -28,6 +30,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -109,6 +112,119 @@ class VmServiceContractTest {
         assertTrue(result.contains("exceeded total 50ms Binder deadline"))
         assertEquals(listOf("status"), manager.calls)
         assertTrue("elapsed=${elapsedMs}ms", elapsedMs < 500)
+    }
+
+    @Test
+    fun `client smoke deadline includes command queue and timed out smoke never runs`() = runBlocking {
+        val scopeJob = SupervisorJob()
+        val scope = CoroutineScope(scopeJob + Dispatchers.Default)
+        val smokeCalls = AtomicInteger()
+        val state = VmBindingStateMachine(scope, observation(VmLifecycleState.IDLE), 500)
+        state.connected(FakeEndpoint(observation(VmLifecycleState.IDLE)) {
+            smokeCalls.incrementAndGet()
+            "smoke ran"
+        })
+        val precedingEntered = CompletableDeferred<Unit>()
+        val releasePreceding = CompletableDeferred<Unit>()
+        val preceding = launch(Dispatchers.Default) {
+            state.command {
+                precedingEntered.complete(Unit)
+                releasePreceding.await()
+            }
+        }
+        precedingEntered.await()
+        val startedNanos = System.nanoTime()
+
+        val result = try {
+            withTimeout(500) {
+                state.boundedCommand(
+                    timeoutMs = 50,
+                    timeoutResult = backendSmokeDeadlineResult(50),
+                ) { it.runBackendSmokeTest() }
+            }
+        } finally {
+            releasePreceding.complete(Unit)
+            preceding.join()
+        }
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos)
+        state.command { Unit }
+
+        assertTrue(result.contains("exceeded total 50ms Binder deadline"))
+        assertTrue("elapsed=${elapsedMs}ms", elapsedMs < 500)
+        assertEquals(0, smokeCalls.get())
+        scopeJob.cancel()
+    }
+
+    @Test
+    fun `client remaining smoke budget bounds a longer nested endpoint deadline`() = runBlocking {
+        val scopeJob = SupervisorJob()
+        val scope = CoroutineScope(scopeJob + Dispatchers.Default)
+        val smokeStarted = CompletableDeferred<Unit>()
+        val smokeCancelled = CompletableDeferred<Unit>()
+        val smoke = object : VmServiceAuxiliaryCapabilities by FakeAuxiliary {
+            override suspend fun runBackendSmokeTest(): String = try {
+                smokeStarted.complete(Unit)
+                awaitCancellation()
+            } finally {
+                smokeCancelled.complete(Unit)
+            }
+        }
+        val state = VmBindingStateMachine(scope, observation(VmLifecycleState.IDLE), 500)
+        state.connected(endpoint(auxiliary = smoke, backendSmokeTotalDeadlineMs = 500))
+        val startedNanos = System.nanoTime()
+
+        val result = state.boundedCommand(
+            timeoutMs = 50,
+            timeoutResult = backendSmokeDeadlineResult(50),
+        ) { it.runBackendSmokeTest() }
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos)
+        withTimeout(200) { smokeCancelled.await() }
+
+        assertTrue(smokeStarted.isCompleted)
+        assertTrue(result.contains("exceeded total 50ms Binder deadline"))
+        assertTrue("elapsed=${elapsedMs}ms", elapsedMs < 500)
+        scopeJob.cancel()
+    }
+
+    @Test
+    fun `endpoint smoke deadline includes command queue and timed out smoke never runs`() = runBlocking {
+        val manager = FakeManager()
+        val smokeCalls = AtomicInteger()
+        val smoke = object : VmServiceAuxiliaryCapabilities by FakeAuxiliary {
+            override suspend fun runBackendSmokeTest(): String {
+                smokeCalls.incrementAndGet()
+                return "smoke ran"
+            }
+        }
+        val precedingEntered = CompletableDeferred<Unit>()
+        val releasePreceding = CompletableDeferred<Unit>()
+        val holdingManager = object : VmManager by manager {
+            override suspend fun ensureInstalled(vmId: VmId) {
+                precedingEntered.complete(Unit)
+                releasePreceding.await()
+            }
+        }
+        val endpoint = endpoint(
+            manager = holdingManager,
+            auxiliary = smoke,
+            backendSmokeTotalDeadlineMs = 50,
+        )
+        val preceding = launch(Dispatchers.Default) { endpoint.ensureInstalled() }
+        precedingEntered.await()
+        val startedNanos = System.nanoTime()
+
+        val result = try {
+            withTimeout(500) { endpoint.runBackendSmokeTest() }
+        } finally {
+            releasePreceding.complete(Unit)
+            preceding.join()
+        }
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos)
+        endpoint.ensureInstalled()
+
+        assertTrue(result.contains("exceeded total 50ms Binder deadline"))
+        assertTrue("elapsed=${elapsedMs}ms", elapsedMs < 500)
+        assertEquals(0, smokeCalls.get())
     }
 
     @Test
@@ -202,7 +318,10 @@ class VmServiceContractTest {
         override suspend fun diagnostics(vmId: VmId, request: VmDiagnosticsRequest) = VmDiagnostics("", false).also { called("diagnostics", vmId) }
     }
 
-    private class FakeEndpoint(initial: VmObservation) : VmServiceEndpoint {
+    private class FakeEndpoint(
+        initial: VmObservation,
+        private val smokeTest: suspend () -> String = { "" },
+    ) : VmServiceEndpoint {
         override val observation = MutableStateFlow(initial)
         override val headlessMode = MutableStateFlow(false)
         var stopCalls = 0
@@ -220,7 +339,7 @@ class VmServiceContractTest {
         override suspend fun runtimeMetrics() = VmRuntimeMetrics(0, null, null)
         override suspend fun diagnostics(request: VmDiagnosticsRequest) = VmDiagnostics("", false)
         override suspend fun backendProbe() = FakeAuxiliary.backendProbe()
-        override suspend fun runBackendSmokeTest() = ""
+        override suspend fun runBackendSmokeTest() = smokeTest()
         override suspend fun setHeadlessMode(active: Boolean) = Unit
         override fun createTerminalSession(client: TerminalSessionClient): TerminalSession = error("not used")
         override fun releaseTerminalClient(client: TerminalSessionClient) = Unit

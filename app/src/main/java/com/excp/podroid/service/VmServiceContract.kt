@@ -134,6 +134,27 @@ internal interface VmServiceAuxiliaryCapabilities {
     fun releaseTerminalClient(client: TerminalSessionClient)
 }
 
+/** A cancellation-aware serialization gate whose bounded wait includes queue admission. */
+internal class BoundedCommandGate {
+    private val mutex = Mutex()
+
+    suspend fun <T> run(block: suspend () -> T): T = mutex.withLock { block() }
+
+    suspend fun <T> runBounded(
+        timeoutMs: Long,
+        timeoutResult: T,
+        block: suspend () -> T,
+    ): T {
+        require(timeoutMs > 0) { "timeoutMs must be positive" }
+        return withTimeoutOrNull(timeoutMs) { mutex.withLock { block() } } ?: timeoutResult
+    }
+}
+
+internal const val DEFAULT_BACKEND_SMOKE_TOTAL_DEADLINE_MS = 15_000L
+
+internal fun backendSmokeDeadlineResult(timeoutMs: Long): String =
+    "FAILED: backend smoke readiness exceeded total ${timeoutMs}ms Binder deadline"
+
 /** Policy implementation behind the Binder; mutation dispatch is serialized. */
 internal class LocalVmServiceEndpoint(
     private val manager: VmManager,
@@ -142,7 +163,7 @@ internal class LocalVmServiceEndpoint(
     private val caller: CallerUidVerifier,
     private val backendSmokeTotalDeadlineMs: Long = DEFAULT_BACKEND_SMOKE_TOTAL_DEADLINE_MS,
 ) : VmServiceEndpoint {
-    private val commands = Mutex()
+    private val commands = BoundedCommandGate()
 
     init {
         require(backendSmokeTotalDeadlineMs > 0) {
@@ -187,11 +208,11 @@ internal class LocalVmServiceEndpoint(
             )
         }
     }
-    override suspend fun runBackendSmokeTest(): String = command {
-        withTimeoutOrNull(backendSmokeTotalDeadlineMs) {
-            auxiliary.runBackendSmokeTest().take(MAX_AUX_TEXT_CHARS)
-        } ?: "FAILED: backend smoke readiness exceeded total " +
-            "${backendSmokeTotalDeadlineMs}ms Binder deadline"
+    override suspend fun runBackendSmokeTest(): String = boundedCommand(
+        timeoutMs = backendSmokeTotalDeadlineMs,
+        timeoutResult = backendSmokeDeadlineResult(backendSmokeTotalDeadlineMs),
+    ) {
+        auxiliary.runBackendSmokeTest().take(MAX_AUX_TEXT_CHARS)
     }
     override suspend fun setHeadlessMode(active: Boolean) = command { auxiliary.setHeadlessMode(active) }
 
@@ -212,14 +233,22 @@ internal class LocalVmServiceEndpoint(
 
     private suspend fun <T> command(block: suspend () -> T): T {
         caller.verify()
-        return commands.withLock { block() }
+        return commands.run(block)
+    }
+
+    private suspend fun <T> boundedCommand(
+        timeoutMs: Long,
+        timeoutResult: T,
+        block: suspend () -> T,
+    ): T {
+        caller.verify()
+        return commands.runBounded(timeoutMs, timeoutResult, block)
     }
 
     companion object {
         private const val MAX_BACKEND_ID_CHARS = 32
         private const val MAX_SHORT_TEXT_CHARS = 256
         private const val MAX_AUX_TEXT_CHARS = 64 * 1024
-        private const val DEFAULT_BACKEND_SMOKE_TOTAL_DEADLINE_MS = 15_000L
     }
 }
 
@@ -239,7 +268,7 @@ internal class VmBindingStateMachine(
     private val _bindingState = MutableStateFlow(VmBindingState.DISCONNECTED)
     private val _observation = MutableStateFlow(initialObservation)
     private val _headlessMode = MutableStateFlow(false)
-    private val commandMutex = Mutex()
+    private val commands = BoundedCommandGate()
     private var mirrorJob: Job? = null
     private var headlessMirrorJob: Job? = null
 
@@ -275,7 +304,16 @@ internal class VmBindingStateMachine(
 
     fun connectedEndpointOrNull(): VmServiceEndpoint? = endpoint.value
 
-    suspend fun <T> command(block: suspend (VmServiceEndpoint) -> T): T = commandMutex.withLock {
+    suspend fun <T> command(block: suspend (VmServiceEndpoint) -> T): T =
+        commands.run { withConnectedEndpoint(block) }
+
+    suspend fun <T> boundedCommand(
+        timeoutMs: Long,
+        timeoutResult: T,
+        block: suspend (VmServiceEndpoint) -> T,
+    ): T = commands.runBounded(timeoutMs, timeoutResult) { withConnectedEndpoint(block) }
+
+    private suspend fun <T> withConnectedEndpoint(block: suspend (VmServiceEndpoint) -> T): T {
         val connected = try {
             withTimeout(connectionTimeoutMs) { endpoint.filterNotNull().first() }
         } catch (timeout: TimeoutCancellationException) {
@@ -283,6 +321,6 @@ internal class VmBindingStateMachine(
         } catch (cancelled: CancellationException) {
             throw cancelled
         }
-        block(connected)
+        return block(connected)
     }
 }

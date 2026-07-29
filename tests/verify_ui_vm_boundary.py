@@ -121,10 +121,17 @@ def verify(root: Path) -> list[str]:
     if not root.is_dir():
         return [f"{root}: production UI root is not a directory"]
     kotlin_sources = sorted(root.rglob("*.kt"))
-    if not kotlin_sources:
-        return [f"{root}: production UI root contains no Kotlin sources"]
+    java_sources = sorted(root.rglob("*.java"))
+    if not kotlin_sources and not java_sources:
+        return [f"{root}: production UI root contains no Kotlin or Java sources"]
 
-    failures: list[str] = []
+    # Java syntax is deliberately rejected rather than being scanned with the
+    # Kotlin rules below. This keeps every production UI source covered until
+    # reviewed Java-aware boundary and path rules are implemented.
+    failures = [
+        f"{path}: Java UI source is unsupported; failing closed until Java-aware rules are reviewed"
+        for path in java_sources
+    ]
     for path in kotlin_sources:
         text = path.read_text(encoding="utf-8")
         uncommented = _without_comments(text)
