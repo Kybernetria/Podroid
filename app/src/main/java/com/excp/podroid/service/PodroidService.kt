@@ -116,10 +116,11 @@ class PodroidService : Service() {
                     return report.toServiceDto(engine.backendId)
                 }
 
-                override suspend fun runBackendSmokeTest(): String {
+                override suspend fun runBackendSmokeTest(deadlineNanos: Long): String {
                     val report = com.excp.podroid.engine.avf.AvfDiagnostics.runSmokeTest(
                         this@PodroidService,
                         vmPaths,
+                        deadlineNanos,
                     )
                     return report
                         .replace(vmPaths.instanceDirectory.absolutePath, "[default VM]")

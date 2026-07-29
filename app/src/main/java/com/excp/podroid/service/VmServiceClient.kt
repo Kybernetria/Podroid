@@ -13,6 +13,7 @@ import android.util.Log
 import com.excp.podroid.di.ApplicationScope
 import com.excp.podroid.vm.ConsoleLog
 import com.excp.podroid.vm.ConsoleLogRequest
+import com.excp.podroid.vm.MonotonicDeadline
 import com.excp.podroid.vm.SshEndpointDiscovery
 import com.excp.podroid.vm.VmDiagnostics
 import com.excp.podroid.vm.VmDiagnosticsRequest
@@ -142,11 +143,14 @@ class VmServiceClient @Inject internal constructor(
     suspend fun diagnostics(request: VmDiagnosticsRequest): VmDiagnostics = call { it.diagnostics(request) }
     suspend fun backendProbe(): VmBackendProbe = call { it.backendProbe() }
     suspend fun runBackendSmokeTest(): String {
+        val deadlineNanos = MonotonicDeadline.afterMillis(
+            DEFAULT_BACKEND_SMOKE_TOTAL_DEADLINE_MS,
+        )
         bind()
-        return state.boundedCommand(
-            timeoutMs = DEFAULT_BACKEND_SMOKE_TOTAL_DEADLINE_MS,
+        return state.commandUntil(
+            deadlineNanos = deadlineNanos,
             timeoutResult = backendSmokeDeadlineResult(DEFAULT_BACKEND_SMOKE_TOTAL_DEADLINE_MS),
-        ) { it.runBackendSmokeTest() }
+        ) { it.runBackendSmokeTest(deadlineNanos) }
     }
     suspend fun setHeadlessMode(active: Boolean) = call { it.setHeadlessMode(active) }
 

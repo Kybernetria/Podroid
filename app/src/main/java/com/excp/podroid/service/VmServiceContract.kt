@@ -6,6 +6,7 @@ package com.excp.podroid.service
 
 import com.excp.podroid.vm.ConsoleLog
 import com.excp.podroid.vm.ConsoleLogRequest
+import com.excp.podroid.vm.MonotonicDeadline
 import com.excp.podroid.vm.SshEndpointDiscovery
 import com.excp.podroid.vm.VmDiagnostics
 import com.excp.podroid.vm.VmDiagnosticsRequest
@@ -21,6 +22,7 @@ import com.excp.podroid.vm.VmSummary
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -35,6 +37,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.time.Duration.Companion.nanoseconds
 
 /** DTO returned by the service-owned AVF capability probe. */
 sealed interface VmUiState {
@@ -102,7 +105,8 @@ interface VmServiceEndpoint {
     suspend fun runtimeMetrics(): VmRuntimeMetrics
     suspend fun diagnostics(request: VmDiagnosticsRequest): VmDiagnostics
     suspend fun backendProbe(): VmBackendProbe
-    suspend fun runBackendSmokeTest(): String
+    /** [deadlineNanos] is an absolute process-local [System.nanoTime] deadline. */
+    suspend fun runBackendSmokeTest(deadlineNanos: Long): String
     suspend fun setHeadlessMode(active: Boolean)
     fun createTerminalSession(client: TerminalSessionClient): TerminalSession
     fun releaseTerminalClient(client: TerminalSessionClient)
@@ -128,25 +132,36 @@ internal interface VmServiceLifecycleCommands {
 internal interface VmServiceAuxiliaryCapabilities {
     val headlessMode: StateFlow<Boolean>
     fun backendProbe(): VmBackendProbe
-    suspend fun runBackendSmokeTest(): String
+    suspend fun runBackendSmokeTest(deadlineNanos: Long): String
     fun setHeadlessMode(active: Boolean)
     fun createTerminalSession(client: TerminalSessionClient): TerminalSession
     fun releaseTerminalClient(client: TerminalSessionClient)
 }
 
 /** A cancellation-aware serialization gate whose bounded wait includes queue admission. */
-internal class BoundedCommandGate {
+internal class BoundedCommandGate(
+    private val nanoTime: () -> Long = System::nanoTime,
+) {
     private val mutex = Mutex()
 
     suspend fun <T> run(block: suspend () -> T): T = mutex.withLock { block() }
 
-    suspend fun <T> runBounded(
-        timeoutMs: Long,
+    suspend fun <T> runUntil(
+        deadlineNanos: Long,
         timeoutResult: T,
         block: suspend () -> T,
     ): T {
-        require(timeoutMs > 0) { "timeoutMs must be positive" }
-        return withTimeoutOrNull(timeoutMs) { mutex.withLock { block() } } ?: timeoutResult
+        val remainingNanos = MonotonicDeadline.remainingNanos(deadlineNanos, nanoTime)
+        if (remainingNanos == 0L) return timeoutResult
+        return withTimeoutOrNull(remainingNanos.nanoseconds) {
+            mutex.withLock {
+                if (MonotonicDeadline.remainingNanos(deadlineNanos, nanoTime) == 0L) {
+                    timeoutResult
+                } else {
+                    block()
+                }
+            }
+        } ?: timeoutResult
     }
 }
 
@@ -162,8 +177,9 @@ internal class LocalVmServiceEndpoint(
     private val auxiliary: VmServiceAuxiliaryCapabilities,
     private val caller: CallerUidVerifier,
     private val backendSmokeTotalDeadlineMs: Long = DEFAULT_BACKEND_SMOKE_TOTAL_DEADLINE_MS,
+    private val nanoTime: () -> Long = System::nanoTime,
 ) : VmServiceEndpoint {
-    private val commands = BoundedCommandGate()
+    private val commands = BoundedCommandGate(nanoTime)
 
     init {
         require(backendSmokeTotalDeadlineMs > 0) {
@@ -208,11 +224,19 @@ internal class LocalVmServiceEndpoint(
             )
         }
     }
-    override suspend fun runBackendSmokeTest(): String = boundedCommand(
-        timeoutMs = backendSmokeTotalDeadlineMs,
-        timeoutResult = backendSmokeDeadlineResult(backendSmokeTotalDeadlineMs),
-    ) {
-        auxiliary.runBackendSmokeTest().take(MAX_AUX_TEXT_CHARS)
+    override suspend fun runBackendSmokeTest(deadlineNanos: Long): String {
+        caller.verify()
+        val endpointDeadlineNanos = MonotonicDeadline.clamp(
+            callerDeadlineNanos = deadlineNanos,
+            maximumTimeoutMs = backendSmokeTotalDeadlineMs,
+            nanoTime = nanoTime,
+        ) ?: return backendSmokeDeadlineResult(backendSmokeTotalDeadlineMs)
+        return commands.runUntil(
+            deadlineNanos = endpointDeadlineNanos,
+            timeoutResult = backendSmokeDeadlineResult(backendSmokeTotalDeadlineMs),
+        ) {
+            auxiliary.runBackendSmokeTest(endpointDeadlineNanos).take(MAX_AUX_TEXT_CHARS)
+        }
     }
     override suspend fun setHeadlessMode(active: Boolean) = command { auxiliary.setHeadlessMode(active) }
 
@@ -236,15 +260,6 @@ internal class LocalVmServiceEndpoint(
         return commands.run(block)
     }
 
-    private suspend fun <T> boundedCommand(
-        timeoutMs: Long,
-        timeoutResult: T,
-        block: suspend () -> T,
-    ): T {
-        caller.verify()
-        return commands.runBounded(timeoutMs, timeoutResult, block)
-    }
-
     companion object {
         private const val MAX_BACKEND_ID_CHARS = 32
         private const val MAX_SHORT_TEXT_CHARS = 256
@@ -263,12 +278,13 @@ internal class VmBindingStateMachine(
     private val scope: CoroutineScope,
     initialObservation: VmObservation,
     private val connectionTimeoutMs: Long = 5_000L,
+    private val nanoTime: () -> Long = System::nanoTime,
 ) {
     private val endpoint = MutableStateFlow<VmServiceEndpoint?>(null)
     private val _bindingState = MutableStateFlow(VmBindingState.DISCONNECTED)
     private val _observation = MutableStateFlow(initialObservation)
     private val _headlessMode = MutableStateFlow(false)
-    private val commands = BoundedCommandGate()
+    private val commands = BoundedCommandGate(nanoTime)
     private var mirrorJob: Job? = null
     private var headlessMirrorJob: Job? = null
 
@@ -305,17 +321,33 @@ internal class VmBindingStateMachine(
     fun connectedEndpointOrNull(): VmServiceEndpoint? = endpoint.value
 
     suspend fun <T> command(block: suspend (VmServiceEndpoint) -> T): T =
-        commands.run { withConnectedEndpoint(block) }
+        commands.run { withConnectedEndpoint(null, block) }
 
-    suspend fun <T> boundedCommand(
-        timeoutMs: Long,
+    suspend fun <T> commandUntil(
+        deadlineNanos: Long,
         timeoutResult: T,
         block: suspend (VmServiceEndpoint) -> T,
-    ): T = commands.runBounded(timeoutMs, timeoutResult) { withConnectedEndpoint(block) }
+    ): T = commands.runUntil(deadlineNanos, timeoutResult) {
+        withConnectedEndpoint(deadlineNanos, block)
+    }
 
-    private suspend fun <T> withConnectedEndpoint(block: suspend (VmServiceEndpoint) -> T): T {
+    private suspend fun <T> withConnectedEndpoint(
+        deadlineNanos: Long?,
+        block: suspend (VmServiceEndpoint) -> T,
+    ): T {
+        val connectionWaitNanos = deadlineNanos?.let {
+            minOf(
+                MonotonicDeadline.remainingNanos(it, nanoTime),
+                TimeUnit.MILLISECONDS.toNanos(connectionTimeoutMs),
+            )
+        }
+        if (connectionWaitNanos == 0L) throw IOException("VM service binding deadline exceeded")
         val connected = try {
-            withTimeout(connectionTimeoutMs) { endpoint.filterNotNull().first() }
+            if (connectionWaitNanos == null) {
+                withTimeout(connectionTimeoutMs) { endpoint.filterNotNull().first() }
+            } else {
+                withTimeout(connectionWaitNanos.nanoseconds) { endpoint.filterNotNull().first() }
+            }
         } catch (timeout: TimeoutCancellationException) {
             throw IOException("VM service binding unavailable", timeout)
         } catch (cancelled: CancellationException) {

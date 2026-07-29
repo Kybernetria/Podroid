@@ -14,9 +14,30 @@ import org.junit.Test
 
 class AvfSmokeTestExecutorTest {
     @Test
+    fun `expired deadline does not acquire admission or execute backend work`() {
+        val calls = AtomicInteger()
+        val nowNanos = System.nanoTime()
+
+        val result = executor().execute(
+            deadlineNanos = nowNanos,
+            setup = { calls.incrementAndGet(); Unit },
+            create = { calls.incrementAndGet(); Any() },
+            run = { calls.incrementAndGet() },
+            stop = { calls.incrementAndGet() },
+            deleteByFixedName = { calls.incrementAndGet() },
+        )
+
+        assertTrue(result.timedOut)
+        assertEquals("admission", result.timeoutStage)
+        assertFalse(result.cleanupPending)
+        assertEquals(0, calls.get())
+    }
+
+    @Test
     fun `all uncontrolled operations and ordered cleanup run in one daemon`() {
         val threads = mutableListOf<Pair<String, Boolean>>()
         val result = executor().execute(
+            deadlineNanos = deadline(),
             setup = { threads += currentThread(); Unit },
             create = { threads += currentThread(); Any() },
             run = { threads += currentThread() },
@@ -38,6 +59,7 @@ class AvfSmokeTestExecutorTest {
         val stopCalls = AtomicInteger()
         val deleteCalls = AtomicInteger()
         val result = executor().execute(
+            deadlineNanos = deadline(),
             setup = { Unit },
             create = { error("create rejected") },
             run = { _: Any -> },
@@ -62,6 +84,7 @@ class AvfSmokeTestExecutorTest {
         val deleteEntered = CountDownLatch(1)
         val events = Collections.synchronizedList(mutableListOf<String>())
         val first = executor(operationTimeoutMs = 60, gate = gate).execute(
+            deadlineNanos = deadline(),
             setup = { Unit },
             create = {
                 events += "create-enter"
@@ -87,7 +110,7 @@ class AvfSmokeTestExecutorTest {
 
         releaseCreate.set(true)
         assertTrue(deleteEntered.await(1, TimeUnit.SECONDS))
-        assertEquals(listOf("create-enter", "create-exit", "run", "stop", "delete-enter"), events.toList())
+        assertEquals(listOf("create-enter", "create-exit", "stop", "delete-enter"), events.toList())
         assertTrue(smokeAttempt(gate).busy)
 
         releaseDelete.set(true)
@@ -102,6 +125,7 @@ class AvfSmokeTestExecutorTest {
         val deleteCalls = AtomicInteger()
         val events = Collections.synchronizedList(mutableListOf<String>())
         val first = executor(operationTimeoutMs = 60, gate = gate).execute(
+            deadlineNanos = deadline(),
             setup = { Unit },
             create = { Any() },
             run = { events += "run" },
@@ -129,10 +153,39 @@ class AvfSmokeTestExecutorTest {
     }
 
     @Test
+    fun `propagated caller deadline caps interrupt ignoring operation maximum`() {
+        val gate = AvfSmokeAttemptGate()
+        val releaseCreate = AtomicBoolean(false)
+        val startedNanos = System.nanoTime()
+
+        val result = executor(operationTimeoutMs = 5_000, gate = gate).execute(
+            deadlineNanos = deadline(60),
+            setup = { Unit },
+            create = {
+                blockIgnoringInterrupts(releaseCreate)
+                Any()
+            },
+            run = { },
+            stop = { },
+            deleteByFixedName = { },
+        )
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos)
+
+        assertTrue(result.timedOut)
+        assertTrue(result.cleanupPending)
+        assertTrue("elapsed=${elapsedMs}ms", elapsedMs < 500)
+        assertTrue(smokeAttempt(gate).busy)
+
+        releaseCreate.set(true)
+        assertFalse(awaitAdmittedAttempt(gate).busy)
+    }
+
+    @Test
     fun `forever stuck operation remains reported pending and keeps admission closed`() {
         val gate = AvfSmokeAttemptGate()
         val releaseCreate = AtomicBoolean(false)
         val first = executor(operationTimeoutMs = 50, gate = gate).execute(
+            deadlineNanos = deadline(),
             setup = { Unit },
             create = {
                 blockIgnoringInterrupts(releaseCreate)
@@ -167,6 +220,7 @@ class AvfSmokeTestExecutorTest {
             cleanupTimeoutMs = 50,
             gate = gate,
         ).execute(
+            deadlineNanos = deadline(),
             setup = { Unit },
             create = { Any() },
             run = { },
@@ -195,6 +249,7 @@ class AvfSmokeTestExecutorTest {
         val caller = Thread {
             try {
                 executor(operationTimeoutMs = 5_000, gate = gate).execute(
+                    deadlineNanos = deadline(6_000),
                     setup = { Unit },
                     create = {
                         createEntered.countDown()
@@ -236,6 +291,7 @@ class AvfSmokeTestExecutorTest {
     )
 
     private fun smokeAttempt(gate: AvfSmokeAttemptGate) = executor(gate = gate).execute(
+        deadlineNanos = deadline(),
         setup = { Unit },
         create = { Any() },
         run = { },
@@ -261,6 +317,9 @@ class AvfSmokeTestExecutorTest {
         }
         return condition()
     }
+
+    private fun deadline(timeoutMs: Long = 2_000): Long =
+        System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
 
     private fun currentThread(): Pair<String, Boolean> =
         Thread.currentThread().let { it.name to it.isDaemon }

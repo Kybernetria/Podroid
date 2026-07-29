@@ -4,6 +4,7 @@
  */
 package com.excp.podroid.engine.avf
 
+import com.excp.podroid.vm.MonotonicDeadline
 import java.io.IOException
 import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
@@ -66,6 +67,7 @@ internal class AvfSmokeTestExecutor(
     private val cleanupTimeoutMs: Long = DEFAULT_CLEANUP_TIMEOUT_MS,
     private val startupObservationDelayMs: Long = DEFAULT_STARTUP_OBSERVATION_DELAY_MS,
     private val attemptGate: AvfSmokeAttemptGate = sharedAttemptGate,
+    private val nanoTime: () -> Long = System::nanoTime,
 ) {
     data class Result(
         val busy: Boolean,
@@ -83,6 +85,8 @@ internal class AvfSmokeTestExecutor(
         val stopFailure: Throwable?,
         val deleteFailure: Throwable?,
     )
+
+    private class OperationDeadlineReached(val stage: Stage) : IOException()
 
     private enum class Stage(val reportName: String) {
         SETUP("setup"),
@@ -103,12 +107,23 @@ internal class AvfSmokeTestExecutor(
     }
 
     fun <S : Any, T : Any> execute(
+        deadlineNanos: Long,
         setup: () -> S,
         create: (S) -> T,
         run: (T) -> Unit,
         stop: (T) -> Unit,
         deleteByFixedName: () -> Unit,
     ): Result {
+        val executorDeadlineNanos = MonotonicDeadline.clamp(
+            deadlineNanos,
+            totalMaximumTimeoutMs(),
+            nanoTime,
+        ) ?: return expiredResult()
+        val operationDeadlineNanos = MonotonicDeadline.clamp(
+            executorDeadlineNanos,
+            operationTimeoutMs,
+            nanoTime,
+        ) ?: return expiredResult()
         val lease = attemptGate.tryAcquire() ?: return Result(
             busy = true,
             timedOut = false,
@@ -139,16 +154,17 @@ internal class AvfSmokeTestExecutor(
                 var stopFailure: Throwable? = null
                 var deleteFailure: Throwable? = null
                 try {
+                    requireOperationBudget(operationDeadlineNanos, stage.get())
                     val prepared = setup()
                     stage.set(Stage.CREATE)
+                    requireOperationBudget(operationDeadlineNanos, Stage.CREATE)
                     createAttempted.set(true)
                     vm = create(prepared)
                     stage.set(Stage.RUN)
+                    requireOperationBudget(operationDeadlineNanos, Stage.RUN)
                     run(vm)
                     stage.set(Stage.WAIT)
-                    if (startupObservationDelayMs > 0) {
-                        Thread.sleep(startupObservationDelayMs)
-                    }
+                    observeStartupWithin(operationDeadlineNanos)
                 } catch (caught: Throwable) {
                     failure = caught
                 } finally {
@@ -182,22 +198,48 @@ internal class AvfSmokeTestExecutor(
             }
 
             try {
-                if (!operationExited.await(operationTimeoutMs, TimeUnit.MILLISECONDS)) {
+                val operationWaitNanos = MonotonicDeadline.remainingNanos(
+                    operationDeadlineNanos,
+                    nanoTime,
+                )
+                if (operationWaitNanos == 0L ||
+                    !operationExited.await(operationWaitNanos, TimeUnit.NANOSECONDS)
+                ) {
                     timedOut = true
                     timeoutStage = stage.get().reportName
                     operationFuture.cancel(true)
                 } else {
-                    try {
-                        operationFuture.get(cleanupTimeoutMs, TimeUnit.MILLISECONDS)
-                        cleanupCompleted = true
-                    } catch (_: TimeoutException) {
-                        operationFuture.cancel(true)
-                        cleanupWaitFailure = IOException(
-                            "AVF smoke final cleanup exceeded ${cleanupTimeoutMs}ms; " +
-                                "cancellation was requested but cleanup remains pending",
-                        )
-                    } catch (failure: ExecutionException) {
-                        awaitFailure = failure.cause ?: failure
+                    val completedBeforeCleanup = operationResult.get()
+                    val deadlineFailure = completedBeforeCleanup?.failure as? OperationDeadlineReached
+                    if (deadlineFailure != null) {
+                        timedOut = true
+                        timeoutStage = deadlineFailure.stage.reportName
+                    }
+                    val cleanupDeadlineNanos = MonotonicDeadline.clamp(
+                        executorDeadlineNanos,
+                        cleanupTimeoutMs,
+                        nanoTime,
+                    )
+                    val cleanupWaitNanos = cleanupDeadlineNanos?.let {
+                        MonotonicDeadline.remainingNanos(it, nanoTime)
+                    } ?: 0L
+                    if (cleanupWaitNanos == 0L) {
+                        if (operationFuture.workerHasExited()) {
+                            cleanupCompleted = true
+                        } else {
+                            operationFuture.cancel(true)
+                            cleanupWaitFailure = cleanupDeadlineFailure()
+                        }
+                    } else {
+                        try {
+                            operationFuture.get(cleanupWaitNanos, TimeUnit.NANOSECONDS)
+                            cleanupCompleted = true
+                        } catch (_: TimeoutException) {
+                            operationFuture.cancel(true)
+                            cleanupWaitFailure = cleanupDeadlineFailure()
+                        } catch (failure: ExecutionException) {
+                            awaitFailure = failure.cause ?: failure
+                        }
                     }
                 }
             } catch (interrupted: InterruptedException) {
@@ -230,6 +272,49 @@ internal class AvfSmokeTestExecutor(
             cleanupPending = !workerFinished.get(),
         )
     }
+
+    private fun expiredResult() = Result(
+        busy = false,
+        timedOut = true,
+        timeoutStage = "admission",
+        failure = null,
+        stopFailure = null,
+        deleteAttempted = false,
+        deleteFailure = null,
+        cleanupPending = false,
+    )
+
+    private fun requireOperationBudget(deadlineNanos: Long, stage: Stage) {
+        if (MonotonicDeadline.remainingNanos(deadlineNanos, nanoTime) == 0L) {
+            throw OperationDeadlineReached(stage)
+        }
+    }
+
+    private fun observeStartupWithin(deadlineNanos: Long) {
+        if (startupObservationDelayMs == 0L) {
+            requireOperationBudget(deadlineNanos, Stage.WAIT)
+            return
+        }
+        val requestedNanos = TimeUnit.MILLISECONDS.toNanos(startupObservationDelayMs)
+        val remainingNanos = MonotonicDeadline.remainingNanos(deadlineNanos, nanoTime)
+        if (remainingNanos == 0L) throw OperationDeadlineReached(Stage.WAIT)
+        val sleepNanos = minOf(requestedNanos, remainingNanos)
+        TimeUnit.NANOSECONDS.sleep(sleepNanos)
+        if (sleepNanos < requestedNanos) throw OperationDeadlineReached(Stage.WAIT)
+        requireOperationBudget(deadlineNanos, Stage.WAIT)
+    }
+
+    private fun cleanupDeadlineFailure() = IOException(
+        "AVF smoke final cleanup exceeded its remaining deadline; " +
+            "cancellation was requested but cleanup remains pending",
+    )
+
+    private fun totalMaximumTimeoutMs(): Long =
+        if (operationTimeoutMs > Long.MAX_VALUE - cleanupTimeoutMs) {
+            Long.MAX_VALUE
+        } else {
+            operationTimeoutMs + cleanupTimeoutMs
+        }
 
     private fun <T> startDaemonFuture(
         threadNamePrefix: String,
