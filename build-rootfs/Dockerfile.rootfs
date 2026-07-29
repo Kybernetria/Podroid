@@ -24,7 +24,8 @@ ENV ALPINE_RELEASE=3.23.4 \
 RUN apk add --no-cache curl squashfs-tools tar openssl libcap-utils
 
 WORKDIR /work
-RUN curl --fail --location --proto '=https' --tlsv1.2 -o minirootfs.tar.gz \
+RUN curl --fail --location --proto '=https' --tlsv1.2 \
+    --connect-timeout 30 --max-time 300 --retry 2 -o minirootfs.tar.gz \
     "https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_RELEASE%.*}/releases/${ALPINE_ARCH}/alpine-minirootfs-${ALPINE_RELEASE}-${ALPINE_ARCH}.tar.gz" \
  && printf '%s  %s\n' "$ALPINE_MINIROOTFS_SHA256" minirootfs.tar.gz | sha256sum -c - \
  && mkdir rootfs \

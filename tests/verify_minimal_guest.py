@@ -256,6 +256,7 @@ def verify_source(repo_root: Path) -> None:
     require_bytes(build_script, b'resolved package closure differs from reviewed lock', "rootfs build does not enforce the resolved package lock")
     require_bytes(dockerfile, MINIROOTFS_SHA256.encode(), "minirootfs SHA-256 is not pinned")
     require_bytes(dockerfile, b"sha256sum -c -", "minirootfs download is not checksum verified")
+    require_bytes(dockerfile, b"--connect-timeout 30 --max-time 300 --retry 2", "minirootfs download is not deadline bounded")
     for overrideable_pin in (b"ARG ALPINE_RELEASE", b"ARG ALPINE_ARCH", b"ARG ALPINE_MINIROOTFS_SHA256"):
         if overrideable_pin in dockerfile:
             fail("minirootfs release, architecture, and checksum pins must not be build-argument overrideable")
