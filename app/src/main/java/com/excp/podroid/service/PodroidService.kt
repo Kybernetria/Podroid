@@ -151,25 +151,34 @@ class PodroidService : Service() {
                 // Android requires this for every delivered foreground-service
                 // start, even when its reserved command has since gone stale.
                 enterForegroundStartWindow()
-                val delivery = commandOrder.deliverAndExecute(intent.commandGenerationOrNull()) {
-                    if (action == ACTION_START) {
-                        executeStartCommand()
-                    } else {
-                        acquireWakeLock()
-                        startSupervision()
-                        requestServiceRestart("VM restart stop failed")
-                    }
-                }
-                if (!delivery.execute) {
-                    logStaleCommand(action, delivery)
+                if (intent?.hasCommandReservation() != true) {
+                    Log.w(TAG, "Ignoring unreserved in-process lifecycle command source=$action")
                     reconcileAfterStaleForegroundDelivery()
+                } else {
+                    val delivery = commandOrder.deliverAndExecute(intent.commandGenerationOrNull()) {
+                        if (action == ACTION_START) {
+                            executeStartCommand()
+                        } else {
+                            acquireWakeLock()
+                            startSupervision()
+                            requestServiceRestart("VM restart stop failed")
+                        }
+                    }
+                    if (!delivery.execute) {
+                        logStaleCommand(action, delivery)
+                        reconcileAfterStaleForegroundDelivery()
+                    }
                 }
             }
             ACTION_STOP -> {
-                val delivery = commandOrder.deliverAndExecute(intent.commandGenerationOrNull()) {
-                    requestServiceStop("VM graceful stop failed", force = false)
+                if (intent?.isSequencedOrExternalNotification() != true) {
+                    Log.w(TAG, "Ignoring unreserved non-notification lifecycle command source=$action")
+                } else {
+                    val delivery = commandOrder.deliverAndExecute(intent.commandGenerationOrNull()) {
+                        requestServiceStop("VM graceful stop failed", force = false)
+                    }
+                    if (!delivery.execute) logStaleCommand(action, delivery)
                 }
-                if (!delivery.execute) logStaleCommand(action, delivery)
             }
             else -> {
                 // Null/unrecognized action (e.g. a system redelivery): we never
@@ -223,8 +232,13 @@ class PodroidService : Service() {
             putExtra(EXTRA_COMMAND_GENERATION, generation)
         }
 
+    private fun Intent.hasCommandReservation(): Boolean = hasExtra(EXTRA_COMMAND_GENERATION)
+
+    private fun Intent.isSequencedOrExternalNotification(): Boolean =
+        hasCommandReservation() || getBooleanExtra(EXTRA_EXTERNAL_NOTIFICATION_DELIVERY, false)
+
     private fun Intent.commandGenerationOrNull(): Long? =
-        if (hasExtra(EXTRA_COMMAND_GENERATION)) getLongExtra(EXTRA_COMMAND_GENERATION, 0L) else null
+        if (hasCommandReservation()) getLongExtra(EXTRA_COMMAND_GENERATION, 0L) else null
 
     private fun enterForegroundStartWindow() {
         val fgType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -259,9 +273,9 @@ class PodroidService : Service() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        // Task removal is unsequenced legacy delivery, so it atomically becomes
-        // newest before using the same bounded stop path as notification Stop.
-        commandOrder.deliverAndExecute(reservedGeneration = null) {
+        // This in-process callback issues its stop directly. Reserve at issue
+        // time; only the notification PendingIntent is intentionally unreserved.
+        commandOrder.executeDirect {
             requestServiceStop("Task-removal graceful stop failed", force = false)
         }
     }
@@ -590,7 +604,10 @@ class PodroidService : Service() {
         )
         val stopIntent = PendingIntent.getService(
             this, 1,
-            Intent(this, PodroidService::class.java).apply { action = ACTION_STOP },
+            Intent(this, PodroidService::class.java).apply {
+                action = ACTION_STOP
+                putExtra(EXTRA_EXTERNAL_NOTIFICATION_DELIVERY, true)
+            },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         openPendingIntent = openIntent
@@ -657,8 +674,9 @@ class PodroidService : Service() {
             })
             "stop" -> {
                 val ctx = applicationContext
+                val generation = commandOrder.reserve()
                 android.os.Handler(android.os.Looper.getMainLooper())
-                    .postDelayed({ PodroidService.stop(ctx) }, 300)
+                    .postDelayed({ enqueueStop(ctx, generation) }, 300)
                 proto.ok()
             }
             "restart" -> { scheduleRestart(); proto.ok() }
@@ -668,8 +686,9 @@ class PodroidService : Service() {
 
     private fun scheduleRestart() {
         val ctx = applicationContext
+        val generation = commandOrder.reserve()
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            PodroidService.restart(ctx)
+            enqueueRestart(ctx, generation)
         }, 300)
     }
 
@@ -680,6 +699,8 @@ class PodroidService : Service() {
         private const val SERVICE_LAUNCH_JOIN_TIMEOUT_MS = 8_000L
         private const val EXTRA_COMMAND_GENERATION =
             "com.excp.podroid.extra.SERVICE_COMMAND_GENERATION"
+        private const val EXTRA_EXTERNAL_NOTIFICATION_DELIVERY =
+            "com.excp.podroid.extra.EXTERNAL_NOTIFICATION_DELIVERY"
 
         // Process-lifetime so a delayed explicit Intent remains stale even if
         // Android recreates the Service object before delivering it.
@@ -690,23 +711,33 @@ class PodroidService : Service() {
         const val ACTION_RESTART = "com.excp.podroid.action.RESTART"
 
         fun start(context: Context) {
-            val intent = Intent(context, PodroidService::class.java).apply {
-                action = ACTION_START
-            }
-            context.startForegroundService(intent)
+            val generation = commandOrder.reserve()
+            context.startForegroundService(lifecycleIntent(context, ACTION_START, generation))
         }
 
         fun stop(context: Context) {
-            context.startService(Intent(context, PodroidService::class.java).apply {
-                action = ACTION_STOP
-            })
+            val generation = commandOrder.reserve()
+            enqueueStop(context, generation)
         }
 
         fun restart(context: Context) {
-            context.startForegroundService(Intent(context, PodroidService::class.java).apply {
-                action = ACTION_RESTART
-            })
+            val generation = commandOrder.reserve()
+            enqueueRestart(context, generation)
         }
+
+        private fun enqueueStop(context: Context, generation: Long) {
+            context.startService(lifecycleIntent(context, ACTION_STOP, generation))
+        }
+
+        private fun enqueueRestart(context: Context, generation: Long) {
+            context.startForegroundService(lifecycleIntent(context, ACTION_RESTART, generation))
+        }
+
+        private fun lifecycleIntent(context: Context, action: String, generation: Long): Intent =
+            Intent(context, PodroidService::class.java).apply {
+                this.action = action
+                putExtra(EXTRA_COMMAND_GENERATION, generation)
+            }
     }
 }
 

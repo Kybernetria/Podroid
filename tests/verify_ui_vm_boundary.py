@@ -53,13 +53,28 @@ FORBIDDEN_SYMBOLS = {
         r"\b(?:storageImage|consoleLog|instanceDirectory|rawKernel|qmpSocket|terminalSocket)\b"
     ),
     "application-data reset bypass": re.compile(r"\bclearApplicationUserData\s*\("),
+    "boundary class reflection": re.compile(
+        r"\bClass\s*\.\s*forName\s*\(|(?:\bclassLoader\b|\bgetClassLoader\s*\(\s*\))"
+        r"\s*\.\s*loadClass\s*\(|\.\s*loadClass\s*\("
+    ),
+}
+
+# Raw package literals are executable boundary references too. Inspect them
+# before strings are stripped so reflection cannot hide implementation classes.
+FORBIDDEN_RAW_LITERALS = {
+    "boundary package string literal": re.compile(
+        r"[\"'][^\"']*\bcom\.excp\.podroid\.(?:engine|service|vm)"
+        r"(?:\.[A-Za-z_]\w*)*\.?[^\"']*[\"']"
+    ),
 }
 
 # These patterns intentionally retain string literals. Otherwise constructions
 # such as filesDir.resolve("instances").resolve("default") evade the check.
 FORBIDDEN_PATHS = {
     "internal app-data path construction": re.compile(
-        r"\b(?:filesDir|dataDir|noBackupFilesDir)\b|\bgetDir\s*\(|/data/(?:data|user)/"
+        r"\b(?:filesDir|dataDir|noBackupFilesDir)\b|"
+        r"\b(?:getFilesDir|getDataDir|getNoBackupFilesDir|getDir)\s*\(|"
+        r"/data/(?:data|user)/"
     ),
     "path resolve bypass": re.compile(r"\bresolve(?:Sibling)?\s*\("),
     "VM path literal": re.compile(
@@ -101,11 +116,20 @@ def verify(root: Path) -> list[str]:
     failures: list[str] = []
     for path in sorted(root.rglob("*.kt")):
         text = path.read_text(encoding="utf-8")
-        for imported in IMPORT.findall(text):
+        uncommented = _without_comments(text)
+        # Kotlin permits backtick-escaped identifiers in imports and qualified
+        # references. Normalize ordinary escaped identifiers before matching so
+        # they cannot bypass the boundary package checks.
+        normalized = re.sub(r"`([A-Za-z_]\w*)`", r"\1", uncommented)
+        for imported in IMPORT.findall(normalized):
             if imported.startswith(BOUNDARY_IMPORT_PREFIXES) and imported not in ALLOWED_BOUNDARY_IMPORTS:
                 failures.append(f"{path}: boundary import is not allowlisted: {imported}")
 
-        symbols = _without_comments_or_strings(text)
+        for label, pattern in FORBIDDEN_RAW_LITERALS.items():
+            if pattern.search(normalized):
+                failures.append(f"{path}: {label}")
+
+        symbols = _without_comments_or_strings(normalized)
         for reference in BOUNDARY_REFERENCE.findall(symbols):
             if reference.startswith("com.excp.podroid.engine") or reference not in ALLOWED_BOUNDARY_IMPORTS:
                 failures.append(f"{path}: boundary reference is not allowlisted: {reference}")
@@ -113,7 +137,7 @@ def verify(root: Path) -> list[str]:
             if pattern.search(symbols):
                 failures.append(f"{path}: {label}")
 
-        paths = _without_comments(text)
+        paths = normalized
         for allowed in ALLOWED_PATH_EXPRESSIONS:
             paths = allowed.sub("", paths)
         normalized_path = path.as_posix()

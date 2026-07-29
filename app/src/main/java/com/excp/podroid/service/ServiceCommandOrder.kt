@@ -7,11 +7,10 @@ package com.excp.podroid.service
 /**
  * Process-lifetime order for every service lifecycle command.
  *
- * Binder start/restart calls reserve before asking Android to deliver an Intent,
- * while Binder stop/force atomically reserve before initiating direct execution.
- * Legacy and notification Intents have no reservation and become
- * newest when Android delivers them. A delayed or duplicate reserved command
- * therefore cannot supersede a command that was ordered after it.
+ * Every in-process issuer reserves before enqueueing an Intent or initiating a
+ * direct command. Only the externally delivered notification PendingIntent has
+ * no reservation and becomes newest when Android delivers it. A delayed or
+ * duplicate reserved command therefore cannot supersede a command ordered later.
  */
 internal class ServiceCommandOrder {
     data class Delivery(
@@ -42,8 +41,8 @@ internal class ServiceCommandOrder {
 
     /**
      * Claim and initiate a delivered command under the same short lock. A null
-     * generation is a legacy/notification command and atomically receives the
-     * newest position at delivery.
+     * generation is reserved for external notification delivery and atomically
+     * receives the newest position at delivery.
      */
     @Synchronized
     fun deliverAndExecute(reservedGeneration: Long?, command: () -> Unit): Delivery {

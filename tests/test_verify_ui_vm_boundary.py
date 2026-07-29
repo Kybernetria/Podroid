@@ -86,6 +86,20 @@ class UiVmBoundaryVerifierTest(unittest.TestCase):
             with self.subTest(source=source):
                 self.assert_rejected(source)
 
+    def test_rejects_boundary_reflection_and_raw_package_literals(self):
+        fixtures = (
+            'Class.forName("com.excp.podroid.engine.QemuEngine")',
+            'context.classLoader.loadClass("com.excp.podroid.service.PodroidService")',
+            'context.getClassLoader().loadClass(className)',
+            'val hidden = "com.excp.podroid.vm." + "VmPaths"',
+            'val hidden = "com.excp.podroid.engine.avf.AvfDiagnostics"',
+            'import com.excp.podroid.`engine`.`hostbridge`.`HostRequestServer`',
+            'val hidden = com.excp.podroid.`service`.`VmServiceEndpoint`::class',
+        )
+        for source in fixtures:
+            with self.subTest(source=source):
+                self.assert_rejected(source)
+
     def test_rejects_vm_path_literal_file_and_resolve_bypasses(self):
         fixtures = (
             'File(context.filesDir, "instances/default")',
@@ -95,6 +109,10 @@ class UiVmBoundaryVerifierTest(unittest.TestCase):
             'root.resolveSibling("alpine-rootfs.squashfs")',
             'File(context.applicationInfo.dataDir, "instances")',
             'val root = context.filesDir; File(root, name)',
+            'File(context.getFilesDir(), child)',
+            'java.io.File(context.getDataDir(), "child").toPath()',
+            'context.getNoBackupFilesDir().resolve("child")',
+            'context.getFilesDir().toPath().resolve("child")',
             'val path = "/data/user/0/com.excp.podroid/files/instances/default"',
             'val socket = "qmp.sock"',
         )

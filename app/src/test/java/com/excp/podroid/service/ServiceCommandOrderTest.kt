@@ -15,12 +15,23 @@ class ServiceCommandOrderTest {
     }
 
     @Test
-    fun `earlier binder restart delivered after later direct stop is stale`() {
+    fun `enqueued static restart delivered after later binder stop is stale`() {
         val order = ServiceCommandOrder()
-        val restart = order.reserve()
-        order.executeDirect { }
+        // PodroidService.restart reserves before enqueueing its Intent.
+        val staticRestart = order.reserve()
+        order.executeDirect { } // Later Binder stop.
 
-        assertFalse(order.deliver(restart).execute)
+        assertFalse(order.deliver(staticRestart).execute)
+    }
+
+    @Test
+    fun `guest delayed restart keeps generation reserved at callback issue time`() {
+        val order = ServiceCommandOrder()
+        // Guest callback reserves before posting its delayed enqueue callback.
+        val guestRestart = order.reserve()
+        order.executeDirect { } // Binder stop arrives during the delay.
+
+        assertFalse(order.deliver(guestRestart).execute)
     }
 
     @Test

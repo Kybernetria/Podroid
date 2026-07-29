@@ -25,11 +25,10 @@ import com.excp.podroid.vm.VmAtomicFile
 import com.excp.podroid.vm.VmPathSecurity
 import com.excp.podroid.vm.VmPaths
 import java.io.File
+import java.io.IOException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 
 /** One-line entries in the diagnostic report; UI just joins them. */
 data class AvfReport(
@@ -141,15 +140,13 @@ object AvfDiagnostics {
 
     /**
      * Attempts a real minimal-VM creation using our existing Alpine kernel and
-     * initrd. All file/reflection work is forced onto IO, the attempt has a
-     * deadline, and every path after creation attempts bounded stop and delete.
+     * initrd. All uncontrolled vendor setup/create/run/stop work is isolated in
+     * a daemon Future with a hard caller-side deadline.
      */
     suspend fun runSmokeTest(context: Context, vmPaths: VmPaths): String =
         withContext(Dispatchers.IO) {
             val result = try {
-                withTimeoutOrNull(TOTAL_SMOKE_TIMEOUT_MS) {
-                    runSmokeTestOnIo(context, vmPaths)
-                } ?: "FAILED: AVF smoke test exceeded total ${TOTAL_SMOKE_TIMEOUT_MS}ms deadline"
+                runSmokeTestOnIo(context, vmPaths)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Throwable) {
@@ -159,6 +156,9 @@ object AvfDiagnostics {
         }
 
     internal fun boundSmokeTestResult(result: String): String = result.take(MAX_SMOKE_RESULT_CHARS)
+
+    private data class SmokeSetup(val manager: Any, val config: Any)
+    private class SmokeOutcome(val result: String) : IOException(result)
 
     private suspend fun runSmokeTestOnIo(context: Context, vmPaths: VmPaths): String {
         val application = context.applicationContext as? PodroidApplication
@@ -170,72 +170,99 @@ object AvfDiagnostics {
         } catch (failure: Throwable) {
             return "FAILED: default VM migration/assets unavailable: ${failureSummary(failure)}"
         }
+
         val pathSecurity = VmPathSecurity(vmPaths)
-        try {
-            pathSecurity.validateForLaunch()
-        } catch (failure: Throwable) {
-            return "FAILED: unsafe default VM paths: ${failureSummary(failure)}"
-        }
-
-        val pre = runInterruptible(Dispatchers.IO) { probe(context) }
-        if (!pre.featureSupported) return "skipped: feature flag not present (device does not ship AVF)"
-        if (!pre.managePermissionGranted) return "skipped: MANAGE_VIRTUAL_MACHINE not granted (run: adb shell pm grant ${context.packageName} $PERM_MANAGE)"
-        if (!pre.customPermissionGranted) return "skipped: USE_CUSTOM_VIRTUAL_MACHINE not granted (run: adb shell pm grant ${context.packageName} $PERM_CUSTOM)"
-        if (!pre.managerClassPresent) return "FAILED: $CLS_MANAGER not on the boot classpath — system stub missing"
-
         val kernelSrc = vmPaths.kernel
         val initrd = vmPaths.initrd
-        if (!kernelSrc.exists()) return "FAILED: kernel not extracted yet at ${kernelSrc.absolutePath}"
-        if (!initrd.exists()) return "FAILED: initrd not extracted yet at ${initrd.absolutePath}"
-
-        if (AvfCapabilities.choose(pre.capabilitiesRaw) is AvfCapabilities.ProtectedVmChoice.Unsupported) {
-            return protectedVmNotApplicable("caps=${pre.capabilitiesDecoded}")
-        }
-
-        val vmm = runInterruptible(Dispatchers.IO) { getVirtualizationManager(context) }
-            ?: return "FAILED: VirtualMachineManager system service returned null"
-
-        // crosvm needs the raw ARM64 Image, not gzip vmlinuz. Reuse the same
-        // confined cache as AvfEngine; preparation happens before VM creation.
-        val config = runInterruptible(Dispatchers.IO) {
-            val kernel = ensureRawKernel(kernelSrc, vmPaths.rawKernel, pathSecurity)
-            val customCfg = buildCustomImageConfig(kernel.absolutePath, initrd.absolutePath)
-            buildVirtualMachineConfig(vmm, context, customCfg)
-        }
-        val name = "podroid-avf-smoke"
-
+        val name = SMOKE_VM_NAME
         val execution = AvfSmokeTestExecutor().execute(
-            create = { invokeOrCreate(vmm, name, config) },
+            setup = {
+                try {
+                    pathSecurity.validateForLaunch()
+                } catch (failure: Throwable) {
+                    throw SmokeOutcome("FAILED: unsafe default VM paths: ${failureSummary(failure)}")
+                }
+                val pre = probe(context)
+                if (!pre.featureSupported) {
+                    throw SmokeOutcome("skipped: feature flag not present (device does not ship AVF)")
+                }
+                if (!pre.managePermissionGranted) {
+                    throw SmokeOutcome("skipped: MANAGE_VIRTUAL_MACHINE not granted (run: adb shell pm grant ${context.packageName} $PERM_MANAGE)")
+                }
+                if (!pre.customPermissionGranted) {
+                    throw SmokeOutcome("skipped: USE_CUSTOM_VIRTUAL_MACHINE not granted (run: adb shell pm grant ${context.packageName} $PERM_CUSTOM)")
+                }
+                if (!pre.managerClassPresent) {
+                    throw SmokeOutcome("FAILED: $CLS_MANAGER not on the boot classpath — system stub missing")
+                }
+                if (!kernelSrc.exists()) {
+                    throw SmokeOutcome("FAILED: kernel not extracted yet at ${kernelSrc.absolutePath}")
+                }
+                if (!initrd.exists()) {
+                    throw SmokeOutcome("FAILED: initrd not extracted yet at ${initrd.absolutePath}")
+                }
+                if (AvfCapabilities.choose(pre.capabilitiesRaw) is
+                    AvfCapabilities.ProtectedVmChoice.Unsupported
+                ) {
+                    throw SmokeOutcome(protectedVmNotApplicable("caps=${pre.capabilitiesDecoded}"))
+                }
+
+                val manager = getVirtualizationManager(context)
+                    ?: throw SmokeOutcome("FAILED: VirtualMachineManager system service returned null")
+                // crosvm requires the raw ARM64 Image. Preparation and all
+                // reflective builder calls remain inside the bounded Future.
+                val kernel = ensureRawKernel(kernelSrc, vmPaths.rawKernel, pathSecurity)
+                val customConfig = buildCustomImageConfig(kernel.absolutePath, initrd.absolutePath)
+                SmokeSetup(manager, buildVirtualMachineConfig(manager, context, customConfig))
+            },
+            create = { prepared -> invokeOrCreate(prepared.manager, name, prepared.config) },
             run = { vm ->
                 pathSecurity.validateForLaunch()
                 vm.javaClass.getMethod("run").invoke(vm)
             },
             stop = { vm -> vm.javaClass.getMethod("stop").invoke(vm) },
-            delete = { vmm.javaClass.getMethod("delete", String::class.java).invoke(vmm, name) },
+            // Resolve the manager independently. Delete must not depend on setup
+            // publishing a manager or create publishing a VM object.
+            deleteByFixedName = {
+                val manager = getVirtualizationManager(context)
+                    ?: throw IOException("VirtualMachineManager system service returned null")
+                manager.javaClass.getMethod("delete", String::class.java).invoke(manager, name)
+            },
         )
 
-        val cleanupFailures = buildList {
-            execution.stopFailure?.let { add("stop=${failureSummary(it)}") }
-            execution.deleteFailure?.let { add("delete=${failureSummary(it)}") }
+        if (execution.busy) {
+            return "FAILED: another AVF smoke attempt is still active; no concurrent attempt was started"
+        }
+        val deleteStatus = when {
+            !execution.deleteAttempted -> "named delete=not needed"
+            execution.deleteFailure == null -> "named delete=completed"
+            else -> "named delete=${failureSummary(execution.deleteFailure)}"
         }
         if (execution.timedOut) {
-            return "FAILED: AVF smoke test exceeded ${AvfSmokeTestExecutor.DEFAULT_OPERATION_TIMEOUT_MS}ms" +
-                cleanupFailures.joinToString(prefix = if (cleanupFailures.isEmpty()) "" else "; cleanup: ")
+            return "FAILED: caller stopped waiting after " +
+                "${AvfSmokeTestExecutor.DEFAULT_OPERATION_TIMEOUT_MS}ms at ${execution.timeoutStage}; " +
+                "cancellation was requested best-effort and vendor work may still be running; " +
+                deleteStatus
         }
         execution.failure?.let { failure ->
+            if (failure is SmokeOutcome) return failure.result
             val cause = failure.cause ?: failure
             if (cause is UnsupportedOperationException &&
                 cause.message?.contains("protected", ignoreCase = true) == true
             ) {
                 return protectedVmNotApplicable(failureSummary(cause))
             }
-            return "FAILED at VM create/run: ${failureSummary(failure)}" +
-                cleanupFailures.joinToString(prefix = if (cleanupFailures.isEmpty()) "" else "; cleanup: ")
+            return "FAILED during AVF smoke setup/create/run: ${failureSummary(failure)}; $deleteStatus" +
+                (execution.stopFailure?.let { "; stop=${failureSummary(it)}" } ?: "")
         }
-        if (cleanupFailures.isNotEmpty()) {
-            return cleanupFailures.joinToString(prefix = "FAILED during AVF smoke cleanup: ")
+        execution.stopFailure?.let {
+            return "FAILED during AVF smoke cleanup: stop=${failureSummary(it)}; $deleteStatus"
         }
-        return "SUCCESS: AVF accepted our config, VM started + stopped cleanly. The dev-grant path works on this device."
+        execution.deleteFailure?.let {
+            return "FAILED during AVF smoke cleanup: $deleteStatus"
+        }
+        return "SUCCESS: AVF accepted our config, VM started + stopped cleanly; $deleteStatus. " +
+            "The dev-grant path works on this device."
     }
 
     private fun protectedVmNotApplicable(detail: String): String =
@@ -341,6 +368,6 @@ object AvfDiagnostics {
         } ?: error("getOrCreate returned null")
     }
 
+    private const val SMOKE_VM_NAME = "podroid-avf-smoke"
     private const val MAX_SMOKE_RESULT_CHARS = 4 * 1024
-    private const val TOTAL_SMOKE_TIMEOUT_MS = 15_000L
 }
