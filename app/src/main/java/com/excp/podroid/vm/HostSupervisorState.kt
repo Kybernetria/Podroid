@@ -30,6 +30,7 @@ data class LifecycleTransaction(
     val requestedAtEpochMs: Long,
     val completedAtEpochMs: Long?,
     val errorCode: LifecycleErrorCode?,
+    val effectStarted: Boolean = false,
 ) {
     init {
         require(id > 0) { "transaction id must be positive" }
@@ -41,10 +42,12 @@ data class LifecycleTransaction(
                 }
             }
             LifecycleOutcome.SUCCEEDED -> {
+                require(effectStarted) { "successful transaction requires an effect claim" }
                 require(completedAtEpochMs != null && completedAtEpochMs >= requestedAtEpochMs)
                 require(errorCode == null) { "successful transaction cannot contain an error" }
             }
             LifecycleOutcome.FAILED -> {
+                require(effectStarted) { "failed transaction requires an effect claim" }
                 require(completedAtEpochMs != null && completedAtEpochMs >= requestedAtEpochMs)
                 require(errorCode != null) { "failed transaction requires a stable error code" }
             }
@@ -87,16 +90,49 @@ data class HostSupervisorState(
     }
 }
 
+/**
+ * Bounded durable command capability. The id is also the service-command
+ * generation, so command admission and persisted transaction order cannot drift.
+ */
 data class LifecycleTransactionToken internal constructor(
     val id: Long,
     val operation: LifecycleOperation,
     val baseRuntimeGeneration: Long,
-)
+) {
+    init {
+        require(id > 0) { "transaction id must be positive" }
+        require(baseRuntimeGeneration >= 0) { "base runtime generation must be non-negative" }
+    }
+
+    companion object {
+        /** Reconstructs a token carried through bounded primitive Intent extras. */
+        fun restore(
+            id: Long,
+            operation: LifecycleOperation,
+            baseRuntimeGeneration: Long,
+        ) = LifecycleTransactionToken(id, operation, baseRuntimeGeneration)
+    }
+}
+
+class StaleLifecycleCommandException(message: String) : IllegalStateException(message)
 
 /** Atomic persistence port owned by the lifecycle manager. */
 internal interface HostSupervisorTransactions {
     suspend fun snapshot(): HostSupervisorState
-    suspend fun begin(operation: LifecycleOperation): LifecycleTransactionToken
-    suspend fun succeed(token: LifecycleTransactionToken, runtimeStarted: Boolean = false)
-    suspend fun fail(token: LifecycleTransactionToken, errorCode: LifecycleErrorCode)
+
+    /**
+     * Persists desired state and exactly one PENDING command. When supplied,
+     * [expectedId] must be the next transaction id or no mutation is committed.
+     */
+    suspend fun prepare(
+        operation: LifecycleOperation,
+        expectedId: Long? = null,
+    ): LifecycleTransactionToken
+
+    /** Atomically claims id + closed operation while keeping outcome PENDING. */
+    suspend fun claim(token: LifecycleTransactionToken): Boolean
+    /** Re-loads the same PENDING token, including an already-started effect. */
+    suspend fun isCurrent(token: LifecycleTransactionToken): Boolean
+    suspend fun succeed(token: LifecycleTransactionToken, runtimeStarted: Boolean = false): Boolean
+    suspend fun fail(token: LifecycleTransactionToken, errorCode: LifecycleErrorCode): Boolean
 }

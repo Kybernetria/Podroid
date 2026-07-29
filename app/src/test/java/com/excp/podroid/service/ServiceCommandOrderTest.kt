@@ -1,84 +1,121 @@
 package com.excp.podroid.service
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ServiceCommandOrderTest {
     @Test
-    fun `earlier binder start delivered after later direct stop is stale`() {
-        val order = ServiceCommandOrder()
-        val start = order.reserve()
-        order.executeDirect { }
-
-        assertFalse(order.deliver(start).execute)
-    }
-
-    @Test
-    fun `enqueued static restart delivered after later binder stop is stale`() {
-        val order = ServiceCommandOrder()
-        // PodroidService.restart reserves before enqueueing its Intent.
-        val staticRestart = order.reserve()
-        order.executeDirect { } // Later Binder stop.
-
-        assertFalse(order.deliver(staticRestart).execute)
-    }
-
-    @Test
-    fun `guest delayed restart keeps generation reserved at callback issue time`() {
-        val order = ServiceCommandOrder()
-        // Guest callback reserves before posting its delayed enqueue callback.
-        val guestRestart = order.reserve()
-        order.executeDirect { } // Binder stop arrives during the delay.
-
-        assertFalse(order.deliver(guestRestart).execute)
-    }
-
-    @Test
-    fun `duplicate reserved lifecycle delivery executes exactly once`() {
-        val order = ServiceCommandOrder()
-        val start = order.reserve()
-
-        assertTrue(order.deliver(start).execute)
-        assertFalse(order.deliver(start).execute)
-    }
-
-    @Test
-    fun `direct stop initiates before a later binder start can reserve`() {
+    fun `prepare commits before Intent dispatch and generation equals transaction order`() = runBlocking {
         val order = ServiceCommandOrder()
         val events = mutableListOf<String>()
+        var durableId = 0L
 
-        order.executeDirect { events += "stop" }
-        val start = order.reserve()
-        order.deliverAndExecute(start) { events += "start" }
+        val admission = order.admitAndDispatch(
+            latestDurableGeneration = { durableId },
+            prepare = { generation ->
+                events += "prepare:$generation"
+                durableId = generation
+                "token-$generation"
+            },
+            dispatch = { events += "dispatch:${it.generation}" },
+        )
 
-        assertTrue(events == listOf("stop", "start"))
+        assertEquals(1L, admission.generation)
+        assertEquals("token-1", admission.prepared)
+        assertEquals(listOf("prepare:1", "dispatch:1"), events)
     }
 
     @Test
-    fun `newer reservation makes an undelivered restart stale`() {
+    fun `later reservation blocks delayed older delivery`() = runBlocking {
         val order = ServiceCommandOrder()
-        val restart = order.reserve()
-        order.reserve()
+        var durableId = 1L // prepared older Intent is delayed
+        val newer = order.admitAndDispatch(
+            latestDurableGeneration = { durableId },
+            prepare = { generation -> durableId = generation; generation },
+            dispatch = { },
+        )
 
-        assertFalse(order.deliver(restart).execute)
+        assertEquals(2L, newer.generation)
+        assertFalse(order.deliverAndExecute(1L, { true }) { error("stale effect") }.execute)
+        assertTrue(order.deliverAndExecute(2L, { true }) { }.execute)
     }
 
     @Test
-    fun `unsequenced notification command becomes newest at delivery`() {
+    fun `delivery cannot pass a newer prepare already admitted to ordering`() = runBlocking {
         val order = ServiceCommandOrder()
-        val delayedBinderStart = order.reserve()
+        var durableId = 1L
+        val prepareEntered = CompletableDeferred<Unit>()
+        val releasePrepare = CompletableDeferred<Unit>()
+        val newer = async(Dispatchers.Default) {
+            order.admitAndDispatch(
+                latestDurableGeneration = { durableId },
+                prepare = { generation ->
+                    prepareEntered.complete(Unit)
+                    releasePrepare.await()
+                    durableId = generation
+                    generation
+                },
+                dispatch = { },
+            )
+        }
+        prepareEntered.await()
+        val olderExecuted = CompletableDeferred<Boolean>()
+        val older = async(Dispatchers.Default) {
+            order.deliverAndExecute(1L, { true }) { olderExecuted.complete(true) }
+        }
 
-        assertTrue(order.deliver(reservedGeneration = null).execute)
-        assertFalse(order.deliver(delayedBinderStart).execute)
+        assertFalse(olderExecuted.isCompleted)
+        releasePrepare.complete(Unit)
+        newer.await()
+        assertFalse(older.await().execute)
     }
 
     @Test
-    fun `explicit generation can be adopted after service process state recreation`() {
+    fun `duplicate prepared delivery executes exactly once`() = runBlocking {
         val order = ServiceCommandOrder()
 
-        assertTrue(order.deliver(42L).execute)
-        assertFalse(order.deliver(42L).execute)
-        assertFalse(order.deliver(41L).execute)
+        assertTrue(order.deliverAndExecute(42L, { true }) { }.execute)
+        assertFalse(order.deliverAndExecute(42L, { true }) { error("duplicate effect") }.execute)
+        assertFalse(order.deliverAndExecute(41L, { true }) { error("stale effect") }.execute)
+    }
+
+    @Test
+    fun `recreated duplicate token is validated before coordinator effects`() = runBlocking {
+        val order = ServiceCommandOrder()
+        var effect = false
+
+        val delivery = order.deliverAndExecute(42L, validatePrepared = { false }) {
+            effect = true
+        }
+
+        assertFalse(delivery.execute)
+        assertFalse(effect)
+        var prepared = 0L
+        order.admitAndDispatch(
+            latestDurableGeneration = { 7L },
+            prepare = { prepared = it; it },
+            dispatch = { },
+        )
+        assertEquals(8L, prepared)
+    }
+
+    @Test
+    fun `process recreation adopts durable generation before new prepare`() = runBlocking {
+        val order = ServiceCommandOrder()
+        var preparedGeneration = 0L
+
+        order.admitAndDispatch(
+            latestDurableGeneration = { 41L },
+            prepare = { generation -> preparedGeneration = generation; generation },
+            dispatch = { },
+        )
+
+        assertEquals(42L, preparedGeneration)
     }
 }

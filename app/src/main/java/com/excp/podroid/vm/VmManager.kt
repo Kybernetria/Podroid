@@ -136,15 +136,38 @@ interface VmManager {
     suspend fun list(vmId: VmId): List<VmSummary>
     suspend fun status(vmId: VmId): VmStatus
     suspend fun supervisorState(vmId: VmId): HostSupervisorState
+    /** Persists desired state and one PENDING command before service dispatch. */
+    suspend fun prepareLifecycleCommand(
+        vmId: VmId,
+        operation: LifecycleOperation,
+        expectedCommandGeneration: Long? = null,
+    ): LifecycleTransactionToken
+    /** Durably claims id + closed operation before service coordinator effects. */
+    suspend fun acceptPrepared(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+    ): Boolean
+    /** Executes a command successfully claimed by [acceptPrepared]. */
+    suspend fun executeAccepted(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+    ): Boolean
+    /** Explicitly fails a claimed command that cannot safely reach its effect. */
+    suspend fun failAccepted(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+        errorCode: LifecycleErrorCode,
+    ): Boolean
+    /** Convenience path that claims then executes. */
+    suspend fun executePrepared(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+    ): Boolean
     suspend fun ensureInstalled(vmId: VmId)
     suspend fun start(vmId: VmId)
     suspend fun stop(vmId: VmId)
     suspend fun forceStop(vmId: VmId)
     suspend fun restart(vmId: VmId)
-    /** Service-owned first phase of a restart; desired state remains RUNNING. */
-    suspend fun stopForRestart(vmId: VmId)
-    /** Service-owned second phase of a restart; records the replacement generation. */
-    suspend fun startForRestart(vmId: VmId)
     suspend fun remove(vmId: VmId, policy: VmRemovePolicy)
     suspend fun readConsoleLog(vmId: VmId, request: ConsoleLogRequest): ConsoleLog
     suspend fun executeQmp(vmId: VmId, operation: VmQmpOperation): VmQmpResult
@@ -221,6 +244,9 @@ class DefaultVmManager internal constructor(
 ) : VmManager {
     private val lifecycleMutex = Mutex()
     private val stopTaskMutex = Mutex()
+    private val launchCompletionMutex = Mutex()
+    private val commandClaimMutex = Mutex()
+    private val claimedCommands = mutableMapOf<Long, CommandClaimState>()
     @Volatile private var stopTask: Deferred<Unit>? = null
     @Volatile private var stopForceSignal: CompletableDeferred<Unit>? = null
     @Volatile private var startTask: Deferred<Unit>? = null
@@ -320,92 +346,144 @@ class DefaultVmManager internal constructor(
         return supervisor.snapshot()
     }
 
-    override suspend fun ensureInstalled(vmId: VmId) = lifecycleTransaction(
-        vmId = vmId,
-        operation = LifecycleOperation.SETUP,
-    ) {
-        awaitInitial(vmId)
-        lifecycleMutex.withLock {
-            check(runtime.quiescent.value) { "Cannot install while VM cleanup is incomplete" }
-            installer.withExclusiveTree(vmId) { lease -> ensureInstalledLocked(vmId, lease) }
-        }
-    }
-
-    override suspend fun start(vmId: VmId) = lifecycleTransaction(
-        vmId = vmId,
-        operation = LifecycleOperation.START,
-        runtimeStarted = true,
-    ) {
-        awaitInitial(vmId)
-        lifecycleMutex.withLock {
-            check(!busyFlow.value) { "Cannot start while previous VM work or cleanup is incomplete" }
-            installer.withExclusiveTree(vmId) { lease ->
-                ensureInstalledLocked(vmId, lease)
-                startLocked(vmId)
-            }
-        }
-    }
-
-    override suspend fun stop(vmId: VmId) = lifecycleTransaction(
-        vmId = vmId,
-        operation = LifecycleOperation.STOP,
-    ) {
-        awaitInitial(vmId)
-        requestStop(force = false).await()
-    }
-
-    override suspend fun forceStop(vmId: VmId) = lifecycleTransaction(
-        vmId = vmId,
-        operation = LifecycleOperation.FORCE_STOP,
-    ) {
-        awaitInitial(vmId)
-        requestStop(force = true).await()
-    }
-
-    override suspend fun stopForRestart(vmId: VmId) = lifecycleTransaction(
-        vmId = vmId,
-        operation = LifecycleOperation.RESTART,
-    ) {
-        awaitInitial(vmId)
-        requestStop(force = false).await()
-    }
-
-    override suspend fun startForRestart(vmId: VmId) = lifecycleTransaction(
-        vmId = vmId,
-        operation = LifecycleOperation.RESTART,
-        runtimeStarted = true,
-    ) {
-        awaitInitial(vmId)
-        lifecycleMutex.withLock {
-            check(!busyFlow.value) { "Cannot restart while previous VM cleanup is incomplete" }
-            installer.withExclusiveTree(vmId) { lease ->
-                ensureInstalledLocked(vmId, lease)
-                startLocked(vmId)
-            }
-        }
-    }
-
-    override suspend fun restart(vmId: VmId) {
+    override suspend fun prepareLifecycleCommand(
+        vmId: VmId,
+        operation: LifecycleOperation,
+        expectedCommandGeneration: Long?,
+    ): LifecycleTransactionToken {
         requireDefault(vmId)
-        // Duplicate delivery while the replacement boot is already in progress
-        // is already satisfied; it must not create a false generation increment.
-        if (busyFlow.value && runtime.state.value is VmState.Starting) return
-        lifecycleTransaction(
-            vmId = vmId,
-            operation = LifecycleOperation.RESTART,
-            runtimeStarted = true,
-        ) {
-            awaitInitial(vmId)
-            requestStop(force = false).await()
-            lifecycleMutex.withLock {
-                check(runtime.quiescent.value) { "Cannot restart while VM cleanup is incomplete" }
-                installer.withExclusiveTree(vmId) { lease ->
-                    ensureInstalledLocked(vmId, lease)
-                    startLocked(vmId)
+        require(operation != LifecycleOperation.REMOVE) {
+            "Prepared service commands cannot carry a remove policy"
+        }
+        return supervisor.prepare(operation, expectedCommandGeneration).also { prepared ->
+            commandClaimMutex.withLock {
+                claimedCommands.entries.removeAll { (id, state) ->
+                    id < prepared.id && state == CommandClaimState.READY
                 }
             }
         }
     }
+
+    override suspend fun acceptPrepared(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+    ): Boolean = commandClaimMutex.withLock {
+        requireDefault(vmId)
+        if (command.id in claimedCommands || claimedCommands.size >= MAX_CLAIMED_COMMANDS) {
+            return@withLock false
+        }
+        if (!supervisor.claim(command)) return@withLock false
+        claimedCommands[command.id] = CommandClaimState.READY
+        true
+    }
+
+    override suspend fun executeAccepted(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+    ): Boolean {
+        requireDefault(vmId)
+        require(command.operation != LifecycleOperation.REMOVE) {
+            "Prepared service commands cannot execute removal without its policy"
+        }
+        val mayExecute = commandClaimMutex.withLock {
+            if (claimedCommands[command.id] != CommandClaimState.READY) return@withLock false
+            claimedCommands[command.id] = CommandClaimState.EXECUTING
+            true
+        }
+        if (!mayExecute) return false
+        return try {
+            if (!supervisor.isCurrent(command)) return false
+            val executeTransaction: suspend () -> Boolean = {
+                preparedTransaction(command) {
+                    when (command.operation) {
+                        LifecycleOperation.SETUP -> {
+                            ensureInstalledEffect(vmId)
+                            false
+                        }
+                        LifecycleOperation.START -> startEffect(vmId)
+                        LifecycleOperation.STOP -> {
+                            stopEffect(vmId, force = false)
+                            false
+                        }
+                        LifecycleOperation.FORCE_STOP -> {
+                            stopEffect(vmId, force = true)
+                            false
+                        }
+                        LifecycleOperation.RESTART -> restartEffect(vmId, command)
+                        LifecycleOperation.REMOVE -> error("validated above")
+                    }
+                }
+            }
+            if (command.operation == LifecycleOperation.START ||
+                command.operation == LifecycleOperation.RESTART
+            ) {
+                // Serialize launch acceptance together with its generation
+                // commit, so superseded launches cannot complete out of order.
+                launchCompletionMutex.withLock { executeTransaction() }
+            } else {
+                executeTransaction()
+            }
+        } finally {
+            val completionUncertain = runCatching { supervisor.isCurrent(command) }
+                .getOrDefault(true)
+            commandClaimMutex.withLock {
+                if (completionUncertain) {
+                    claimedCommands[command.id] = CommandClaimState.COMPLETION_UNCERTAIN
+                } else {
+                    claimedCommands.remove(command.id)
+                }
+            }
+        }
+    }
+
+    override suspend fun failAccepted(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+        errorCode: LifecycleErrorCode,
+    ): Boolean {
+        requireDefault(vmId)
+        val mayFail = commandClaimMutex.withLock {
+            if (claimedCommands[command.id] != CommandClaimState.READY) return@withLock false
+            claimedCommands[command.id] = CommandClaimState.EXECUTING
+            true
+        }
+        if (!mayFail) return false
+        return try {
+            withContext(NonCancellable) { supervisor.fail(command, errorCode) }
+        } finally {
+            val completionUncertain = runCatching { supervisor.isCurrent(command) }
+                .getOrDefault(true)
+            commandClaimMutex.withLock {
+                if (completionUncertain) {
+                    claimedCommands[command.id] = CommandClaimState.COMPLETION_UNCERTAIN
+                } else {
+                    claimedCommands.remove(command.id)
+                }
+            }
+        }
+    }
+
+    override suspend fun executePrepared(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+    ): Boolean {
+        if (!acceptPrepared(vmId, command)) return false
+        return executeAccepted(vmId, command)
+    }
+
+    override suspend fun ensureInstalled(vmId: VmId) = prepareAndExecute(
+        vmId,
+        LifecycleOperation.SETUP,
+    )
+
+    override suspend fun start(vmId: VmId) = prepareAndExecute(vmId, LifecycleOperation.START)
+
+    override suspend fun stop(vmId: VmId) = prepareAndExecute(vmId, LifecycleOperation.STOP)
+
+    override suspend fun forceStop(vmId: VmId) =
+        prepareAndExecute(vmId, LifecycleOperation.FORCE_STOP)
+
+    override suspend fun restart(vmId: VmId) = prepareAndExecute(vmId, LifecycleOperation.RESTART)
 
     override suspend fun remove(vmId: VmId, policy: VmRemovePolicy) = lifecycleTransaction(
         vmId = vmId,
@@ -419,6 +497,7 @@ class DefaultVmManager internal constructor(
                 installationEnsured = false
             }
         }
+        false
     }
 
     override suspend fun readConsoleLog(vmId: VmId, request: ConsoleLogRequest): ConsoleLog =
@@ -457,30 +536,91 @@ class DefaultVmManager internal constructor(
         return VmDiagnostics(raw.takeLast(request.maxChars), raw.length > request.maxChars)
     }
 
-    private suspend fun <T> lifecycleTransaction(
+    private suspend fun prepareAndExecute(vmId: VmId, operation: LifecycleOperation) {
+        val command = prepareLifecycleCommand(vmId, operation)
+        executePrepared(vmId, command)
+    }
+
+    private suspend fun lifecycleTransaction(
         vmId: VmId,
         operation: LifecycleOperation,
-        runtimeStarted: Boolean = false,
-        effect: suspend () -> T,
-    ): T {
+        effect: suspend () -> Boolean,
+    ) {
         requireDefault(vmId)
-        // The complete encoded intent and PENDING transaction are fsync-owned by
-        // DataStore before any installer/backend effect is entered.
-        val token = supervisor.begin(operation)
-        val result = try {
+        val command = supervisor.prepare(operation)
+        if (!supervisor.claim(command)) return
+        preparedTransaction(command, effect)
+    }
+
+    /**
+     * Completes only the same still-current PENDING command. Completion writes
+     * are non-cancellable; a failed write deliberately leaves crash evidence.
+     */
+    private suspend fun preparedTransaction(
+        command: LifecycleTransactionToken,
+        effect: suspend () -> Boolean,
+    ): Boolean {
+        val runtimeStarted = try {
             effect()
         } catch (failure: Throwable) {
             val errorCode = classifyLifecycleFailure(failure)
             withContext(NonCancellable) {
-                runCatching { supervisor.fail(token, errorCode) }
+                runCatching { supervisor.fail(command, errorCode) }
                     .onFailure(failure::addSuppressed)
             }
             throw failure
         }
-        // Completion is non-cancellable. If this write itself fails, PENDING is
-        // deliberately retained as crash evidence and the failure is returned.
-        withContext(NonCancellable) { supervisor.succeed(token, runtimeStarted) }
-        return result
+        return withContext(NonCancellable) { supervisor.succeed(command, runtimeStarted) }
+    }
+
+    private suspend fun ensureInstalledEffect(vmId: VmId) {
+        awaitInitial(vmId)
+        lifecycleMutex.withLock {
+            check(runtime.quiescent.value) { "Cannot install while VM cleanup is incomplete" }
+            installer.withExclusiveTree(vmId) { lease -> ensureInstalledLocked(vmId, lease) }
+        }
+    }
+
+    /** Returns true only when this command accepted a new backend generation. */
+    private suspend fun startEffect(vmId: VmId): Boolean {
+        awaitInitial(vmId)
+        return lifecycleMutex.withLock {
+            if (isRuntimeActive()) return@withLock false
+            check(!busyFlow.value) { "Cannot start while previous VM work or cleanup is incomplete" }
+            installer.withExclusiveTree(vmId) { lease ->
+                ensureInstalledLocked(vmId, lease)
+                startLocked(vmId)
+            }
+            true
+        }
+    }
+
+    private suspend fun stopEffect(vmId: VmId, force: Boolean) {
+        awaitInitial(vmId)
+        requestStop(force).await()
+    }
+
+    /** One durable RESTART remains pending across the stop-to-start handoff. */
+    private suspend fun restartEffect(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+    ): Boolean {
+        awaitInitial(vmId)
+        // Duplicate direct convenience calls during an already accepted
+        // replacement do not create another replacement generation.
+        if (runtime.state.value is VmState.Starting && !runtime.quiescent.value) return false
+        requestStop(force = false).await()
+        // A Start/Stop prepared while shutdown was in flight supersedes this
+        // command. Re-load before replacement installation or backend launch.
+        if (!supervisor.isCurrent(command)) return false
+        lifecycleMutex.withLock {
+            check(runtime.quiescent.value) { "Cannot restart while VM cleanup is incomplete" }
+            installer.withExclusiveTree(vmId) { lease ->
+                ensureInstalledLocked(vmId, lease)
+                startLocked(vmId)
+            }
+        }
+        return true
     }
 
     private fun classifyLifecycleFailure(failure: Throwable): LifecycleErrorCode = when (failure) {
@@ -658,6 +798,7 @@ class DefaultVmManager internal constructor(
     }
 
     private enum class StopWait { QUIESCENT, FORCE, TIMEOUT }
+    private enum class CommandClaimState { READY, EXECUTING, COMPLETION_UNCERTAIN }
 
     companion object {
         const val SSH_HOST_PORT = 9922
@@ -665,6 +806,7 @@ class DefaultVmManager internal constructor(
         private const val STOP_POLL_MS = 10L
         private const val MAX_OBSERVATION_TEXT_CHARS = 512
         private const val MAX_BACKEND_ID_CHARS = 32
+        private const val MAX_CLAIMED_COMMANDS = 16
 
         internal fun mapLifecycle(state: VmState): VmLifecycleState = when (state) {
             is VmState.Idle -> VmLifecycleState.IDLE

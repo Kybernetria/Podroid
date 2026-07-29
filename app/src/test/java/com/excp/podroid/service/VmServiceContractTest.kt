@@ -5,6 +5,9 @@ import com.excp.podroid.engine.avf.AvfSmokeTestExecutor
 import com.excp.podroid.vm.ConsoleLog
 import com.excp.podroid.vm.ConsoleLogRequest
 import com.excp.podroid.vm.HostSupervisorState
+import com.excp.podroid.vm.LifecycleErrorCode
+import com.excp.podroid.vm.LifecycleOperation
+import com.excp.podroid.vm.LifecycleTransactionToken
 import com.excp.podroid.vm.MonotonicDeadline
 import com.excp.podroid.vm.SshEndpointDiscovery
 import com.excp.podroid.vm.VmDiagnostics
@@ -63,9 +66,9 @@ class VmServiceContractTest {
     fun `start dispatches foreground command and stop intent remains lifecycle owned`() = runBlocking {
         val events = mutableListOf<String>()
         val endpoint = endpoint(lifecycle = object : VmServiceLifecycleCommands {
-            override fun startForeground() { events += "foreground-start" }
-            override fun stop(force: Boolean) { events += if (force) "force-stop" else "graceful-stop" }
-            override fun restart() { events += "foreground-restart" }
+            override suspend fun startForeground() { events += "foreground-start" }
+            override suspend fun stop(force: Boolean) { events += if (force) "force-stop" else "graceful-stop" }
+            override suspend fun restart() { events += "foreground-restart" }
         })
 
         endpoint.start()
@@ -463,13 +466,37 @@ class VmServiceContractTest {
         override suspend fun status(vmId: VmId) = VmStatus(vmId, true, VmLifecycleState.IDLE, "qemu").also { called("status", vmId) }
         override suspend fun supervisorState(vmId: VmId) =
             HostSupervisorState.safeDefaults().also { called("supervisor", vmId) }
+        override suspend fun prepareLifecycleCommand(
+            vmId: VmId,
+            operation: LifecycleOperation,
+            expectedCommandGeneration: Long?,
+        ): LifecycleTransactionToken = LifecycleTransactionToken.restore(
+            expectedCommandGeneration ?: 1L,
+            operation,
+            0L,
+        ).also { called("prepare:$operation", vmId) }
+        override suspend fun acceptPrepared(
+            vmId: VmId,
+            command: LifecycleTransactionToken,
+        ): Boolean = true.also { called("accept:${command.operation}", vmId) }
+        override suspend fun executeAccepted(
+            vmId: VmId,
+            command: LifecycleTransactionToken,
+        ): Boolean = true.also { called("executeAccepted:${command.operation}", vmId) }
+        override suspend fun failAccepted(
+            vmId: VmId,
+            command: LifecycleTransactionToken,
+            errorCode: LifecycleErrorCode,
+        ): Boolean = true.also { called("failAccepted:$errorCode", vmId) }
+        override suspend fun executePrepared(
+            vmId: VmId,
+            command: LifecycleTransactionToken,
+        ): Boolean = true.also { called("execute:${command.operation}", vmId) }
         override suspend fun ensureInstalled(vmId: VmId) { called("install", vmId) }
         override suspend fun start(vmId: VmId) { called("start", vmId) }
         override suspend fun stop(vmId: VmId) { called("stop", vmId) }
         override suspend fun forceStop(vmId: VmId) { called("forceStop", vmId) }
         override suspend fun restart(vmId: VmId) { called("restart", vmId) }
-        override suspend fun stopForRestart(vmId: VmId) { called("restartStop", vmId) }
-        override suspend fun startForRestart(vmId: VmId) { called("restartStart", vmId) }
         override suspend fun remove(vmId: VmId, policy: VmRemovePolicy) { called("remove:$policy", vmId) }
         override suspend fun readConsoleLog(vmId: VmId, request: ConsoleLogRequest) = ConsoleLog("", 0, 0, false).also { called("log", vmId) }
         override suspend fun executeQmp(vmId: VmId, operation: VmQmpOperation) = VmQmpResult.Status("running").also { called("qmp", vmId) }
@@ -507,9 +534,9 @@ class VmServiceContractTest {
     }
 
     private object NoopLifecycle : VmServiceLifecycleCommands {
-        override fun startForeground() = Unit
-        override fun stop(force: Boolean) = Unit
-        override fun restart() = Unit
+        override suspend fun startForeground() = Unit
+        override suspend fun stop(force: Boolean) = Unit
+        override suspend fun restart() = Unit
     }
 
     private object FakeAuxiliary : VmServiceAuxiliaryCapabilities {

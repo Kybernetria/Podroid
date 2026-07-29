@@ -126,9 +126,9 @@ internal fun interface CallerUidVerifier {
 }
 
 internal interface VmServiceLifecycleCommands {
-    fun startForeground()
-    fun stop(force: Boolean)
-    fun restart()
+    suspend fun startForeground()
+    suspend fun stop(force: Boolean)
+    suspend fun restart()
 }
 
 internal interface VmServiceAuxiliaryCapabilities {

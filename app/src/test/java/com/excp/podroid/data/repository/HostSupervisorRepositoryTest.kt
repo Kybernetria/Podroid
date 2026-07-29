@@ -42,8 +42,9 @@ class HostSupervisorRepositoryTest {
     fun `strict v1 codec round trips pending and terminal records`() = runBlocking {
         val store = FakeAtomicStore()
         val repository = repository(store)
-        val token = repository.begin(LifecycleOperation.START)
+        val token = repository.prepare(LifecycleOperation.START)
         val pending = repository.snapshot()
+        assertTrue(repository.claim(token))
 
         assertEquals(pending, HostSupervisorRecordCodec.decodeV1(HostSupervisorRecordCodec.encode(pending)))
         assertEquals(LifecycleOutcome.PENDING, pending.latestTransaction?.outcome)
@@ -54,6 +55,27 @@ class HostSupervisorRepositoryTest {
         assertEquals(failed, HostSupervisorRecordCodec.decodeV1(HostSupervisorRecordCodec.encode(failed)))
         assertEquals(LifecycleOutcome.FAILED, failed.latestTransaction?.outcome)
         assertEquals(LifecycleErrorCode.IO, failed.latestTransaction?.errorCode)
+    }
+
+    @Test
+    fun `initial schema v1 transaction layout remains readable`() {
+        val current = HostSupervisorState.safeDefaults().copy(
+            latestTransaction = com.excp.podroid.vm.LifecycleTransaction(
+                id = 1L,
+                operation = LifecycleOperation.START,
+                outcome = LifecycleOutcome.PENDING,
+                requestedAtEpochMs = 1L,
+                completedAtEpochMs = null,
+                errorCode = null,
+            ),
+        )
+        val legacy = HostSupervisorRecordCodec.encode(current)
+            .substringBeforeLast("\ntx_effect_started=")
+
+        val decoded = HostSupervisorRecordCodec.decodeV1(legacy)
+
+        assertEquals(current, decoded)
+        assertFalse(decoded.latestTransaction?.effectStarted == true)
     }
 
     @Test
@@ -81,13 +103,16 @@ class HostSupervisorRepositoryTest {
 
     @Test
     fun `DataStore waits are bounded before lifecycle effects`() = runBlocking {
-        val blockedStore = AtomicHostSupervisorRecordStore { _ ->
-            delay(1_000)
-            error("unreachable")
+        val blockedStore = object : AtomicHostSupervisorRecordStore {
+            override suspend fun read(): String? = null
+            override suspend fun update(transform: (String?) -> String): String {
+                delay(1_000)
+                error("unreachable")
+            }
         }
         val repository = HostSupervisorRepository(blockedStore, { 1L }, datastoreTimeoutMs = 10L)
 
-        val failure = runCatching { repository.begin(LifecycleOperation.START) }.exceptionOrNull()
+        val failure = runCatching { repository.prepare(LifecycleOperation.START) }.exceptionOrNull()
 
         assertTrue(failure is TimeoutCancellationException)
     }
@@ -97,7 +122,7 @@ class HostSupervisorRepositoryTest {
         val store = FakeAtomicStore()
         val repository = repository(store)
 
-        repository.begin(LifecycleOperation.RESTART)
+        repository.prepare(LifecycleOperation.RESTART)
         val recovered = repository(store).snapshot()
 
         assertEquals(VmDesiredState.RUNNING, recovered.desiredState)
@@ -113,7 +138,7 @@ class HostSupervisorRepositoryTest {
 
         val ids = (1..100).map { index ->
             async(Dispatchers.Default) {
-                repository.begin(if (index % 2 == 0) LifecycleOperation.START else LifecycleOperation.STOP).id
+                repository.prepare(if (index % 2 == 0) LifecycleOperation.START else LifecycleOperation.STOP).id
             }
         }.awaitAll()
 
@@ -122,12 +147,14 @@ class HostSupervisorRepositoryTest {
     }
 
     @Test
-    fun `stale launch completion preserves newer transaction and advances generation monotonically`() = runBlocking {
+    fun `accepted launch completion preserves newer transaction and accounts once`() = runBlocking {
         val repository = repository(FakeAtomicStore())
-        val oldStart = repository.begin(LifecycleOperation.START)
-        val newerStop = repository.begin(LifecycleOperation.STOP)
+        val oldStart = repository.prepare(LifecycleOperation.START)
+        assertTrue(repository.claim(oldStart))
+        val newerStop = repository.prepare(LifecycleOperation.STOP)
+        assertTrue(repository.claim(newerStop))
 
-        repository.succeed(oldStart, runtimeStarted = true)
+        assertFalse(repository.succeed(oldStart, runtimeStarted = true))
         val pendingStop = repository.snapshot()
         assertEquals(1L, pendingStop.runtimeGeneration)
         assertEquals(newerStop.id, pendingStop.latestTransaction?.id)
@@ -145,15 +172,71 @@ class HostSupervisorRepositoryTest {
     }
 
     @Test
+    fun `explicit stale generation is rejected before store mutation`() = runBlocking {
+        val store = FakeAtomicStore()
+        val repository = repository(store)
+        repository.prepare(LifecycleOperation.START, expectedId = 1L)
+        val commitsBeforeStale = store.commits
+
+        val failure = runCatching {
+            repository.prepare(LifecycleOperation.STOP, expectedId = 1L)
+        }.exceptionOrNull()
+
+        assertTrue(failure is com.excp.podroid.vm.StaleLifecycleCommandException)
+        assertEquals(commitsBeforeStale, store.commits)
+        assertEquals(LifecycleOperation.START, repository.snapshot().latestTransaction?.operation)
+    }
+
+    @Test
+    fun `recreated token validates by id and closed operation and duplicates are stale`() = runBlocking {
+        val repository = repository(FakeAtomicStore())
+        val prepared = repository.prepare(LifecycleOperation.RESTART)
+        val restored = com.excp.podroid.vm.LifecycleTransactionToken.restore(
+            prepared.id,
+            LifecycleOperation.RESTART,
+            prepared.baseRuntimeGeneration,
+        )
+
+        assertTrue(repository.claim(restored))
+        val recreated = repository(FakeAtomicStore(
+            HostSupervisorRecordCodec.encode(repository.snapshot()),
+        ))
+        assertTrue(recreated.isCurrent(restored))
+        assertFalse(recreated.claim(restored))
+        assertFalse(repository.claim(
+            com.excp.podroid.vm.LifecycleTransactionToken.restore(
+                prepared.id,
+                LifecycleOperation.START,
+                prepared.baseRuntimeGeneration,
+            ),
+        ))
+        assertFalse(repository.claim(
+            com.excp.podroid.vm.LifecycleTransactionToken.restore(
+                prepared.id,
+                LifecycleOperation.RESTART,
+                prepared.baseRuntimeGeneration + 1L,
+            ),
+        ))
+        assertTrue(repository.succeed(restored, runtimeStarted = true))
+        assertFalse(repository.isCurrent(restored))
+        assertFalse(repository.claim(restored))
+        assertFalse(repository.succeed(restored, runtimeStarted = true))
+        assertEquals(1L, repository.snapshot().runtimeGeneration)
+    }
+
+    @Test
     fun `successful launches advance generation while non-launch outcomes preserve it`() = runBlocking {
         val repository = repository(FakeAtomicStore())
-        val start = repository.begin(LifecycleOperation.START)
+        val start = repository.prepare(LifecycleOperation.START)
+        assertTrue(repository.claim(start))
         repository.succeed(start, runtimeStarted = true)
         val first = repository.snapshot()
-        val stop = repository.begin(LifecycleOperation.FORCE_STOP)
+        val stop = repository.prepare(LifecycleOperation.FORCE_STOP)
+        assertTrue(repository.claim(stop))
         repository.succeed(stop)
         val stopped = repository.snapshot()
-        val restart = repository.begin(LifecycleOperation.RESTART)
+        val restart = repository.prepare(LifecycleOperation.RESTART)
+        assertTrue(repository.claim(restart))
         repository.succeed(restart, runtimeStarted = true)
 
         assertEquals(1L, first.runtimeGeneration)
@@ -173,6 +256,8 @@ class HostSupervisorRepositoryTest {
             private set
         var commits: Int = 0
             private set
+
+        override suspend fun read(): String? = mutex.withLock { raw }
 
         override suspend fun update(transform: (String?) -> String): String = mutex.withLock {
             val replacement = transform(raw)

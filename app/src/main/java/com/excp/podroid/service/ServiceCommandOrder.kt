@@ -4,13 +4,17 @@
  */
 package com.excp.podroid.service
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
 /**
- * Process-lifetime order for every service lifecycle command.
+ * One suspend admission path for service lifecycle commands.
  *
- * Every in-process issuer reserves before enqueueing an Intent or initiating a
- * direct command. Only the externally delivered notification PendingIntent has
- * no reservation and becomes newest when Android delivers it. A delayed or
- * duplicate reserved command therefore cannot supersede a command ordered later.
+ * Admission adopts the latest durable transaction id, reserves exactly its
+ * successor, waits for that PENDING record to commit, and only then dispatches
+ * an Intent or touches the in-memory execution coordinator. Delivered commands
+ * use the same gate, so an older asynchronous delivery cannot start after a
+ * newer generation has been reserved for persistence.
  */
 internal class ServiceCommandOrder {
     data class Delivery(
@@ -19,59 +23,67 @@ internal class ServiceCommandOrder {
         val newestGeneration: Long,
     )
 
+    data class Admission<T : Any>(val generation: Long, val prepared: T)
+
+    private val mutex = Mutex()
     private var newestGeneration = 0L
     private var lastDeliveredGeneration = 0L
 
-    /** Reserve an order position before enqueueing a start/restart Intent. */
-    @Synchronized
-    fun reserve(): Long = nextGenerationLocked()
-
-    /**
-     * Reserve and initiate a direct Binder command under the same short lock.
-     * This preserves stop-then-start ordering even when a later Binder call can
-     * reserve immediately after the stop call returns.
-     */
-    @Synchronized
-    fun executeDirect(command: (generation: Long) -> Unit): Long {
-        val generation = nextGenerationLocked()
-        lastDeliveredGeneration = generation
-        command(generation)
-        return generation
-    }
-
-    /**
-     * Claim and initiate a delivered command under the same short lock. A null
-     * generation is reserved for external notification delivery and atomically
-     * receives the newest position at delivery.
-     */
-    @Synchronized
-    fun deliverAndExecute(reservedGeneration: Long?, command: () -> Unit): Delivery {
-        val delivery = deliverLocked(reservedGeneration)
-        if (delivery.execute) command()
-        return delivery
-    }
-
-    @Synchronized
-    fun deliver(reservedGeneration: Long?): Delivery = deliverLocked(reservedGeneration)
-
-    private fun deliverLocked(reservedGeneration: Long?): Delivery {
-        if (reservedGeneration == null) {
-            val generation = nextGenerationLocked()
-            lastDeliveredGeneration = generation
-            return Delivery(generation, execute = true, newestGeneration)
+    suspend fun <T : Any> admitAndDispatch(
+        latestDurableGeneration: suspend () -> Long,
+        prepare: suspend (generation: Long) -> T,
+        dispatch: (Admission<T>) -> Unit,
+    ): Admission<T> = mutex.withLock {
+        val durableGeneration = latestDurableGeneration()
+        adoptLocked(durableGeneration)
+        check(newestGeneration == durableGeneration) {
+            "In-memory command order is ahead of durable transaction order"
         }
+        val generation = nextGenerationLocked()
+        try {
+            val admission = Admission(generation, prepare(generation))
+            dispatch(admission)
+            admission
+        } catch (failure: Throwable) {
+            // No concurrent admission can exist under this mutex. A failed
+            // prepare did not commit this reserved generation, so roll it back.
+            newestGeneration = durableGeneration
+            throw failure
+        }
+    }
+
+    suspend fun deliverAndExecute(
+        reservedGeneration: Long,
+        validatePrepared: suspend () -> Boolean,
+        command: () -> Unit,
+    ): Delivery = mutex.withLock {
+        val delivery = deliverLocked(reservedGeneration, validatePrepared)
+        if (delivery.execute) command()
+        delivery
+    }
+
+    private suspend fun deliverLocked(
+        reservedGeneration: Long,
+        validatePrepared: suspend () -> Boolean,
+    ): Delivery {
         if (reservedGeneration <= 0L ||
             reservedGeneration < newestGeneration ||
-            reservedGeneration <= lastDeliveredGeneration
+            reservedGeneration <= lastDeliveredGeneration ||
+            !validatePrepared()
         ) {
             return Delivery(reservedGeneration, execute = false, newestGeneration)
         }
 
-        // A process recreated to deliver an already-enqueued explicit Intent has
-        // no in-memory reservation. Adopt that positive generation safely.
-        if (reservedGeneration > newestGeneration) newestGeneration = reservedGeneration
+        // Process recreation can deliver an already-prepared explicit Intent,
+        // but only after durable id + operation + PENDING validation.
+        adoptLocked(reservedGeneration)
         lastDeliveredGeneration = reservedGeneration
         return Delivery(reservedGeneration, execute = true, newestGeneration)
+    }
+
+    private fun adoptLocked(generation: Long) {
+        require(generation >= 0L) { "command generation must be non-negative" }
+        if (generation > newestGeneration) newestGeneration = generation
     }
 
     private fun nextGenerationLocked(): Long {

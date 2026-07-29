@@ -33,6 +33,9 @@ import com.excp.podroid.data.repository.PortForwardRepository
 import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.engine.VmEngine
 import com.excp.podroid.engine.usb.UsbPassthroughManager
+import com.excp.podroid.vm.LifecycleErrorCode
+import com.excp.podroid.vm.LifecycleOperation
+import com.excp.podroid.vm.LifecycleTransactionToken
 import com.excp.podroid.vm.VmId
 import com.excp.podroid.vm.VmLifecycleState
 import com.excp.podroid.vm.VmManager
@@ -63,12 +66,12 @@ class PodroidService : Service() {
     // both launch joining and manager.stop have completed.
     private data class ServiceLaunchOwner(
         val job: Job,
-        val completesRestart: Boolean,
+        val command: LifecycleTransactionToken,
         var generation: Long = 0L,
     )
 
     private val launchCoordinator = ServiceLaunchCoordinator<ServiceLaunchOwner>()
-    @Volatile private var queuedLaunchCompletesRestart = false
+    @Volatile private var queuedLaunchCommand: LifecycleTransactionToken? = null
 
     private var notificationBuilder: NotificationCompat.Builder? = null
     private var stopPendingIntent: PendingIntent? = null
@@ -87,28 +90,32 @@ class PodroidService : Service() {
         val endpoint = LocalVmServiceEndpoint(
             manager = vmManager,
             lifecycleCommands = object : VmServiceLifecycleCommands {
-                override fun startForeground() {
-                    val generation = commandOrder.reserve()
-                    ContextCompat.startForegroundService(
-                        this@PodroidService,
-                        lifecycleIntent(ACTION_START, generation),
+                override suspend fun startForeground() {
+                    admitAndDispatch(
+                        operation = LifecycleOperation.START,
+                        enqueueAction = ACTION_START,
                     )
                 }
 
-                override fun stop(force: Boolean) {
-                    commandOrder.executeDirect {
+                override suspend fun stop(force: Boolean) {
+                    val operation = if (force) {
+                        LifecycleOperation.FORCE_STOP
+                    } else {
+                        LifecycleOperation.STOP
+                    }
+                    admitAndDispatch(operation) { command ->
                         requestServiceStop(
+                            command = command,
                             failureLog = if (force) "VM force stop failed" else "VM graceful stop failed",
                             force = force,
                         )
                     }
                 }
 
-                override fun restart() {
-                    val generation = commandOrder.reserve()
-                    ContextCompat.startForegroundService(
-                        this@PodroidService,
-                        lifecycleIntent(ACTION_RESTART, generation),
+                override suspend fun restart() {
+                    admitAndDispatch(
+                        operation = LifecycleOperation.RESTART,
+                        enqueueAction = ACTION_RESTART,
                     )
                 }
             },
@@ -154,65 +161,92 @@ class PodroidService : Service() {
         val action = intent?.action
         when (action) {
             ACTION_START, ACTION_RESTART -> {
-                // Android requires this for every delivered foreground-service
-                // start, even when its reserved command has since gone stale.
+                // Android requires this for each delivered foreground start,
+                // including a token that became stale after enqueue.
                 enterForegroundStartWindow()
-                if (intent?.hasCommandReservation() != true) {
-                    Log.w(TAG, "Ignoring unreserved in-process lifecycle command source=$action")
+                val command = intent.preparedCommandOrNull(action)
+                if (command == null) {
+                    Log.w(TAG, "Ignoring malformed prepared lifecycle command source=$action")
                     reconcileAfterStaleForegroundDelivery()
                 } else {
-                    val delivery = commandOrder.deliverAndExecute(intent.commandGenerationOrNull()) {
-                        if (action == ACTION_START) {
-                            executeStartCommand()
-                        } else {
-                            acquireWakeLock()
-                            startSupervision()
-                            requestServiceRestart("VM restart stop failed")
-                        }
-                    }
-                    if (!delivery.execute) {
-                        logStaleCommand(action, delivery)
-                        reconcileAfterStaleForegroundDelivery()
+                    serviceScope.launch {
+                        deliverPreparedIntent(action, command)
                     }
                 }
             }
             ACTION_STOP -> {
-                if (intent?.isSequencedOrExternalNotification() != true) {
-                    Log.w(TAG, "Ignoring unreserved non-notification lifecycle command source=$action")
-                } else {
-                    val delivery = commandOrder.deliverAndExecute(intent.commandGenerationOrNull()) {
-                        requestServiceStop("VM graceful stop failed", force = false)
+                val command = intent.preparedCommandOrNull(action)
+                if (command != null) {
+                    serviceScope.launch { deliverPreparedIntent(action, command) }
+                } else if (intent?.getBooleanExtra(EXTRA_EXTERNAL_NOTIFICATION_DELIVERY, false) == true) {
+                    // Notification PendingIntents cannot contain a token prepared
+                    // at click time. Delivery enters the same suspend admission
+                    // path before launch cancellation or backend effects.
+                    serviceScope.launch {
+                        runCatching {
+                            admitAndDispatch(LifecycleOperation.STOP) {
+                                requestServiceStop(it, "Notification graceful stop failed", force = false)
+                            }
+                        }.onFailure { Log.e(TAG, "Notification stop admission failed", it) }
                     }
-                    if (!delivery.execute) logStaleCommand(action, delivery)
+                } else {
+                    Log.w(TAG, "Ignoring malformed stop command")
                 }
             }
-            else -> {
-                // Null/unrecognized action (e.g. a system redelivery): we never
-                // called startForeground for this start, so just stop to avoid a
-                // started-but-not-foregrounded service.
-                stopSelf()
-            }
+            else -> stopSelf()
         }
         return START_NOT_STICKY
     }
 
-    private fun executeStartCommand() {
-        // STOPPING owns the current launch generation, but an ordered start in
-        // that window is durable and idempotent. completeStop performs the
-        // atomic handoff to exactly one fresh lazy launch.
+    private suspend fun deliverPreparedIntent(
+        action: String,
+        command: LifecycleTransactionToken,
+    ) {
+        val delivery = commandOrder.deliverAndExecute(
+            reservedGeneration = command.id,
+            validatePrepared = { vmManager.acceptPrepared(VmId.DEFAULT, command) },
+        ) {
+            when (command.operation) {
+                LifecycleOperation.START -> executeStartCommand(command)
+                LifecycleOperation.RESTART -> {
+                    acquireWakeLock()
+                    startSupervision()
+                    requestServiceRestart(command, "VM restart failed")
+                }
+                LifecycleOperation.STOP ->
+                    requestServiceStop(command, "VM graceful stop failed", force = false)
+                else -> Log.w(TAG, "Ignoring operation ${command.operation} for service Intent")
+            }
+        }
+        if (!delivery.execute) {
+            logStaleCommand(action, delivery)
+            if (action != ACTION_STOP) reconcileAfterStaleForegroundDelivery()
+        }
+    }
+
+    private fun executeStartCommand(command: LifecycleTransactionToken) {
+        // The durable RUNNING/PENDING command is authoritative. This queue only
+        // coordinates execution; process death intentionally leaves it pending
+        // for ticket #11 reconciliation.
         val queuedDuringStop = launchCoordinator.queueStartDuringStop()
-        if (queuedDuringStop) queuedLaunchCompletesRestart = false
+        if (queuedDuringStop) queuedLaunchCommand = command
         val startDecision = VmServiceStartPolicy.decide(
             managerBusy = vmManager.busy(VmId.DEFAULT).value,
             pendingStartOwned = launchCoordinator.ownershipActive.value,
         )
         val launch = if (!queuedDuringStop && startDecision.launchNewGeneration) {
-            prepareLaunch()
+            prepareLaunch(command)
         } else {
             null
         }
         if (startDecision.acquireWakeLock) acquireWakeLock()
         if (startDecision.armSupervision) startSupervision()
+        if (!queuedDuringStop && launch == null) {
+            serviceScope.launch(Dispatchers.IO) {
+                runCatching { vmManager.executeAccepted(VmId.DEFAULT, command) }
+                    .onFailure { Log.e(TAG, "VM start command failed", it) }
+            }
+        }
         launch?.owner?.job?.start()
     }
 
@@ -233,19 +267,74 @@ class PodroidService : Service() {
         }
     }
 
-    private fun lifecycleIntent(action: String, generation: Long): Intent =
+    private suspend fun admitAndDispatch(
+        operation: LifecycleOperation,
+        enqueueAction: String,
+    ) = admitAndDispatch(operation, claimBeforeDispatch = false) { command ->
+        val intent = lifecycleIntent(enqueueAction, command)
+        if (enqueueAction == ACTION_START || enqueueAction == ACTION_RESTART) {
+            ContextCompat.startForegroundService(this, intent)
+        } else {
+            startService(intent)
+        }
+    }
+
+    private suspend fun admitAndDispatch(
+        operation: LifecycleOperation,
+        claimBeforeDispatch: Boolean = true,
+        dispatch: (LifecycleTransactionToken) -> Unit,
+    ): LifecycleTransactionToken = commandOrder.admitAndDispatch(
+        latestDurableGeneration = {
+            vmManager.supervisorState(VmId.DEFAULT).latestTransaction?.id ?: 0L
+        },
+        prepare = { generation ->
+            vmManager.prepareLifecycleCommand(VmId.DEFAULT, operation, generation).also {
+                if (claimBeforeDispatch) {
+                    check(vmManager.acceptPrepared(VmId.DEFAULT, it)) {
+                        "Fresh durable lifecycle command could not be claimed"
+                    }
+                }
+            }
+        },
+        dispatch = { admission ->
+            check(admission.prepared.id == admission.generation) {
+                "Durable transaction order diverged from service command order"
+            }
+            dispatch(admission.prepared)
+        },
+    ).prepared
+
+    private fun lifecycleIntent(action: String, command: LifecycleTransactionToken): Intent =
         Intent(this, PodroidService::class.java).apply {
             this.action = action
-            putExtra(EXTRA_COMMAND_GENERATION, generation)
+            putExtra(EXTRA_TRANSACTION_ID, command.id)
+            putExtra(EXTRA_TRANSACTION_OPERATION, command.operation.name)
+            putExtra(EXTRA_TRANSACTION_BASE_RUNTIME_GENERATION, command.baseRuntimeGeneration)
         }
 
-    private fun Intent.hasCommandReservation(): Boolean = hasExtra(EXTRA_COMMAND_GENERATION)
-
-    private fun Intent.isSequencedOrExternalNotification(): Boolean =
-        hasCommandReservation() || getBooleanExtra(EXTRA_EXTERNAL_NOTIFICATION_DELIVERY, false)
-
-    private fun Intent.commandGenerationOrNull(): Long? =
-        if (hasCommandReservation()) getLongExtra(EXTRA_COMMAND_GENERATION, 0L) else null
+    private fun Intent?.preparedCommandOrNull(action: String): LifecycleTransactionToken? {
+        if (this == null || !hasExtra(EXTRA_TRANSACTION_ID) ||
+            !hasExtra(EXTRA_TRANSACTION_OPERATION) ||
+            !hasExtra(EXTRA_TRANSACTION_BASE_RUNTIME_GENERATION)) return null
+        val id = getLongExtra(EXTRA_TRANSACTION_ID, 0L)
+        val operationName = getStringExtra(EXTRA_TRANSACTION_OPERATION)
+            ?.takeIf { it.length <= MAX_OPERATION_NAME_CHARS }
+            ?: return null
+        val operation = enumValues<LifecycleOperation>().singleOrNull { it.name == operationName }
+            ?: return null
+        val expected = when (action) {
+            ACTION_START -> LifecycleOperation.START
+            ACTION_RESTART -> LifecycleOperation.RESTART
+            ACTION_STOP -> LifecycleOperation.STOP
+            else -> return null
+        }
+        val baseRuntimeGeneration = getLongExtra(
+            EXTRA_TRANSACTION_BASE_RUNTIME_GENERATION,
+            -1L,
+        )
+        if (operation != expected || id <= 0L || baseRuntimeGeneration < 0L) return null
+        return LifecycleTransactionToken.restore(id, operation, baseRuntimeGeneration)
+    }
 
     private fun enterForegroundStartWindow() {
         val fgType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -280,68 +369,65 @@ class PodroidService : Service() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        // This in-process callback issues its stop directly. Reserve at issue
-        // time; only the notification PendingIntent is intentionally unreserved.
-        commandOrder.executeDirect {
-            requestServiceStop("Task-removal graceful stop failed", force = false)
+        serviceScope.launch {
+            runCatching {
+                admitAndDispatch(LifecycleOperation.STOP) {
+                    requestServiceStop(it, "Task-removal graceful stop failed", force = false)
+                }
+            }.onFailure { Log.e(TAG, "Task-removal stop admission failed", it) }
         }
     }
 
-    private fun requestServiceStop(failureLog: String, force: Boolean) {
-        queuedLaunchCompletesRestart = false
+    private fun requestServiceStop(
+        command: LifecycleTransactionToken,
+        failureLog: String,
+        force: Boolean,
+    ) {
+        queuedLaunchCommand = null
         val wasBusy = vmManager.busy(VmId.DEFAULT).value || launchCoordinator.ownershipActive.value
         val stop = launchCoordinator.beginStop()
         if (!stop.shouldExecute) {
-            // The existing service stop retains teardown ownership. Still route
-            // the newer desired-state command through the manager: Force can
-            // escalate the same backend stop, and a normal Stop can supersede a
-            // queued Restart without starting a second teardown sequence.
+            // The current teardown remains the in-memory owner. This newer
+            // durable command may share/escalate the manager-owned stop task.
             serviceScope.launch(Dispatchers.IO) {
-                runCatching {
-                    if (force) vmManager.forceStop(VmId.DEFAULT) else vmManager.stop(VmId.DEFAULT)
-                }.onFailure { Log.e(TAG, failureLog, it) }
-            }
-            return
-        }
-        dispatchServiceStop(stop, failureLog, wasBusy, force, restartCommand = false)
-    }
-
-    private fun requestServiceRestart(failureLog: String) {
-        queuedLaunchCompletesRestart = true
-        val wasBusy = vmManager.busy(VmId.DEFAULT).value || launchCoordinator.ownershipActive.value
-        val stop = launchCoordinator.beginRestart()
-        if (!stop.shouldExecute) {
-            // Persist the newer Restart intent even when an existing stop owns
-            // cleanup; its retained launch will complete the restart phase.
-            serviceScope.launch(Dispatchers.IO) {
-                runCatching { vmManager.stopForRestart(VmId.DEFAULT) }
+                runCatching { vmManager.executeAccepted(VmId.DEFAULT, command) }
                     .onFailure { Log.e(TAG, failureLog, it) }
             }
             return
         }
-        dispatchServiceStop(
-            stop,
-            failureLog,
-            wasBusy,
-            force = false,
-            restartCommand = true,
-        )
+        dispatchServiceStop(stop, command, failureLog, wasBusy)
+    }
+
+    private fun requestServiceRestart(
+        command: LifecycleTransactionToken,
+        failureLog: String,
+    ) {
+        val wasBusy = vmManager.busy(VmId.DEFAULT).value || launchCoordinator.ownershipActive.value
+        val stop = launchCoordinator.beginStop()
+        if (!stop.shouldExecute) {
+            queuedLaunchCommand = command
+            launchCoordinator.queueStartDuringStop()
+            return
+        }
+        // Restart executes as one manager transaction. It remains PENDING while
+        // shutdown is in flight and completes only after replacement acceptance.
+        dispatchServiceStop(stop, command, failureLog, wasBusy)
     }
 
     private fun dispatchServiceStop(
         stop: ServiceLaunchCoordinator.Stop<ServiceLaunchOwner>,
+        command: LifecycleTransactionToken,
         failureLog: String,
         wasBusy: Boolean,
-        force: Boolean,
-        restartCommand: Boolean,
     ) {
         if (!stop.shouldExecute) return
 
+        // Command preparation is already durable before this cancellation.
         stop.launchOwner?.job?.cancel()
         val stopScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         stopScope.launch {
             try {
-                stopAndApplyPolicy(stop, failureLog, force, restartCommand)
+                stopAndApplyPolicy(stop, command, failureLog)
             } finally {
                 stopScope.cancel()
             }
@@ -353,22 +439,12 @@ class PodroidService : Service() {
 
     private suspend fun stopAndApplyPolicy(
         stop: ServiceLaunchCoordinator.Stop<ServiceLaunchOwner>,
+        command: LifecycleTransactionToken,
         failureLog: String,
-        force: Boolean,
-        restartCommand: Boolean,
     ) {
         val stopResult = coroutineScope {
-            // Start manager.stop together with the bounded join. If cancellation
-            // landed during manager acceptance, its manager-owned cleanup and
-            // this stop operation serialize at the manager lifecycle boundary.
             val managerStop = async {
-                runCatching {
-                    when {
-                        force -> vmManager.forceStop(VmId.DEFAULT)
-                        restartCommand -> vmManager.stopForRestart(VmId.DEFAULT)
-                        else -> vmManager.stop(VmId.DEFAULT)
-                    }
-                }
+                runCatching { vmManager.executeAccepted(VmId.DEFAULT, command) }
             }
             val joined = withTimeoutOrNull(SERVICE_LAUNCH_JOIN_TIMEOUT_MS) {
                 stop.launchOwner?.job?.join()
@@ -382,24 +458,34 @@ class PodroidService : Service() {
         stopResult.onFailure { Log.e(TAG, failureLog, it) }
         withContext(NonCancellable + Dispatchers.Main.immediate) {
             if (stopResult.isFailure) {
-                // Cleanup did not complete, so a retained Start/Restart must not
-                // race a still-owned backend. Clear the queued handoff; the
-                // failed durable transaction remains available for diagnosis.
+                queuedLaunchCommand?.let { queued ->
+                    val failed = withContext(Dispatchers.IO) {
+                        runCatching {
+                            vmManager.failAccepted(
+                                VmId.DEFAULT,
+                                queued,
+                                LifecycleErrorCode.INVALID_STATE,
+                            )
+                        }
+                    }
+                    failed.onFailure { Log.e(TAG, "Queued launch failure persistence failed", it) }
+                }
                 launchCoordinator.beginStop()
-                queuedLaunchCompletesRestart = false
+                queuedLaunchCommand = null
             }
-            val completesRestart = queuedLaunchCompletesRestart
-            queuedLaunchCompletesRestart = false
-            val restartOwner = createLaunchOwner(completesRestart = completesRestart)
-            val completion = launchCoordinator.completeStop(stop.generation, restartOwner)
-            val restart = completion?.launch
-            if (restart != null) {
-                restartOwner.generation = restart.generation
+            val queuedCommand = queuedLaunchCommand
+            queuedLaunchCommand = null
+            val queuedOwner = queuedCommand?.let(::createLaunchOwner)
+            val unusedOwner = queuedOwner ?: createLaunchOwner(command).also { it.job.cancel() }
+            val completion = launchCoordinator.completeStop(stop.generation, unusedOwner)
+            val launch = completion?.launch
+            if (launch != null && queuedOwner != null) {
+                queuedOwner.generation = launch.generation
                 acquireWakeLock()
                 startSupervision()
-                restart.owner.job.start()
+                launch.owner.job.start()
             } else {
-                restartOwner.job.cancel()
+                queuedOwner?.job?.cancel()
                 val decision = currentLifecycleDecision()
                 if (decision.teardown) teardown()
                 else if (decision.notification == VmServiceNotification.CLEANUP_INCOMPLETE) {
@@ -574,8 +660,10 @@ class PodroidService : Service() {
         }
     }
 
-    private fun prepareLaunch(): ServiceLaunchCoordinator.Launch<ServiceLaunchOwner>? {
-        val owner = createLaunchOwner()
+    private fun prepareLaunch(
+        command: LifecycleTransactionToken,
+    ): ServiceLaunchCoordinator.Launch<ServiceLaunchOwner>? {
+        val owner = createLaunchOwner(command)
         val launch = launchCoordinator.beginLaunch(owner)
         if (launch == null) {
             owner.job.cancel()
@@ -585,23 +673,19 @@ class PodroidService : Service() {
         return launch
     }
 
-    private fun createLaunchOwner(completesRestart: Boolean = false): ServiceLaunchOwner {
+    private fun createLaunchOwner(command: LifecycleTransactionToken): ServiceLaunchOwner {
         lateinit var owner: ServiceLaunchOwner
         val job = serviceScope.launch(start = CoroutineStart.LAZY) {
             var failure: Throwable? = null
             try {
                 withContext(Dispatchers.IO) {
-                    if (owner.completesRestart) {
-                        vmManager.startForRestart(VmId.DEFAULT)
-                    } else {
-                        vmManager.start(VmId.DEFAULT)
-                    }
+                    vmManager.executeAccepted(VmId.DEFAULT, owner.command)
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (caught: Throwable) {
                 failure = caught
-                Log.e(TAG, "VM failed to start", caught)
+                Log.e(TAG, "VM failed to execute prepared launch", caught)
             } finally {
                 withContext(NonCancellable + Dispatchers.Main.immediate) {
                     if (launchCoordinator.completeLaunch(owner.generation)) {
@@ -615,7 +699,7 @@ class PodroidService : Service() {
                 }
             }
         }
-        owner = ServiceLaunchOwner(job, completesRestart)
+        owner = ServiceLaunchOwner(job, command)
         return owner
     }
 
@@ -718,23 +802,37 @@ class PodroidService : Service() {
                 VmLifecycleState.ERROR -> "error"
             })
             "stop" -> {
-                val ctx = applicationContext
-                val generation = commandOrder.reserve()
-                android.os.Handler(android.os.Looper.getMainLooper())
-                    .postDelayed({ enqueueStop(ctx, generation) }, 300)
+                scheduleGuestPowerCommand(LifecycleOperation.STOP)
                 proto.ok()
             }
-            "restart" -> { scheduleRestart(); proto.ok() }
+            "restart" -> {
+                scheduleGuestPowerCommand(LifecycleOperation.RESTART)
+                proto.ok()
+            }
             else -> proto.err("usage: stop|restart|status")
         }
     }
 
-    private fun scheduleRestart() {
-        val ctx = applicationContext
-        val generation = commandOrder.reserve()
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            enqueueRestart(ctx, generation)
-        }, 300)
+    private fun scheduleGuestPowerCommand(operation: LifecycleOperation) {
+        serviceScope.launch {
+            delay(300L) // allow the host-bridge response to flush first
+            runCatching {
+                admitAndDispatch(operation) { command ->
+                    when (operation) {
+                        LifecycleOperation.STOP -> requestServiceStop(
+                            command,
+                            "Guest graceful stop failed",
+                            force = false,
+                        )
+                        LifecycleOperation.RESTART -> requestServiceRestart(
+                            command,
+                            "Guest restart failed",
+                        )
+                        else -> error("Unsupported guest power operation")
+                    }
+                }
+            }.onFailure { Log.e(TAG, "Guest power admission failed", it) }
+        }
     }
 
     companion object {
@@ -742,47 +840,23 @@ class PodroidService : Service() {
         private const val CHANNEL_ID = "podroid_service"
         private const val NOTIFICATION_ID = 1001
         private const val SERVICE_LAUNCH_JOIN_TIMEOUT_MS = 8_000L
-        private const val EXTRA_COMMAND_GENERATION =
-            "com.excp.podroid.extra.SERVICE_COMMAND_GENERATION"
+        private const val EXTRA_TRANSACTION_ID =
+            "com.excp.podroid.extra.LIFECYCLE_TRANSACTION_ID"
+        private const val EXTRA_TRANSACTION_OPERATION =
+            "com.excp.podroid.extra.LIFECYCLE_TRANSACTION_OPERATION"
+        private const val EXTRA_TRANSACTION_BASE_RUNTIME_GENERATION =
+            "com.excp.podroid.extra.LIFECYCLE_TRANSACTION_BASE_RUNTIME_GENERATION"
         private const val EXTRA_EXTERNAL_NOTIFICATION_DELIVERY =
             "com.excp.podroid.extra.EXTERNAL_NOTIFICATION_DELIVERY"
+        private const val MAX_OPERATION_NAME_CHARS = 32
 
-        // Process-lifetime so a delayed explicit Intent remains stale even if
-        // Android recreates the Service object before delivering it.
+        // Process-lifetime ordering is anchored to the durable latest id on
+        // every admission and can adopt a prepared token after recreation.
         private val commandOrder = ServiceCommandOrder()
 
         const val ACTION_START   = "com.excp.podroid.action.START"
         const val ACTION_STOP    = "com.excp.podroid.action.STOP"
         const val ACTION_RESTART = "com.excp.podroid.action.RESTART"
-
-        fun start(context: Context) {
-            val generation = commandOrder.reserve()
-            context.startForegroundService(lifecycleIntent(context, ACTION_START, generation))
-        }
-
-        fun stop(context: Context) {
-            val generation = commandOrder.reserve()
-            enqueueStop(context, generation)
-        }
-
-        fun restart(context: Context) {
-            val generation = commandOrder.reserve()
-            enqueueRestart(context, generation)
-        }
-
-        private fun enqueueStop(context: Context, generation: Long) {
-            context.startService(lifecycleIntent(context, ACTION_STOP, generation))
-        }
-
-        private fun enqueueRestart(context: Context, generation: Long) {
-            context.startForegroundService(lifecycleIntent(context, ACTION_RESTART, generation))
-        }
-
-        private fun lifecycleIntent(context: Context, action: String, generation: Long): Intent =
-            Intent(context, PodroidService::class.java).apply {
-                this.action = action
-                putExtra(EXTRA_COMMAND_GENERATION, generation)
-            }
     }
 }
 

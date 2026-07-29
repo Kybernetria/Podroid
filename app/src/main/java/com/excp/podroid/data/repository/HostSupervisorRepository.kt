@@ -20,11 +20,13 @@ import com.excp.podroid.vm.LifecycleOperation
 import com.excp.podroid.vm.LifecycleOutcome
 import com.excp.podroid.vm.LifecycleTransaction
 import com.excp.podroid.vm.LifecycleTransactionToken
+import com.excp.podroid.vm.StaleLifecycleCommandException
 import com.excp.podroid.vm.VmDesiredState
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeout
 
 // Deliberately has no replacement corruption handler. This store contains
@@ -33,7 +35,8 @@ private val Context.hostSupervisorDataStore: DataStore<Preferences> by preferenc
     name = "host_supervisor_state",
 )
 
-internal fun interface AtomicHostSupervisorRecordStore {
+internal interface AtomicHostSupervisorRecordStore {
+    suspend fun read(): String?
     /** Atomically replaces the one encoded record and returns its committed value. */
     suspend fun update(transform: (String?) -> String): String
 }
@@ -41,6 +44,8 @@ internal fun interface AtomicHostSupervisorRecordStore {
 private class PreferencesHostSupervisorRecordStore(
     private val dataStore: DataStore<Preferences>,
 ) : AtomicHostSupervisorRecordStore {
+    override suspend fun read(): String? = dataStore.data.first()[RECORD_KEY]
+
     override suspend fun update(transform: (String?) -> String): String {
         lateinit var committed: String
         dataStore.edit { preferences ->
@@ -74,8 +79,9 @@ internal object HostSupervisorRecordCodec {
             throw HostSupervisorSchemaException("Unsupported Host supervisor schema version $schema")
         }
         val hasTransaction = parseBoolean(value(lines, 8, "transaction"), "transaction")
-        val expectedLines = if (hasTransaction) 15 else 9
-        if (lines.size != expectedLines) corrupt("field count")
+        if ((!hasTransaction && lines.size != 9) ||
+            (hasTransaction && lines.size !in 15..16)
+        ) corrupt("field count")
 
         val transaction = if (hasTransaction) {
             val outcome = parseEnum<LifecycleOutcome>(value(lines, 11, "tx_outcome"), "tx_outcome")
@@ -95,6 +101,17 @@ internal object HostSupervisorRecordCodec {
                         parseNonNegativeLong(completedRaw, "tx_completed_ms"),
                     errorCode = if (errorRaw == ABSENT_RESULT) null else
                         parseEnum<LifecycleErrorCode>(errorRaw, "tx_error"),
+                    effectStarted = if (lines.size == 16) {
+                        parseBoolean(
+                            value(lines, 15, "tx_effect_started"),
+                            "tx_effect_started",
+                        )
+                    } else {
+                        // Compatibility with ticket #10's initial schema-v1
+                        // layout: terminal records necessarily ran an effect;
+                        // old pending records remain safely unclaimed.
+                        outcome != LifecycleOutcome.PENDING
+                    },
                 )
             }
         } else {
@@ -139,7 +156,8 @@ internal object HostSupervisorRecordCodec {
             appendLine("tx_outcome=${transaction.outcome.name}")
             appendLine("tx_requested_ms=${transaction.requestedAtEpochMs}")
             appendLine("tx_completed_ms=${transaction.completedAtEpochMs ?: ABSENT_RESULT}")
-            append("tx_error=${transaction.errorCode?.name ?: ABSENT_RESULT}")
+            appendLine("tx_error=${transaction.errorCode?.name ?: ABSENT_RESULT}")
+            append("tx_effect_started=${bit(transaction.effectStarted)}")
         }
     }.also {
         check(it.length <= MAX_ENCODED_CHARS) { "Host supervisor record exceeded its fixed bound" }
@@ -198,10 +216,18 @@ class HostSupervisorRepository internal constructor(
 
     override suspend fun snapshot(): HostSupervisorState = mutate { it }
 
-    override suspend fun begin(operation: LifecycleOperation): LifecycleTransactionToken {
+    override suspend fun prepare(
+        operation: LifecycleOperation,
+        expectedId: Long?,
+    ): LifecycleTransactionToken {
         lateinit var token: LifecycleTransactionToken
         mutate { current ->
             val nextId = Math.addExact(current.latestTransaction?.id ?: 0L, 1L)
+            if (expectedId != null && expectedId != nextId) {
+                throw StaleLifecycleCommandException(
+                    "Lifecycle command generation $expectedId is stale; next durable id is $nextId",
+                )
+            }
             val desired = when (operation) {
                 LifecycleOperation.START, LifecycleOperation.RESTART -> VmDesiredState.RUNNING
                 LifecycleOperation.STOP, LifecycleOperation.FORCE_STOP, LifecycleOperation.REMOVE ->
@@ -225,29 +251,59 @@ class HostSupervisorRepository internal constructor(
         return token
     }
 
-    override suspend fun succeed(token: LifecycleTransactionToken, runtimeStarted: Boolean) {
-        finish(token, LifecycleOutcome.SUCCEEDED, null, runtimeStarted)
+    override suspend fun claim(token: LifecycleTransactionToken): Boolean {
+        var claimed = false
+        mutate { current ->
+            val transaction = current.latestTransaction
+            if (transaction.matchesPending(token) && !transaction!!.effectStarted &&
+                token.baseRuntimeGeneration <= current.runtimeGeneration
+            ) {
+                claimed = true
+                current.copy(latestTransaction = transaction.copy(effectStarted = true))
+            } else {
+                current
+            }
+        }
+        return claimed
     }
 
-    override suspend fun fail(token: LifecycleTransactionToken, errorCode: LifecycleErrorCode) {
-        finish(token, LifecycleOutcome.FAILED, errorCode, runtimeStarted = false)
+    override suspend fun isCurrent(token: LifecycleTransactionToken): Boolean {
+        val raw = withTimeout(datastoreTimeoutMs) { store.read() }
+        val current = HostSupervisorRecordCodec.decodeV0AbsentOrV1(raw)
+        return current.latestTransaction.matchesPending(token) &&
+            current.latestTransaction?.effectStarted == true &&
+            token.baseRuntimeGeneration <= current.runtimeGeneration
     }
+
+    override suspend fun succeed(
+        token: LifecycleTransactionToken,
+        runtimeStarted: Boolean,
+    ): Boolean = finish(token, LifecycleOutcome.SUCCEEDED, null, runtimeStarted)
+
+    override suspend fun fail(
+        token: LifecycleTransactionToken,
+        errorCode: LifecycleErrorCode,
+    ): Boolean = finish(token, LifecycleOutcome.FAILED, errorCode, runtimeStarted = false)
 
     private suspend fun finish(
         token: LifecycleTransactionToken,
         outcome: LifecycleOutcome,
         errorCode: LifecycleErrorCode?,
         runtimeStarted: Boolean,
-    ) {
+    ): Boolean {
+        var completed = false
         mutate { current ->
             val transaction = current.latestTransaction
             // A newer command is authoritative. Duplicate or stale completion
-            // cannot overwrite its outcome or regress the runtime generation.
-            if (transaction?.id != token.id || transaction.outcome != LifecycleOutcome.PENDING) {
-                // A superseded launch may still have created a real runtime before
-                // its completion write. Preserve the newer transaction, but do
-                // account for that observed generation monotonically.
-                if (runtimeStarted && outcome == LifecycleOutcome.SUCCEEDED) {
+            // cannot overwrite its outcome or account for a runtime generation.
+            if (!transaction.matchesPending(token) || transaction?.effectStarted != true) {
+                // A command that was accepted while current may finish after a
+                // newer command was prepared. Account for its observed launch
+                // exactly once via the token's durable-generation base, without
+                // changing the newer transaction.
+                if (runtimeStarted && outcome == LifecycleOutcome.SUCCEEDED &&
+                    transaction?.id != token.id
+                ) {
                     current.copy(
                         runtimeGeneration = maxOf(
                             current.runtimeGeneration,
@@ -258,14 +314,14 @@ class HostSupervisorRepository internal constructor(
                     current
                 }
             } else {
-                val generation = if (runtimeStarted) {
-                    maxOf(current.runtimeGeneration, Math.addExact(token.baseRuntimeGeneration, 1L))
-                } else {
-                    current.runtimeGeneration
-                }
+                completed = true
                 current.copy(
-                    runtimeGeneration = generation,
-                    latestTransaction = transaction.copy(
+                    runtimeGeneration = if (runtimeStarted) {
+                        Math.addExact(current.runtimeGeneration, 1L)
+                    } else {
+                        current.runtimeGeneration
+                    },
+                    latestTransaction = transaction!!.copy(
                         outcome = outcome,
                         completedAtEpochMs = maxOf(now(), transaction.requestedAtEpochMs),
                         errorCode = errorCode,
@@ -273,7 +329,13 @@ class HostSupervisorRepository internal constructor(
                 )
             }
         }
+        return completed
     }
+
+    private fun LifecycleTransaction?.matchesPending(token: LifecycleTransactionToken): Boolean =
+        this?.id == token.id &&
+            operation == token.operation &&
+            outcome == LifecycleOutcome.PENDING
 
     private suspend fun mutate(transform: (HostSupervisorState) -> HostSupervisorState): HostSupervisorState {
         val encoded = withTimeout(datastoreTimeoutMs) {
