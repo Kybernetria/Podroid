@@ -26,6 +26,38 @@ distrobox enter android-dev -- bash -lc '
 
 Recorded output was `docker: absent` and `podman version 5.8.4`.
 
+## Host prerequisites for credential and rootfs verification
+
+The ordinary Gradle `preBuild` runs source verification only. It requires Python 3 and OpenSSL; OpenSSL is used by the actual root-hash generator, which the verifier executes twice. It deliberately does not inspect an ignored or stale squashfs and therefore does not require `unsquashfs`:
+
+```bash
+distrobox enter android-dev -- bash -lc '
+  set -euo pipefail
+  cd "$(git rev-parse --show-toplevel)"
+  command -v python3
+  python3 --version
+  command -v openssl
+  openssl version
+  python3 tests/verify_guest_credentials.py
+'
+```
+
+A rootfs build additionally requires Docker or Podman and `unsquashfs` from the `squashfs-tools` package on the host. `build-all.sh rootfs` preflights Python and `unsquashfs`, then explicitly verifies the newly produced artifact. The verifier limits the compressed size, superblock inode count, listing output, summed expanded entry sizes, CPU concurrency, command duration, and each `-cat` result before semantic checks. It uses `unsquashfs -cat` rather than extraction, so artifact symlinks cannot redirect writes or reads onto the host.
+
+```bash
+distrobox enter android-dev -- bash -lc '
+  set -euo pipefail
+  cd "$(git rev-parse --show-toplevel)"
+  command -v podman
+  command -v unsquashfs
+  unsquashfs -version
+  CONTAINER_ENGINE=podman ./build-all.sh rootfs
+  python3 tests/verify_guest_credentials.py app/src/main/assets/alpine-rootfs.squashfs
+'
+```
+
+`openssl` and Alpine signing keys are installed inside the rootfs builder image. The rootfs package installation explicitly uses the copied Alpine keys and does not use apk's `--allow-untrusted` bypass.
+
 ## Pinned and selected inputs
 
 | Input | Baseline value | Source/qualification |
@@ -164,7 +196,7 @@ distrobox enter android-dev -- bash -lc '
 '
 ```
 
-Narrow stages are available for diagnosis:
+Narrow stages are available for diagnosis. The rootfs stage also supports Podman through the explicit container-engine seam:
 
 ```bash
 distrobox enter android-dev -- bash -lc '
@@ -172,7 +204,7 @@ distrobox enter android-dev -- bash -lc '
   cd "$(git rev-parse --show-toplevel)"
   ./build-all.sh kernel
   ./build-all.sh initramfs
-  ./build-all.sh rootfs
+  CONTAINER_ENGINE=podman ./build-all.sh rootfs
   ./build-all.sh qemu
   ./build-all.sh apk
 '

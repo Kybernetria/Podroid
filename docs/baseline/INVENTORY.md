@@ -4,7 +4,7 @@ This is the inventory at commit `8ecfefaa3459b7e84c3d6e52c57e8005e289e8e3`. “R
 
 ## Release-blocking credential
 
-> **RELEASE BLOCKER — known root password:** `build-rootfs/build-rootfs.sh` hashes the fixed plaintext password `podroid` into `/etc/shadow`, and writes it into `/etc/issue`. This inventory records the defect; it does not recommend logging in with it. Release must be blocked until an approved first-boot credential or disabled-password design replaces it and upgrade behavior is defined.
+> **RELEASE BLOCKER — known root password:** At this baseline, `build-rootfs/build-rootfs.sh` hashed the fixed plaintext password `[REDACTED RETIRED CREDENTIAL]` into `/etc/shadow` and wrote it into `/etc/issue`. This inventory retains the release-blocker record without retaining the plaintext. The defect was not recommended usage; release remained blocked until an approved first-boot credential or disabled-password design replaced it and upgrade behavior was defined.
 
 ## Preserved VM baseline
 

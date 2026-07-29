@@ -15,14 +15,16 @@ val podroidQemuVersion = providers.gradleProperty("podroidQemuVersion").get()
 
 val verifyGuestCredentials by tasks.registering(Exec::class) {
     group = "verification"
-    description = "Checks that the guest ships no known credentials and uses public-key-only SSH."
+    description = "Checks guest credential sources without inspecting generated rootfs artifacts."
     workingDir(rootProject.projectDir)
-    commandLine("sh", rootProject.file("tests/verify-guest-credentials.sh"))
+    commandLine("python3", rootProject.file("tests/verify_guest_credentials.py"))
     inputs.files(
         rootProject.fileTree("build-rootfs"),
-        rootProject.fileTree("app/src/main/assets") { include("alpine-rootfs.squashfs") },
+        rootProject.fileTree("app/src/main/assets") { exclude("alpine-rootfs.squashfs") },
+        rootProject.file("tests/verify_guest_credentials.py"),
         rootProject.file("README.md"),
         rootProject.file("CLAUDE.md"),
+        rootProject.fileTree("docs/baseline") { include("*.md") },
         rootProject.fileTree("docs/guide") { include("*.html") },
         rootProject.fileTree("app/src/main/res") { include("values*/strings.xml") }
     )

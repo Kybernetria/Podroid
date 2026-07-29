@@ -57,7 +57,7 @@ The following evidence was recorded for this source anchor:
 
 ## Release blocker: fixed root credential
 
-> **RELEASE BLOCKER:** `build-rootfs/build-rootfs.sh` sets the guest root password to the known value `podroid`, and the guest login banner repeats it. This is a recorded defect, not recommended usage. Do not treat this baseline as release-ready and do not publish a release with that fixed credential. A release needs an approved first-boot credential/lockout design and verification that no known credential remains.
+> **RELEASE BLOCKER:** At this baseline, `build-rootfs/build-rootfs.sh` set the guest root password to `[REDACTED RETIRED CREDENTIAL]`, and the guest login banner repeated it. The plaintext is now redacted while this release-blocker record is retained. This was a recorded defect, not recommended usage. Do not treat this baseline as release-ready; a release required an approved first-boot credential/lockout design and verification that no known credential remained.
 
 ## Documents
 

@@ -15,7 +15,8 @@ EOF
 
 apk -X "https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_BRANCH}/main" \
     -X "https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_BRANCH}/community" \
-    -U --allow-untrusted --root "$ROOTFS" --initdb add \
+    --keys-dir "$ROOTFS/etc/apk/keys" \
+    -U --root "$ROOTFS" --initdb add \
     alpine-base \
     openrc \
     busybox-openrc \
@@ -72,20 +73,9 @@ mkdir -p "$ROOTFS/etc/sudoers.d"
 echo "%wheel ALL=(ALL) ALL" > "$ROOTFS/etc/sudoers.d/wheel"
 chmod 0440 "$ROOTFS/etc/sudoers.d/wheel"
 
-# Keep root usable for public-key SSH without shipping a known password.
-# The high-entropy plaintext exists only in this command-substitution subshell;
-# only its salted SHA-512 hash leaves the subshell and enters the rootfs.
-ROOT_HASH=$(
-    ROOT_PASSWORD=$(openssl rand -hex 48)
-    [ "${#ROOT_PASSWORD}" -eq 96 ]
-    GENERATED_HASH=$(printf '%s\n' "$ROOT_PASSWORD" | openssl passwd -6 -stdin)
-    unset ROOT_PASSWORD
-    printf '%s\n' "$GENERATED_HASH"
-)
-case "$ROOT_HASH" in
-    '$6$'*) ;;
-    *) echo "ERROR: failed to generate a SHA-512 root password hash" >&2; exit 1 ;;
-esac
+# Keep root usable for public-key SSH without shipping a known password. This
+# executes the same narrowly scoped entropy generator exercised by verification.
+ROOT_HASH=$(/work/generate-root-password-hash.sh)
 sed -i "s|^root:[^:]*:|root:${ROOT_HASH}:|" "$ROOTFS/etc/shadow"
 
 # Strip docs/man/locale to shrink squashfs

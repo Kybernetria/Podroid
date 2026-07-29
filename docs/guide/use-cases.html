@@ -102,6 +102,7 @@
 
 <span class="c"># SSH in from a laptop on the same Wi-Fi</span>
 <span class="p">$</span> ssh root@&lt;phone-ip&gt; -p 9922</code></pre>
+      <p>Dropbear is public-key-only. Before connecting, use Podroid's in-app guest console to create <code>/root/.ssh</code> with mode <code>700</code>, append your laptop's public key to <code>/root/.ssh/authorized_keys</code>, and set that file to mode <code>600</code>. The exact commands are in <a href="getting-started.html">Getting started</a>.</p>
       <p>Once SSH is working, VS Code Remote-SSH and JetBrains Gateway both connect without any plugin beyond their standard remote-development extension. The phone acts exactly like any remote Linux server from the laptop's point of view.</p>
       <p>Persistence is handled by the overlayfs stack: all writes go to the ext4 <code>storage.img</code>. Packages you install with <code>apk add</code>, files you create, services you enable with <code>rc-update add</code> - all survive reboots and app updates.</p>
 

@@ -25,6 +25,7 @@ RUN curl -L -o minirootfs.tar.gz \
     "https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_RELEASE%.*}/releases/${ALPINE_ARCH}/alpine-minirootfs-${ALPINE_RELEASE}-${ALPINE_ARCH}.tar.gz" \
  && mkdir rootfs \
  && tar -xzf minirootfs.tar.gz -C rootfs \
+ && cp /etc/apk/keys/*.pub /work/rootfs/etc/apk/keys/ \
  && rm minirootfs.tar.gz
 
 # Pull in the vsock-agent binary built in stage 1.
@@ -38,7 +39,9 @@ ENV SYSTEM_VERSION=${SYSTEM_VERSION}
 ENV ALPINE_VERSION=${ALPINE_RELEASE}
 COPY files /work/files
 COPY build-rootfs.sh /work/build-rootfs.sh
-RUN chmod +x /work/build-rootfs.sh && /work/build-rootfs.sh
+COPY generate-root-password-hash.sh /work/generate-root-password-hash.sh
+RUN chmod +x /work/build-rootfs.sh /work/generate-root-password-hash.sh \
+ && /work/build-rootfs.sh
 
 RUN mksquashfs /work/rootfs /work/alpine-rootfs.squashfs \
     -comp zstd -Xcompression-level 19 -all-root -noappend
