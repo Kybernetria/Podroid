@@ -372,7 +372,8 @@ class AvfEngine @Inject constructor(
                 runCatching { AvfReflect.setConfig(existing, vmConfigObj) }.fold(
                     onSuccess = { existing },
                     onFailure = {
-                        Log.w(TAG, "stale VM config detected (${it.message}); deleting + recreating")
+                        // Framework messages may echo resolved kernel parameters.
+                        Log.w(TAG, "stale VM config detected type=${it.javaClass.simpleName}; deleting + recreating")
                         AvfReflect.delete(mgr, VM_NAME)
                         AvfReflect.create(mgr, VM_NAME, vmConfigObj)
                     },
@@ -394,13 +395,15 @@ class AvfEngine @Inject constructor(
 
             val cb = AvfReflect.newVmCallback(
                 onError = { code, msg ->
-                    Log.e(TAG, "VM onError ${AvfReasonCodes.errorCode(code)} msg=$msg")
-                    lastLifecycleEvent = "onError(${AvfReasonCodes.errorCode(code)}) msg=${msg ?: "no message"}"
+                    val reason = AvfReasonCodes.errorCode(code)
+                    // Framework messages may echo user kernel extras. Preserve
+                    // reason codes and explicit redaction, never the raw text.
+                    val messageSummary = if (msg == null) "none" else "[redacted; charCount=${msg.length}]"
+                    Log.e(TAG, "VM onError $reason msg=$messageSummary")
+                    lastLifecycleEvent = "onError($reason) msg=$messageSummary"
                     // Funnel respects terminal states (won't clobber a user Stop)
                     // and the generation token (ignores a prior VM's late error).
-                    onVmTerminal(generation, VmState.Error(
-                        "AVF onError(${AvfReasonCodes.errorCode(code)}): ${msg ?: "no message"}"
-                    ))
+                    onVmTerminal(generation, VmState.Error("AVF onError($reason): $messageSummary"))
                 },
                 onStopped = { reason ->
                     Log.i(TAG, "VM onStopped ${AvfReasonCodes.stopReason(reason)}")
@@ -563,8 +566,9 @@ class AvfEngine @Inject constructor(
             throw e
         } catch (e: Throwable) {
             val cause = e.cause ?: e
-            Log.e(TAG, "AVF start failed", cause)
-            _state.value = VmState.Error("AVF rejected: ${cause.javaClass.simpleName}: ${cause.message}")
+            // Throwable messages from AVF may include the resolved cmdline.
+            Log.e(TAG, "AVF start failed type=${cause.javaClass.simpleName}; message=[redacted]")
+            _state.value = VmState.Error("AVF rejected: ${cause.javaClass.simpleName}: [message redacted]")
             cleanup()
         }
     }
@@ -1059,7 +1063,9 @@ class AvfEngine @Inject constructor(
             config.kernelExtraCmdline).trim()
         AvfReflect.addParams(cb, resolvedCmdline)
         if (config.verboseLogging) {
-            Log.i(TAG, "verbose: resolved cmdline = $resolvedCmdline")
+            // The resolved value includes user kernel extras and must never be
+            // copied to logcat. Retain only a clearly redacted size signal.
+            Log.i(TAG, "verbose: backend=avf kernelCmdline=[redacted] charCount=${resolvedCmdline.length}")
             Log.i(TAG, "verbose: ramMb=${config.ramMb} cpus=$effectiveCpus (requested ${config.cpus}) " +
                 "storageAccess=${config.storageAccessEnabled}")
         }

@@ -111,14 +111,13 @@ class QemuEngine @Inject constructor(
     val hostSockPath: String get() = vmPaths.hostSocket.absolutePath
 
     /**
-     * Last QEMU process exit code (null until it exits) + a bounded tail of
-     * QEMU's own stderr. Surfaced in the diagnostic export so a crash leaves a
-     * forensic trail. Written from start()/the stderr drain, read from the
-     * diagnostic thread — the deque is guarded by its own monitor.
+     * Last QEMU process exit code (null until it exits) + bounded stderr line
+     * lengths. Raw stderr may echo user-supplied arguments, so it is neither
+     * retained nor exported. The deque is guarded by its own monitor.
      */
     @Volatile
     private var lastExitCode: Int? = null
-    private val stderrTail = ArrayDeque<String>()
+    private val stderrLineLengths = ArrayDeque<Int>()
 
     private val qmpSocketPath: String get() = vmPaths.qmpSocket.absolutePath
 
@@ -352,7 +351,9 @@ class QemuEngine @Inject constructor(
         var processOwner: QemuProcessOwner<Process, Int>? = null
         try {
             val cmd = buildCommand(qemuExe, portForwards, config)
-            Log.d(TAG, "Launching QEMU with ${cmd.size} args: $cmd")
+            // Never emit the command: user QEMU and kernel extras may contain
+            // credentials or other private values. Counts and backend are safe.
+            Log.d(TAG, "Launching backend=qemu argCount=${cmd.size} forwardCount=${portForwards.size}")
 
             val nativeDir = context.applicationInfo.nativeLibraryDir
             val pb = ProcessBuilder(cmd).directory(vmPaths.qemuWorkingDirectory)
@@ -360,8 +361,8 @@ class QemuEngine @Inject constructor(
             // Discard QEMU's stdout. Nothing routes there today (serial/QMP use
             // sockets), but user extra args like `-monitor stdio` could, and an
             // unread OS pipe would fill its buffer and deadlock the VM. Redirect
-            // to /dev/null rather than merging into stderr, which feeds error
-            // formatting (recordStderr below). Redirect.DISCARD would need API 33.
+            // to /dev/null rather than merging into stderr. Redirect.DISCARD
+            // would need API 33.
             pb.redirectOutput(File("/dev/null"))
 
             // Fork QEMU on a private, long-lived thread (see qemuDispatcher).
@@ -410,8 +411,10 @@ class QemuEngine @Inject constructor(
                         val n = proc.errorStream.read(buf)
                         if (n < 0) break
                         val chunk = String(buf, 0, n).trimEnd()
-                        Log.d("PodroidVM-err", chunk.take(300))
-                        recordStderr(chunk)
+                        // QEMU errors can echo user extras. Keep only safe counts
+                        // in logcat and diagnostics, never the raw text.
+                        Log.d("PodroidVM-err", "stderr redacted charCount=${chunk.length}")
+                        recordRedactedStderr(chunk)
                     }
                 } catch (e: Exception) {
                     Log.d(TAG, "Stderr drain ended: ${e.message}")
@@ -832,23 +835,22 @@ class QemuEngine @Inject constructor(
 
     override fun diagnosticsReport(): String = buildString {
         appendLine("last process exit code: ${lastExitCode?.toString() ?: "(still running / not yet exited)"}")
-        val tail = synchronized(stderrTail) { stderrTail.toList() }
-        if (tail.isEmpty()) {
+        val lineLengths = synchronized(stderrLineLengths) { stderrLineLengths.toList() }
+        if (lineLengths.isEmpty()) {
             appendLine("qemu stderr: (none captured)")
         } else {
-            appendLine("qemu stderr (last ${tail.size} line(s)):")
-            tail.forEach { appendLine("  $it") }
+            appendLine("qemu stderr: [redacted; last ${lineLengths.size} line length(s): ${lineLengths.joinToString()}]")
         }
     }
 
-    /** Keep the most recent [STDERR_TAIL_LINES] non-blank stderr lines. */
-    private fun recordStderr(chunk: String) {
+    /** Retain only lengths for the most recent [STDERR_TAIL_LINES] non-blank lines. */
+    private fun recordRedactedStderr(chunk: String) {
         if (chunk.isBlank()) return
-        synchronized(stderrTail) {
+        synchronized(stderrLineLengths) {
             for (line in chunk.lineSequence()) {
                 if (line.isBlank()) continue
-                stderrTail.addLast(line)
-                while (stderrTail.size > STDERR_TAIL_LINES) stderrTail.removeFirst()
+                stderrLineLengths.addLast(line.length)
+                while (stderrLineLengths.size > STDERR_TAIL_LINES) stderrLineLengths.removeFirst()
             }
         }
     }

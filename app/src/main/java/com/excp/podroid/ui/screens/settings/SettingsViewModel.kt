@@ -414,8 +414,10 @@ class SettingsViewModel @Inject constructor(
             appendLine("Downloads sharing:  $storageAccess")
             appendLine("Terminal theme:     $theme")
             appendLine("Terminal font:      $font")
-            appendLine("QEMU extra args:    $qemuExtras")
-            appendLine("Kernel extra cmd:   $kernelExtras")
+            // Advanced values can contain credentials or other private data.
+            // Export only an explicit redaction marker and a safe size signal.
+            appendLine("QEMU extra args:    [redacted; charCount=${qemuExtras.length}]")
+            appendLine("Kernel extra cmd:   [redacted; charCount=${kernelExtras.length}]")
             appendLine()
 
             appendLine("=== VM State ===")

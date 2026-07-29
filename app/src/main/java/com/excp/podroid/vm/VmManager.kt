@@ -18,9 +18,11 @@ import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.ArrayDeque
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,6 +33,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /** The intentionally small public lifecycle state exposed above backend engines. */
@@ -345,6 +348,20 @@ class DefaultVmManager internal constructor(
                 throw IOException("VM start failed: ${error.message}")
             }
             check(isRuntimeActive()) { "VM backend returned before reaching an active state" }
+        } catch (cancelled: CancellationException) {
+            // The service cancels its exact caller Job when Stop invalidates this
+            // generation. The runtime task belongs to the manager scope, so it
+            // must be force-invalidated, cancelled, and joined explicitly or it
+            // could accept a backend after the caller released lifecycleMutex.
+            val cleaned = withContext(NonCancellable) {
+                forceCleanupWithin(forceStopTimeoutMs)
+            }
+            if (!cleaned) {
+                cancelled.addSuppressed(
+                    IllegalStateException("Cancelled VM launch cleanup exceeded the force-stop deadline")
+                )
+            }
+            throw cancelled
         } finally {
             launchPending.value = false
         }

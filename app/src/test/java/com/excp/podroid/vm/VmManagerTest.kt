@@ -354,6 +354,38 @@ class VmManagerTest {
     }
 
     @Test
+    fun `caller cancellation during acceptance invalidates and joins manager runtime task`() = runBlocking {
+        val runtime = FakeRuntime()
+        val startEntered = CompletableDeferred<Unit>()
+        val events = mutableListOf<String>()
+        runtime.onStart = {
+            startEntered.complete(Unit)
+            try {
+                CompletableDeferred<Unit>().await()
+            } finally {
+                events += "runtime-finished"
+            }
+        }
+        runtime.onForceStop = {
+            events += "force"
+            runtime.state.value = VmState.Stopped
+            runtime.quiescent.value = true
+        }
+        val manager = manager(runtime = runtime)
+
+        val start = async(Dispatchers.Default) { manager.start(VmId.DEFAULT) }
+        startEntered.await()
+        start.cancel()
+        start.join()
+        manager.stop(VmId.DEFAULT)
+
+        assertEquals(listOf("force", "runtime-finished"), events)
+        assertEquals(1, runtime.forceStopCalls)
+        assertTrue(manager.quiescent(VmId.DEFAULT).value)
+        assertFalse(manager.busy(VmId.DEFAULT).value)
+    }
+
+    @Test
     fun `error is not safe and destructive operations reject until cleanup completes`() = runBlocking {
         val runtime = FakeRuntime().apply {
             state.value = VmState.Error("stop rejected")
