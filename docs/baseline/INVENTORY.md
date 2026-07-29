@@ -1,6 +1,6 @@
 # Podroid feature and dependency inventory
 
-This is a **historical** inventory at commit `8ecfefaa3459b7e84c3d6e52c57e8005e289e8e3`, not a description of the current release. “Retain” identifies that earlier VM baseline. “Removable candidate” identifies a bounded optional group as reviewed at that commit; it is not evidence that deleting one file is safe and it is not an approved source change. The current minimal guest does not bundle Docker, Podman, LXC, Xvnc, PulseAudio, desktop/font packages, or their listeners/forwards; see `docs/guide/packages.html` for the current contract.
+This is a **historical** inventory at commit `8ecfefaa3459b7e84c3d6e52c57e8005e289e8e3`, not a description of the current release. Its root-level `filesDir/<VM file>` references intentionally record that old layout and are not active operator instructions; current VM files are under `filesDir/instances/default`. “Retain” identifies that earlier VM baseline. “Removable candidate” identifies a bounded optional group as reviewed at that commit; it is not evidence that deleting one file is safe and it is not an approved source change. The current minimal guest does not bundle Docker, Podman, LXC, Xvnc, PulseAudio, desktop/font packages, or their listeners/forwards; see `docs/guide/packages.html` for the current contract.
 
 ## Release-blocking credential
 

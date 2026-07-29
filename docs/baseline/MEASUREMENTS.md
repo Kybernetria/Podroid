@@ -1,6 +1,6 @@
 # Baseline measurements and template
 
-All values in this document apply to source commit `8ecfefaa3459b7e84c3d6e52c57e8005e289e8e3` unless a result row says otherwise.
+All values and commands in this document apply to source commit `8ecfefaa3459b7e84c3d6e52c57e8005e289e8e3` unless a result row says otherwise. Root-level `files/<VM file>` commands intentionally reproduce that historical layout and are not current operator instructions; current VM files are under `files/instances/default`.
 
 ## Recorded baseline
 

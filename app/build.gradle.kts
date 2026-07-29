@@ -91,6 +91,32 @@ val testMinimalGuestVerifier by tasks.registering(Exec::class) {
     )
 }
 
+val verifyVmInstancePaths by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Rejects active VM paths outside files/instances/default."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", rootProject.file("tests/verify_vm_instance_paths.py"))
+    inputs.files(
+        rootProject.fileTree("app/src/main") { include("**/*.kt") },
+        rootProject.fileTree(rootProject.projectDir) {
+            include("**/*.kts", "**/*.sh", "**/*.bash", "**/*.md", "**/*.html")
+            exclude("docs/baseline/**", ".git/**", ".gradle/**", "**/build/**")
+        },
+        rootProject.file("tests/verify_vm_instance_paths.py")
+    )
+}
+
+val testVmInstancePathVerifier by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Runs VM instance path verifier regression tests."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", "-m", "unittest", "-v", "tests/test_verify_vm_instance_paths.py")
+    inputs.files(
+        rootProject.file("tests/test_verify_vm_instance_paths.py"),
+        rootProject.file("tests/verify_vm_instance_paths.py")
+    )
+}
+
 val requireGuestRootfsForRelease by tasks.registering(Exec::class) {
     group = "verification"
     description = "Requires a verified guest rootfs for release packaging."
@@ -167,7 +193,8 @@ tasks.named("preBuild") {
         verifyGuestCredentialSources,
         verifyGuestCredentialArtifact,
         verifyMinimalGuestSources,
-        verifyMinimalGuestArtifact
+        verifyMinimalGuestArtifact,
+        verifyVmInstancePaths
     )
 }
 
@@ -190,12 +217,19 @@ tasks.named("check") {
         testGuestCredentialVerifier,
         verifyMinimalGuestSources,
         verifyMinimalGuestArtifact,
-        testMinimalGuestVerifier
+        testMinimalGuestVerifier,
+        verifyVmInstancePaths,
+        testVmInstancePathVerifier
     )
 }
 
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
-    dependsOn(testGuestCredentialVerifier, testMinimalGuestVerifier)
+    dependsOn(
+        testGuestCredentialVerifier,
+        testMinimalGuestVerifier,
+        verifyVmInstancePaths,
+        testVmInstancePathVerifier
+    )
 }
 
 android {

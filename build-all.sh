@@ -203,8 +203,8 @@ run_boot_test() {
     # Reset State
     log "Resetting VM storage for clean test..."
     adb shell am force-stop "$pkg" 2>/dev/null || true
-    adb shell run-as "$pkg" rm -f files/storage.img 2>/dev/null || true
-    adb shell run-as "$pkg" rm -f files/console.log 2>/dev/null || true
+    adb shell run-as "$pkg" rm -f files/instances/default/storage.img 2>/dev/null || true
+    adb shell run-as "$pkg" rm -f files/instances/default/console.log 2>/dev/null || true
     
     # Launch
     log "Launching App..."
@@ -217,7 +217,7 @@ run_boot_test() {
     local boot_ok=false
     for i in $(seq 1 "$timeout"); do
         local console
-        console=$(adb shell run-as "$pkg" cat files/console.log 2>/dev/null || echo "")
+        console=$(adb shell run-as "$pkg" cat files/instances/default/console.log 2>/dev/null || echo "")
         if echo "$console" | grep -q "Ready!"; then
             boot_ok=true
             break
@@ -234,7 +234,7 @@ run_boot_test() {
     # Validation
     log "Validating boot output..."
     local console
-    console=$(adb shell run-as "$pkg" cat files/console.log 2>/dev/null || echo "")
+    console=$(adb shell run-as "$pkg" cat files/instances/default/console.log 2>/dev/null || echo "")
     
     local errors=0
     local checks=("Podroid - Alpine Linux" "IP:" "Ready!" "Loading kernel modules")

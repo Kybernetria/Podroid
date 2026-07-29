@@ -44,7 +44,7 @@ The kernel, initramfs, and QEMU stages remain Docker-only. `CONTAINER_ENGINE` ap
 To validate a full rebuild end-to-end:
 
 ```sh
-./build-all.sh test         # deploys APK, polls console.log for "Ready!"
+./build-all.sh test         # deploys APK, polls files/instances/default/console.log for "Ready!"
 ```
 
 ## Reporting bugs
@@ -56,7 +56,7 @@ Please open an issue using the **Bug Report** template. The most useful single t
 It bundles app version, device model + Android version, settings, and full logcat in one file. If the bug is VM-side, also include the VM console:
 
 ```sh
-adb shell run-as com.excp.podroid.debug cat files/console.log
+adb shell run-as com.excp.podroid.debug cat files/instances/default/console.log
 ```
 
 ## Submitting changes

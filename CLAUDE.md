@@ -43,7 +43,7 @@ All native/VM components are coordinated by `build-all.sh` (Docker-cached):
 ./build-all.sh apk         # Android APK via Gradle
 ./build-all.sh all         # everything
 ./build-all.sh deploy      # all + install + launch
-./build-all.sh test        # boot validation: installs, polls console.log for "Ready!"
+./build-all.sh test        # boot validation: installs, polls files/instances/default/console.log for "Ready!"
 ```
 
 **APK only:** `./gradlew assembleDebug` / `./gradlew installDebug`.
@@ -53,7 +53,7 @@ All native/VM components are coordinated by `build-all.sh` (Docker-cached):
 **Monitor VM boot:**
 ```bash
 adb logcat -s PodroidQemu
-adb shell run-as com.excp.podroid.debug cat files/console.log   # debug build
+adb shell run-as com.excp.podroid.debug cat files/instances/default/console.log   # debug build
 ```
 
 **Release builds** are signed via `signingConfigs.release` (keystore `podroid-release.jks`), fed by the `PODROID_RELEASE_STORE_FILE` / `_PASSWORD` / `_KEY_ALIAS` / `_KEY_PASSWORD` Gradle properties. Release `applicationId = com.excp.podroid`; debug gets `applicationIdSuffix = ".debug"` + `versionNameSuffix = "-debug"`. Any code comparing the local version against an upstream release tag must strip an optional `-debug` suffix (see `UpdateRepository.checkForUpdate`).
