@@ -6,6 +6,7 @@ package com.excp.podroid.engine
 
 import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
@@ -32,7 +33,10 @@ class QemuBootMonitorTest {
     ): Triple<QemuBootMonitor, MutableStateFlow<VmState>, MutableStateFlow<String>> {
         val state = MutableStateFlow<VmState>(VmState.Starting)
         val stage = MutableStateFlow("")
-        val detector = BootStageDetector(stage, state) { /* onReady no-op */ }
+        val detector = BootStageDetector {
+            stage.value = it
+            if (it == "Ready") state.value = VmState.Running
+        }
         val log = Files.createTempFile("console", ".log").toFile().also { it.deleteOnExit() }
         val monitor = QemuBootMonitor("/unused/serial.sock", log, detector, consoleText, 1000L)
         return Triple(monitor, state, stage)
@@ -91,6 +95,52 @@ class QemuBootMonitorTest {
         assertTrue(ct.value.contains("hello console"))
     }
 
+    @Test fun staleGenerationCannotDeleteOrAppendReplacementRunCapture() {
+        val state = MutableStateFlow<VmState>(VmState.Starting)
+        val log = Files.createTempFile("replacement-console", ".log").toFile().also {
+            it.writeText("NEW_RUN_ONLY")
+            it.deleteOnExit()
+        }
+        val monitor = QemuBootMonitor(
+            "/unused/serial.sock",
+            log,
+            BootStageDetector { if (it == "Ready") state.value = VmState.Running },
+            MutableStateFlow("NEW_RUN_ONLY"),
+            1000L,
+            runIfCurrent = { false },
+        )
+
+        monitor.runLoop(ByteArrayInputStream("STALE_SENTINEL\nReady!\n".toByteArray()))
+
+        assertEquals("NEW_RUN_ONLY", log.readText())
+        assertEquals(VmState.Starting, state.value)
+    }
+
+    @Test fun advancedConfigurationLeavesNoPersistedConsoleWhileDetectionContinues() {
+        val state = MutableStateFlow<VmState>(VmState.Starting)
+        val stage = MutableStateFlow("")
+        val log = Files.createTempFile("sensitive-console", ".log").toFile().also {
+            it.writeText("stale sentinel")
+            it.deleteOnExit()
+        }
+        val monitor = QemuBootMonitor(
+            "/unused/serial.sock",
+            log,
+            BootStageDetector {
+                stage.value = it
+                if (it == "Ready") state.value = VmState.Running
+            },
+            MutableStateFlow(""),
+            1000L,
+            persistConsoleCapture = false,
+        )
+
+        monitor.runLoop(ByteArrayInputStream("SENTINEL_ADVANCED_VALUE\nReady!\n".toByteArray()))
+
+        assertFalse(log.exists())
+        assertEquals(VmState.Running, state.value)
+    }
+
     @Test fun diskLogCapsAtOneMiBWhileBootDetectionContinues() {
         val state = MutableStateFlow<VmState>(VmState.Starting)
         val stage = MutableStateFlow("")
@@ -98,7 +148,10 @@ class QemuBootMonitorTest {
         val monitor = QemuBootMonitor(
             "/unused/serial.sock",
             log,
-            BootStageDetector(stage, state) { },
+            BootStageDetector {
+                stage.value = it
+                if (it == "Ready") state.value = VmState.Running
+            },
             MutableStateFlow(""),
             1000L,
         )

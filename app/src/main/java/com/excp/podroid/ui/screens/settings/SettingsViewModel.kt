@@ -21,10 +21,14 @@ import com.excp.podroid.data.repository.PortForwardRule
 import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.di.ApplicationScope
 import com.excp.podroid.engine.EngineSelection
+import com.excp.podroid.engine.SensitiveConsolePolicy
 import com.excp.podroid.engine.VmEngine
 import com.excp.podroid.engine.VmState
 import com.excp.podroid.util.DeviceResourcePolicy
 import com.excp.podroid.util.NetworkUtils
+import com.excp.podroid.vm.ConsoleLogRequest
+import com.excp.podroid.vm.VmId
+import com.excp.podroid.vm.VmManager
 import com.excp.podroid.vm.VmPaths
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -74,6 +78,7 @@ class SettingsViewModel @Inject constructor(
     private val settingsRepository: SettingsRepository,
     private val portForwardRepository: PortForwardRepository,
     private val engine: VmEngine,
+    private val vmManager: VmManager,
     private val vmPaths: VmPaths,
     private val languageManager: LanguageManager,
     @ApplicationScope private val externalScope: CoroutineScope,
@@ -384,7 +389,7 @@ class SettingsViewModel @Inject constructor(
         val kernelExtras = runCatching { settingsRepository.getKernelExtraCmdlineSnapshot() }.getOrDefault("")
         val rules = runCatching { portForwardRepository.getRulesSnapshot() }.getOrDefault(emptyList())
 
-        buildString {
+        val report = buildString {
             appendLine("=== Podroid Diagnostic Log ===")
             appendLine("Generated: $timestamp")
             appendLine()
@@ -463,18 +468,25 @@ class SettingsViewModel @Inject constructor(
             appendLine()
 
             appendLine("=== VM Console Log (backend=${activeBackendId()}) ===")
-            val consoleFile = vmPaths.consoleLog
-            if (consoleFile.exists() && consoleFile.length() > 0) {
-                val text = consoleFile.readText()
-                append(text)
-                if (!text.endsWith("\n")) appendLine()
+            val consoleText = if (SensitiveConsolePolicy.persistedCaptureAllowed(qemuExtras, kernelExtras)) {
+                runCatching {
+                    vmManager.readConsoleLog(
+                        VmId.DEFAULT,
+                        ConsoleLogRequest(
+                            maxBytes = ConsoleLogRequest.MAX_BYTES,
+                            maxLines = ConsoleLogRequest.MAX_LINES,
+                        ),
+                    ).text
+                }.getOrNull()
             } else {
-                appendLine("(no console.log — VM has not been started this session)")
+                null
             }
+            append(SensitiveConsolePolicy.consoleForExport(consoleText, qemuExtras, kernelExtras))
             appendLine()
 
             appendLine("=== End of Log ===")
         }
+        SensitiveConsolePolicy.redactConfiguredValues(report, qemuExtras, kernelExtras)
     }
 
     /**

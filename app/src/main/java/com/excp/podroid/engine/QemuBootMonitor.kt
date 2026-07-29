@@ -36,6 +36,8 @@ class QemuBootMonitor(
     private val detector: BootStageDetector,
     private val consoleText: MutableStateFlow<String>,
     private val socketReadyTimeoutMs: Long,
+    private val persistConsoleCapture: Boolean = true,
+    private val runIfCurrent: ((() -> Unit) -> Boolean) = { mutation -> mutation(); true },
 ) {
     private val maxConsoleSize = 64 * 1024
     private val consoleBuilder = StringBuilder()
@@ -53,6 +55,9 @@ class QemuBootMonitor(
                 Log.w(TAG, "serial.sock not found after ${waited}ms - boot detection disabled")
                 return@launch
             }
+            // A released monitor can observe the replacement run's socket at
+            // the same path. Never connect unless this monitor still owns it.
+            if (!runIfCurrent { }) return@launch
             val sock = LocalSocket()
             try {
                 sock.connect(LocalSocketAddress(serialSockPath, LocalSocketAddress.Namespace.FILESYSTEM))
@@ -84,35 +89,46 @@ class QemuBootMonitor(
             .onUnmappableCharacter(CodingErrorAction.REPLACE)
         val byteBuf = ByteBuffer.allocate(8192)
         val charBuf = CharBuffer.allocate(8192)
-        consoleLog.delete()
-        BoundedRunLog(FileOutputStream(consoleLog, false)).use { logOut ->
+        var logOut: BoundedRunLog? = null
+        val initialized = runIfCurrent {
+            consoleLog.delete()
+            if (persistConsoleCapture) {
+                logOut = BoundedRunLog(FileOutputStream(consoleLog, false))
+            }
+        }
+        if (!initialized) return
+        try {
             val readBuf = ByteArray(4096)
             while (true) {
                 val n = try { input.read(readBuf) } catch (_: Exception) { break }
                 if (n < 0) break
 
-                // Raw diagnostic bytes are capped per run; detector and the
-                // in-memory tail continue consuming after the disk cap.
-                logOut.write(readBuf, 0, n)
-                logOut.flush()
+                runIfCurrent {
+                    // Raw diagnostic bytes are capped per run; detector and the
+                    // in-memory tail continue consuming after the disk cap.
+                    logOut?.write(readBuf, 0, n)
+                    logOut?.flush()
 
-                // Streaming UTF-8 decode; carry leftover undecoded bytes via compact().
-                byteBuf.put(readBuf, 0, n)
-                byteBuf.flip()
-                decoder.decode(byteBuf, charBuf, false)
-                byteBuf.compact()
-                charBuf.flip()
-                if (charBuf.hasRemaining()) {
-                    consoleBuilder.append(charBuf)
-                    if (consoleBuilder.length > maxConsoleSize) {
-                        consoleBuilder.delete(0, consoleBuilder.length - maxConsoleSize)
+                    // Streaming UTF-8 decode; carry leftover undecoded bytes via compact().
+                    byteBuf.put(readBuf, 0, n)
+                    byteBuf.flip()
+                    decoder.decode(byteBuf, charBuf, false)
+                    byteBuf.compact()
+                    charBuf.flip()
+                    if (charBuf.hasRemaining()) {
+                        consoleBuilder.append(charBuf)
+                        if (consoleBuilder.length > maxConsoleSize) {
+                            consoleBuilder.delete(0, consoleBuilder.length - maxConsoleSize)
+                        }
+                        consoleText.value = consoleBuilder.toString()
                     }
-                    consoleText.value = consoleBuilder.toString()
-                }
-                charBuf.clear()
+                    charBuf.clear()
 
-                detector.feed(readBuf, n)
+                    detector.feed(readBuf, n)
+                }
             }
+        } finally {
+            logOut?.close()
         }
     }
 

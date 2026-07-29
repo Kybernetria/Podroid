@@ -22,7 +22,10 @@ class BootStageDetectorTest {
     private fun newDetector(): Triple<BootStageDetector, MutableStateFlow<String>, MutableStateFlow<VmState>> {
         val stage = MutableStateFlow("")
         val state = MutableStateFlow<VmState>(VmState.Idle)
-        val detector = BootStageDetector(stage, state) { /* onReady */ }
+        val detector = BootStageDetector {
+            stage.value = it
+            if (it == "Ready") state.value = VmState.Running
+        }
         return Triple(detector, stage, state)
     }
 

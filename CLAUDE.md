@@ -89,11 +89,11 @@ QEMU exposes these Unix sockets under `filesDir/instances/default`, each with on
 
 - **`terminal.sock`** ↔ virtio-console `/dev/hvc0` - primary terminal I/O. A dedicated getty runs on hvc0 and auto-logs in as guest root; `libpodroid-bridge.so` relays it to a Termux PTY. This is an app-owned guest-console transport, not remote authentication and not an Android shell. Remote Dropbear access remains public-key-only.
 - **`ctrl.sock`** ↔ virtio-console `/dev/hvc1` - resize channel. The bridge debounces SIGWINCH bursts and writes one `RESIZE rows cols\n`; a guest resize daemon `stty`s hvc0.
-- **`serial.sock`** ↔ PL011 `/dev/ttyAMA0` - boot-log sink only. The boot monitor streams kernel + init output into `console.log` and the boot-stage detector.
+- **`serial.sock`** ↔ PL011 `/dev/ttyAMA0` - boot-log sink only. The boot monitor streams kernel + init output into the boot-stage detector and bounded in-memory UI; `console.log` persistence is disabled and removed for runs with nonblank advanced QEMU or kernel settings.
 - **`qmp.sock`** - QEMU Machine Protocol for runtime port forwarding and USB hot-plug.
 - **`host.sock`** ↔ virtio-console `/dev/hvc2` - the guest→Android host bridge (see below).
 
-On **AVF** there is no QMP and no PL011: the console is captured via `ConsoleFanout.kt`, control/resize go over `VsockControlChannel.kt`, port forwards over `VsockPortForwarder.kt`, and the host bridge over vsock port 9101.
+On **AVF** there is no QMP and no PL011: the console is captured via `ConsoleFanout.kt`, control/resize go over `VsockControlChannel.kt`, port forwards over `VsockPortForwarder.kt`, and the host bridge over vsock port 9101. As on QEMU, persisted console capture is omitted when either advanced launch field is nonblank; boot detection and bounded in-memory output continue.
 
 ### Boot pipeline
 

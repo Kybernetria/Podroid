@@ -19,6 +19,7 @@ internal class ServiceLaunchCoordinator<T : Any> {
         val launchOwner: T?,
         val shouldExecute: Boolean,
     )
+    data class StopCompletion<T : Any>(val launch: Launch<T>?)
 
     private enum class Mode { IDLE, LAUNCHING, STOPPING }
 
@@ -26,6 +27,7 @@ internal class ServiceLaunchCoordinator<T : Any> {
     private var mode = Mode.IDLE
     private var launch: Launch<T>? = null
     private var stopGeneration: Long? = null
+    private var startQueuedDuringStop = false
     private val _ownershipActive = MutableStateFlow(false)
 
     /** True while a launch or its authoritative stop is service-owned. */
@@ -43,19 +45,35 @@ internal class ServiceLaunchCoordinator<T : Any> {
 
     /** Invalidates any launch generation and returns its exact owner once. */
     @Synchronized
-    fun beginStop(): Stop<T> {
+    fun beginStop(): Stop<T> = beginStopLocked(queueStart = false)
+
+    /** Atomically makes Stop authoritative while retaining one restart intent. */
+    @Synchronized
+    fun beginRestart(): Stop<T> = beginStopLocked(queueStart = true)
+
+    private fun beginStopLocked(queueStart: Boolean): Stop<T> {
         if (mode == Mode.STOPPING) {
+            if (queueStart) startQueuedDuringStop = true
             return Stop(checkNotNull(stopGeneration), null, shouldExecute = false)
         }
         val invalidatedOwner = launch?.owner
         launch = null
         val generation = ++nextGeneration
         stopGeneration = generation
+        startQueuedDuringStop = queueStart
         mode = Mode.STOPPING
         // Keep ownership asserted until manager.stop and the bounded launch join
         // finish, so a replayed terminal state cannot tear down their scope.
         _ownershipActive.value = true
         return Stop(generation, invalidatedOwner, shouldExecute = true)
+    }
+
+    /** Retains one idempotent ACTION_START intent only while Stop owns the generation. */
+    @Synchronized
+    fun queueStartDuringStop(): Boolean {
+        if (mode != Mode.STOPPING) return false
+        startQueuedDuringStop = true
+        return true
     }
 
     /** A stale completion cannot clear a stop or a newer launch generation. */
@@ -69,12 +87,27 @@ internal class ServiceLaunchCoordinator<T : Any> {
         return true
     }
 
+    /**
+     * Completes the exact stop and atomically hands a retained start intent to a
+     * fresh launch generation. [restartOwner] is ignored when no start is queued.
+     * A stale stop completion cannot consume the queued intent.
+     */
     @Synchronized
-    fun completeStop(generation: Long): Boolean {
-        if (mode != Mode.STOPPING || stopGeneration != generation) return false
+    fun completeStop(generation: Long, restartOwner: T): StopCompletion<T>? {
+        if (mode != Mode.STOPPING || stopGeneration != generation) return null
         stopGeneration = null
-        mode = Mode.IDLE
-        _ownershipActive.value = false
-        return true
+        return if (startQueuedDuringStop) {
+            startQueuedDuringStop = false
+            val fresh = Launch(++nextGeneration, restartOwner)
+            launch = fresh
+            mode = Mode.LAUNCHING
+            // Deliberately no false ownership edge between Stop and restart.
+            _ownershipActive.value = true
+            StopCompletion(fresh)
+        } else {
+            mode = Mode.IDLE
+            _ownershipActive.value = false
+            StopCompletion(null)
+        }
     }
 }

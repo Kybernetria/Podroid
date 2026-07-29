@@ -36,7 +36,7 @@ class ServiceLaunchCoordinatorTest {
         assertFalse(duplicateStop.shouldExecute)
         assertNull(duplicateStop.launchOwner)
         assertFalse(coordinator.completeLaunch(launch.generation))
-        assertTrue(coordinator.completeStop(stop.generation))
+        assertNull(coordinator.completeStop(stop.generation, Any())?.launch)
         assertFalse(coordinator.ownershipActive.value)
     }
 
@@ -45,7 +45,7 @@ class ServiceLaunchCoordinatorTest {
         val coordinator = ServiceLaunchCoordinator<Any>()
         val oldLaunch = requireNotNull(coordinator.beginLaunch(Any()))
         val stop = coordinator.beginStop()
-        assertTrue(coordinator.completeStop(stop.generation))
+        assertNull(coordinator.completeStop(stop.generation, Any())?.launch)
         val newLaunch = requireNotNull(coordinator.beginLaunch(Any()))
 
         assertFalse(coordinator.completeLaunch(oldLaunch.generation))
@@ -60,11 +60,48 @@ class ServiceLaunchCoordinatorTest {
         val first = requireNotNull(coordinator.beginLaunch("first"))
         val stop = coordinator.beginStop()
 
-        assertTrue(coordinator.completeStop(stop.generation))
+        assertNull(coordinator.completeStop(stop.generation, "unused")?.launch)
         val second = requireNotNull(coordinator.beginLaunch("second"))
 
         assertEquals("second", second.owner)
         assertTrue(second.generation > stop.generation)
         assertTrue(stop.generation > first.generation)
+    }
+
+    @Test
+    fun `start after stop before completion launches once with a fresh generation`() {
+        val coordinator = ServiceLaunchCoordinator<String>()
+        val first = requireNotNull(coordinator.beginLaunch("first"))
+        val stop = coordinator.beginStop()
+
+        assertTrue(coordinator.queueStartDuringStop())
+        assertTrue(coordinator.queueStartDuringStop())
+        val completion = requireNotNull(coordinator.completeStop(stop.generation, "queued"))
+        val queued = requireNotNull(completion.launch)
+
+        assertEquals("queued", queued.owner)
+        assertTrue(queued.generation > stop.generation)
+        assertTrue(stop.generation > first.generation)
+        assertTrue(coordinator.ownershipActive.value)
+        assertNull(coordinator.completeStop(stop.generation, "duplicate"))
+        assertTrue(coordinator.completeLaunch(queued.generation))
+        assertFalse(coordinator.ownershipActive.value)
+    }
+
+    @Test
+    fun `restart intent survives stale cancelled-generation completion window`() {
+        val coordinator = ServiceLaunchCoordinator<String>()
+        val cancelled = requireNotNull(coordinator.beginLaunch("cancelled"))
+        val stop = coordinator.beginRestart()
+
+        assertFalse(coordinator.completeLaunch(cancelled.generation))
+        assertNull(coordinator.completeStop(cancelled.generation, "stale"))
+        val restart = requireNotNull(
+            requireNotNull(coordinator.completeStop(stop.generation, "restart")).launch,
+        )
+
+        assertEquals("restart", restart.owner)
+        assertTrue(restart.generation > stop.generation)
+        assertTrue(coordinator.ownershipActive.value)
     }
 }

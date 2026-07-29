@@ -22,7 +22,9 @@ import androidx.annotation.RequiresApi
 import com.excp.podroid.data.repository.PortForwardRule
 import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.engine.BootStageDetector
+import com.excp.podroid.engine.BootStageGenerationGate
 import com.excp.podroid.engine.BoundedRunLog
+import com.excp.podroid.engine.SensitiveConsolePolicy
 import com.excp.podroid.engine.QmpController
 import com.excp.podroid.engine.VmConfig
 import com.excp.podroid.engine.VmEngine
@@ -166,6 +168,8 @@ class AvfEngine @Inject constructor(
      * same reason; AVF has no single exit thread, so a generation token guards it.
      */
     @Volatile private var vmGeneration: Long = 0
+    @Volatile private var activeBootGeneration: Long? = null
+    private val bootStageGate = BootStageGenerationGate()
     /**
      * Set by stop() before signalling the framework so a subsequent
      * onError/onStopped/onDied is treated as the expected consequence of a
@@ -189,6 +193,7 @@ class AvfEngine @Inject constructor(
     private val consoleBuilder = StringBuilder()
     private val maxConsoleSize = 64 * 1024
     private var logOut: java.io.OutputStream? = null
+    @Volatile private var persistedConsoleCaptureEnabled = false
     @Volatile private var control: VsockControlChannel? = null
     /** Live AVF Downloads share (9p over vsock); started in bringUpControlChannel(), torn down in cleanup(). */
     @Volatile private var downloadsShare: AvfDownloadsShare? = null
@@ -232,11 +237,22 @@ class AvfEngine @Inject constructor(
     // feeds the OLD detector (already ready=true, ignored) instead of flipping
     // the NEW boot to Running on a late "Ready!" — the one state-transition
     // path the generation token didn't otherwise cover.
-    @Volatile private var detector = newDetector()
+    @Volatile private var detector = BootStageDetector { }
 
-    private fun newDetector() = BootStageDetector(_bootStage, _state) {
-        // Detector already flipped _state to Running; stamp the uptime origin.
-        _runningSinceMs = System.currentTimeMillis()
+    private fun newDetector(generation: Long) = BootStageDetector { stage ->
+        val accepted = bootStageGate.apply(
+            generation,
+            isStarting = { _state.value is VmState.Starting },
+            isQuiescent = { _quiescent.value },
+            mutation = {
+                _bootStage.value = stage
+                if (stage == "Ready") {
+                    _runningSinceMs = System.currentTimeMillis()
+                    _state.value = VmState.Running
+                }
+            },
+        )
+        if (!accepted || stage != "Ready") return@BootStageDetector
         Log.i(TAG, "boot Ready! detected — bridge connects via ConsoleFanout")
         // Wipe the boot log from the emulator so the user sees a clean login
         // prompt. AVF only exposes one captured console stream, so unlike
@@ -336,12 +352,19 @@ class AvfEngine @Inject constructor(
         // prior VM is ignored, clear the user-stop flag, and arm cleanup() to run
         // once on this run's first terminal transition.
         val generation = ++vmGeneration
+        activeBootGeneration = generation
+        bootStageGate.arm(generation)
         cleanedUp.set(false)
+        persistedConsoleCaptureEnabled = SensitiveConsolePolicy.persistedCaptureAllowed(
+            config.qemuExtraArgs,
+            config.kernelExtraCmdline,
+        )
+        if (!persistedConsoleCaptureEnabled) vmPaths.consoleLog.delete()
         _quiescent.value = false
         // A stop that landed after adaptive cleanup but before this relaunch must
         // not be erased. Abort before reacquiring AVF resources.
         if (stopRequested) {
-            onVmTerminal(generation, VmState.Stopped)
+            cleanup(terminalState = VmState.Stopped)
             return
         }
         // Reset console capture from any prior run before we start emitting.
@@ -355,7 +378,7 @@ class AvfEngine @Inject constructor(
         // Fresh detector per run so a Stop → Start cycle's second boot can fire
         // onReady again AND a prior run's late console bytes can't drive this
         // boot's state (see the field comment).
-        detector = newDetector()
+        detector = newDetector(generation)
 
         val pathSecurity = VmPathSecurity(vmPaths)
         try {
@@ -455,11 +478,15 @@ class AvfEngine @Inject constructor(
             // reboot on Pixel 8a. Tee inside ConsoleFanout's vm→bridge pump.
             val logFile = vmPaths.consoleLog
             runCatching { logFile.delete() }
-            val log = runCatching {
-                BoundedRunLog(java.io.FileOutputStream(logFile, false))
+            val log = if (persistedConsoleCaptureEnabled) {
+                runCatching {
+                    BoundedRunLog(java.io.FileOutputStream(logFile, false))
+                }
+                    .onFailure { Log.w(TAG, "console.log open failed (continuing without capture)", it) }
+                    .getOrNull()
+            } else {
+                null
             }
-                .onFailure { Log.w(TAG, "console.log open failed (continuing without capture)", it) }
-                .getOrNull()
             logOut = log
 
             // Fan out: VM ↔ filesystem socket. The bridge subprocess connects to
@@ -482,24 +509,24 @@ class AvfEngine @Inject constructor(
                     // diagnostic log. Boot output (incl. boot-time kernel panics like
                     // issue #29) is still captured; a later death's reason still lands
                     // via the onStopped/onDied callbacks.
-                    if (_state.value is VmState.Starting) {
-                        runCatching {
-                            log?.write(buf, 0, n)
-                            log?.flush()
-                        }
-                        // UTF-8 decode best-effort (split multi-byte sequences may
-                        // surface as U+FFFD here — acceptable for the diagnostic
-                        // tail; the raw bytes hit disk faithfully above).
-                        // Guard the StringBuilder: this runs on the fanout pump thread
-                        // while start() may clear it on another (fast Stop → Start).
-                        val snapshot = synchronized(consoleLock) {
-                            consoleBuilder.append(String(buf, 0, n, Charsets.UTF_8))
-                            if (consoleBuilder.length > maxConsoleSize) {
-                                consoleBuilder.delete(0, consoleBuilder.length - maxConsoleSize)
+                    bootStageGate.applyCurrent(generation) {
+                        if (_state.value is VmState.Starting) {
+                            runCatching {
+                                log?.write(buf, 0, n)
+                                log?.flush()
                             }
-                            consoleBuilder.toString()
+                            // UTF-8 decode best-effort (split multi-byte sequences may
+                            // surface as U+FFFD here — acceptable for the diagnostic
+                            // tail; the raw bytes hit disk faithfully above).
+                            val snapshot = synchronized(consoleLock) {
+                                consoleBuilder.append(String(buf, 0, n, Charsets.UTF_8))
+                                if (consoleBuilder.length > maxConsoleSize) {
+                                    consoleBuilder.delete(0, consoleBuilder.length - maxConsoleSize)
+                                }
+                                consoleBuilder.toString()
+                            }
+                            _consoleText.value = snapshot
                         }
-                        _consoleText.value = snapshot
                     }
                 },
             )
@@ -512,7 +539,7 @@ class AvfEngine @Inject constructor(
             // asked to stop — clean up and bail before it boots headless.
             if (stopRequested || cleanedUp.get()) {
                 Log.i(TAG, "AVF launch aborted before run() — stop requested mid-start")
-                cleanup()
+                cleanup(terminalState = VmState.Stopped)
                 return
             }
 
@@ -533,26 +560,20 @@ class AvfEngine @Inject constructor(
             // promoting a VM that already stopped in the delay window.
             bootTimeoutJob = scope.launch {
                 kotlinx.coroutines.delay(BOOT_TIMEOUT_MS)
-                // Re-check the guard AND flip state under the same monitor that
-                // onVmTerminal/cleanup hold (@Synchronized -> this). Otherwise a
-                // terminal callback running cleanup() during the delay window
-                // (which nulls vmHandle and sets cleanedUp) could be overwritten
-                // back to Running here, orphaning the engine with null handles.
-                // bringUpControlChannel() runs outside the lock — it only reads
-                // vmHandle and bails if null.
-                val promoted = synchronized(this@AvfEngine) {
-                    if (generation == vmGeneration && !cleanedUp.get() &&
-                        _state.value is VmState.Starting) {
-                        Log.w(TAG, "AVF boot timeout — forcing Running state")
+                val promoted = bootStageGate.apply(
+                    generation,
+                    isStarting = { _state.value is VmState.Starting },
+                    isQuiescent = { _quiescent.value },
+                    mutation = {
                         _bootStage.value = "Ready"
                         _runningSinceMs = System.currentTimeMillis()
                         _state.value = VmState.Running
-                        true
-                    } else {
-                        false
-                    }
+                    },
+                )
+                if (promoted) {
+                    Log.w(TAG, "AVF boot timeout — forcing Running state")
+                    bringUpControlChannel()
                 }
-                if (promoted) bringUpControlChannel()
             }
         } catch (e: CancellationException) {
             // The start coroutine runs in PodroidService.serviceScope, cancelled
@@ -562,14 +583,17 @@ class AvfEngine @Inject constructor(
             // sticky Error that poisons the next start (QemuEngine guards the same
             // way). Clean up and let the cancellation propagate.
             Log.i(TAG, "AVF start cancelled (teardown) — not an error")
-            cleanup()
+            cleanup(terminalState = VmState.Stopped)
             throw e
         } catch (e: Throwable) {
             val cause = e.cause ?: e
             // Throwable messages from AVF may include the resolved cmdline.
             Log.e(TAG, "AVF start failed type=${cause.javaClass.simpleName}; message=[redacted]")
-            _state.value = VmState.Error("AVF rejected: ${cause.javaClass.simpleName}: [message redacted]")
-            cleanup()
+            cleanup(
+                terminalState = VmState.Error(
+                    "AVF rejected: ${cause.javaClass.simpleName}: [message redacted]",
+                ),
+            )
         }
     }
 
@@ -585,6 +609,7 @@ class AvfEngine @Inject constructor(
      * foreground service stays up (a terminal state would tear it down). The
      * ladder is finite and monotonic (e.g. 8 -> 2 -> 1), so this can't loop.
      */
+    @Synchronized
     private fun maybeRelaunchWithFewerCpus(generation: Long, reason: Int): Boolean {
         if (reason != STOP_REASON_REBOOT) return false
         if (generation != vmGeneration) return false
@@ -593,6 +618,10 @@ class AvfEngine @Inject constructor(
         val config = lastConfig ?: return false
         val forwards = synchronized(lastPortForwards) { lastPortForwards.toList() }
         val mode = if (useExplicitCpuCount) "explicit-count" else "MATCH_HOST+nr_cpus"
+        // Fence this dead VM immediately, before the asynchronous cleanup →
+        // relaunch gap. A second framework callback from [generation] is stale
+        // from this point and cannot publish a terminal/quiescent replacement.
+        ++vmGeneration
         Log.w(TAG, "AVF early-boot reset at $attemptedCpus vCPU(s) ($mode topology, #29); " +
             "capping to $next and relaunching")
         scope.launch {
@@ -683,9 +712,11 @@ class AvfEngine @Inject constructor(
         if (!requested) {
             if (generation == vmGeneration && !cleanedUp.get()) {
                 _stopping.value = false
-                // Keep vmHandle and non-quiescent. A retry can request stop again,
-                // and a later real terminal callback must still run cleanup.
-                _state.value = VmState.Error("AVF stop request rejected; VM may still be running")
+                // Keep vmHandle and non-quiescent. Serialize this Error against a
+                // detector that may already have checked Starting.
+                bootStageGate.applyCurrent(generation) {
+                    _state.value = VmState.Error("AVF stop request rejected; VM may still be running")
+                }
             }
             return
         }
@@ -694,7 +725,9 @@ class AvfEngine @Inject constructor(
             if (generation == vmGeneration && !cleanedUp.get()) {
                 Log.w(TAG, "AVF stop callback timeout — retaining handle for retry")
                 _stopping.value = false
-                _state.value = VmState.Error("AVF stop callback timed out; cleanup is incomplete")
+                bootStageGate.applyCurrent(generation) {
+                    _state.value = VmState.Error("AVF stop callback timed out; cleanup is incomplete")
+                }
             }
         }
     }
@@ -833,19 +866,38 @@ class AvfEngine @Inject constructor(
                 // Error may represent a rejected/timed-out stop while AVF still
                 // owns a live handle. This real callback is authoritative evidence
                 // that teardown happened; retain diagnostics but finish cleanup.
-                cleanup()
+                cleanup(terminalState = _state.value)
             }
             AvfTerminalPolicy.Decision.TRANSITION_AND_CLEANUP -> {
-                _state.value = if (stopRequested) VmState.Stopped else newState
-                cleanup()
+                cleanup(terminalState = if (stopRequested) VmState.Stopped else newState)
             }
         }
     }
 
     @Synchronized
-    private fun cleanup(publishQuiescent: Boolean = true) {
+    private fun cleanup(
+        terminalState: VmState? = null,
+        publishQuiescent: Boolean = true,
+    ) {
+        // Invalidate atomically against detector/timeout mutation before either
+        // console worker is cancelled. Terminal state, when present, is committed
+        // in that same critical section so a checked-but-buffered Ready cannot win.
+        val generation = activeBootGeneration
+        if (generation != null) {
+            if (terminalState != null) {
+                bootStageGate.invalidateAndApply(generation) { _state.value = terminalState }
+            } else {
+                bootStageGate.invalidate(generation)
+            }
+        } else if (terminalState != null) {
+            _state.value = terminalState
+        }
+        activeBootGeneration = null
         if (cleanedUp.getAndSet(true)) {
-            if (publishQuiescent) _quiescent.value = true
+            if (publishQuiescent && _state.value !is VmState.Starting &&
+                _state.value !is VmState.Running) {
+                _quiescent.value = true
+            }
             return
         }
         _stopping.value = false
@@ -895,9 +947,14 @@ class AvfEngine @Inject constructor(
         runCatching { terminalSession?.finishIfRunning() }
         terminalSession = null
         vmHandle = null
-        // Last cleanup write. Internal adaptive relaunches keep this false so no
-        // manager operation can enter between teardown and the replacement run.
-        if (publishQuiescent) _quiescent.value = true
+        // Last cleanup write. Callers establish a terminal state before public
+        // quiescence; internal adaptive relaunches deliberately retain Starting.
+        if (publishQuiescent) {
+            check(_state.value !is VmState.Starting && _state.value !is VmState.Running) {
+                "AVF cleanup cannot publish quiescence from an active lifecycle state"
+            }
+            _quiescent.value = true
+        }
     }
 
     /**
@@ -972,6 +1029,7 @@ class AvfEngine @Inject constructor(
     }
 
     override fun diagnosticsReport(): String = buildString {
+        appendLine("persisted console capture: $persistedConsoleCaptureEnabled")
         appendLine("backend launch config: $launchConfigSummary")
         appendLine("last VM lifecycle callback: $lastLifecycleEvent")
     }

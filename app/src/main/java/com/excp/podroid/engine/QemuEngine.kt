@@ -139,6 +139,7 @@ class QemuEngine @Inject constructor(
     private var qemuDispatcher: ExecutorCoroutineDispatcher? = null
 
     private var bootStartTime: Long = 0L
+    @Volatile private var persistedConsoleCaptureEnabled = false
 
     /** Per-run serial monitor; created in start(), released in cleanup(). */
     private var bootMonitor: QemuBootMonitor? = null
@@ -150,12 +151,22 @@ class QemuEngine @Inject constructor(
      * feed race the new run's scan offsets / one-shot guard. A new instance per
      * run isolates each boot. Mirrors the AVF backend, which already does this.
      */
-    private fun newBootStageDetector() = BootStageDetector(_bootStage, _state) {
-        // BootStageDetector has already flipped _state to Running by the time
-        // this onReady fires; stamp the uptime origin to match.
-        _runningSinceMs = System.currentTimeMillis()
-        persistBootDuration()
-        autoStartBridge()
+    private fun newBootStageDetector(generation: Long) = BootStageDetector { stage ->
+        if (bootStageGate.apply(
+                generation,
+                isStarting = { _state.value is VmState.Starting },
+                isQuiescent = { _quiescent.value },
+                mutation = {
+                    _bootStage.value = stage
+                    if (stage == "Ready") {
+                        _runningSinceMs = System.currentTimeMillis()
+                        persistBootDuration()
+                        _state.value = VmState.Running
+                    }
+                },
+            ) && stage == "Ready") {
+            autoStartBridge()
+        }
     }
 
     /** Set once cleanup() has run for the current VM lifetime; reset by start(). */
@@ -170,6 +181,7 @@ class QemuEngine @Inject constructor(
      */
     private val startMutex = Mutex()
     private val launchGate = QemuLaunchGate()
+    private val bootStageGate = BootStageGenerationGate()
     @Volatile private var activeLaunchGeneration: Long? = null
 
     /**
@@ -292,7 +304,15 @@ class QemuEngine @Inject constructor(
             }
             val claimedGeneration = launchGate.begin()
             activeLaunchGeneration = claimedGeneration
+            bootStageGate.arm(claimedGeneration)
             cleanedUp.set(false)
+            persistedConsoleCaptureEnabled = SensitiveConsolePolicy.persistedCaptureAllowed(
+                config.qemuExtraArgs,
+                config.kernelExtraCmdline,
+            )
+            // Delete any prior capture before this run can expose advanced
+            // values. Boot detection and the bounded in-memory tail stay active.
+            if (!persistedConsoleCaptureEnabled) vmPaths.consoleLog.delete()
             // Publish before disk/process/socket resources can be acquired.
             _quiescent.value = false
             bootStartTime = System.currentTimeMillis()
@@ -336,7 +356,7 @@ class QemuEngine @Inject constructor(
         _bootStage.value = "Starting QEMU..."
         // Fresh per-run detector so a previous run's still-draining monitor can't
         // feed (or race the one-shot guard / scan offsets of) this run's detector.
-        val detector = newBootStageDetector()
+        val detector = newBootStageDetector(generation)
 
         // Clean up stale sockets from a previous run. qmp.sock must be
         // included — a leftover file from a crashed QEMU prevents the new
@@ -426,6 +446,8 @@ class QemuEngine @Inject constructor(
             val monitor = QemuBootMonitor(
                 serialSockPath, vmPaths.consoleLog,
                 detector, _consoleText, SOCKET_READY_TIMEOUT_MS,
+                persistConsoleCapture = persistedConsoleCaptureEnabled,
+                runIfCurrent = { mutation -> bootStageGate.applyCurrent(generation, mutation) },
             )
             bootMonitor = monitor
             monitor.connectAndRun(scope) { proc.isAlive }
@@ -439,8 +461,7 @@ class QemuEngine @Inject constructor(
                     val exitCode = owner.awaitCommittedReap(proc)
                     lastExitCode = exitCode
                     Log.e(TAG, "QEMU died during startup, exit code: $exitCode")
-                    _state.value = VmState.Error("QEMU exited with code $exitCode")
-                    cleanup()
+                    cleanup(VmState.Error("QEMU exited with code $exitCode"))
                     return
                 }
                 if (File(serialSockPath).exists() && File(qmpSocketPath).exists()) {
@@ -468,15 +489,23 @@ class QemuEngine @Inject constructor(
                 // stamping Running at a fixed 60s like the old blind fallback.
                 scope.launch {
                     delay(BOOT_READY_SAFETY_MS)
-                    if (_state.value is VmState.Starting &&
-                        process?.isAlive == true && !cleanedUp.get()) {
-                        Log.w(TAG, "Ready! not detected within ${BOOT_READY_SAFETY_MS / 1000}s - " +
-                            "promoting to Running (boot detection may have missed the marker)")
-                        _bootStage.value = "Ready"
-                        persistBootDuration()
-                        _runningSinceMs = System.currentTimeMillis()
-                        _state.value = VmState.Running
-                        autoStartBridge()
+                    if (process?.isAlive == true) {
+                        val promoted = bootStageGate.apply(
+                            generation,
+                            isStarting = { _state.value is VmState.Starting },
+                            isQuiescent = { _quiescent.value },
+                            mutation = {
+                                _bootStage.value = "Ready"
+                                persistBootDuration()
+                                _runningSinceMs = System.currentTimeMillis()
+                                _state.value = VmState.Running
+                            },
+                        )
+                        if (promoted) {
+                            Log.w(TAG, "Ready! not detected within ${BOOT_READY_SAFETY_MS / 1000}s - " +
+                                "promoting to Running (boot detection may have missed the marker)")
+                            autoStartBridge()
+                        }
                     }
                 }
             }
@@ -487,14 +516,14 @@ class QemuEngine @Inject constructor(
             lastExitCode = exitCode
             Log.d(TAG, "QEMU exited: $exitCode")
             val priorError = _state.value as? VmState.Error
-            cleanup()
             // If the socket-timeout branch already set a specific Error, keep it
             // rather than overwriting with the generic signal-exit message.
-            _state.value = when {
+            val terminalState = when {
                 priorError != null -> priorError
                 exitCode == 0 -> VmState.Stopped
                 else -> VmState.Error(formatExitError(exitCode, config.storageAccessEnabled))
             }
+            cleanup(terminalState)
         } catch (e: CancellationException) {
             // Cancellation can land immediately after child creation or after
             // publication. The owner shields create/commit and then force-reaps
@@ -503,8 +532,7 @@ class QemuEngine @Inject constructor(
             try {
                 withContext(NonCancellable) {
                     processOwner?.forceDestroyAndReapCommitted()
-                    cleanup()
-                    _state.value = VmState.Stopped
+                    cleanup(VmState.Stopped)
                 }
             } catch (cleanupFailure: Throwable) {
                 e.addSuppressed(cleanupFailure)
@@ -517,8 +545,7 @@ class QemuEngine @Inject constructor(
             try {
                 withContext(NonCancellable) {
                     processOwner?.forceDestroyAndReapCommitted()
-                    cleanup()
-                    _state.value = VmState.Error(failure.message ?: "Unknown error")
+                    cleanup(VmState.Error(failure.message ?: "Unknown error"))
                 }
             } catch (cleanupFailure: Throwable) {
                 failure.addSuppressed(cleanupFailure)
@@ -594,14 +621,18 @@ class QemuEngine @Inject constructor(
 
     private fun finishBeforeProcess(generation: Long, terminalState: VmState) {
         check(process == null) { "Pre-process cleanup cannot own a QEMU process" }
-        cleanup()
-        _state.value = terminalState
+        cleanup(terminalState)
         launchGate.complete(generation)
     }
 
     @Synchronized
-    private fun cleanup() {
-        if (cleanedUp.getAndSet(true)) return
+    private fun cleanup(terminalState: VmState) {
+        if (cleanedUp.get()) return
+        // Invalidate under the same gate used by detector/timeout mutations,
+        // before cleanup is published or either worker is cancelled. Buffered
+        // Ready bytes are inert from this point onward.
+        activeLaunchGeneration?.let(bootStageGate::invalidate)
+        cleanedUp.set(true)
         _stopping.value = false
         bootMonitor?.release()
         bootMonitor = null
@@ -621,8 +652,10 @@ class QemuEngine @Inject constructor(
         _bootStage.value = ""
         activeLaunchGeneration?.let(launchGate::complete)
         activeLaunchGeneration = null
-        // Last cleanup write: terminal UI state may have changed earlier, but
-        // destructive manager operations are released only after this point.
+        // Terminal lifecycle is safe before quiescence releases destructive
+        // manager operations. A late detector cannot overwrite it after the
+        // generation invalidation above.
+        _state.value = terminalState
         _quiescent.value = true
     }
 
@@ -834,6 +867,7 @@ class QemuEngine @Inject constructor(
     }
 
     override fun diagnosticsReport(): String = buildString {
+        appendLine("persisted console capture: $persistedConsoleCaptureEnabled")
         appendLine("last process exit code: ${lastExitCode?.toString() ?: "(still running / not yet exited)"}")
         val lineLengths = synchronized(stderrLineLengths) { stderrLineLengths.toList() }
         if (lineLengths.isEmpty()) {

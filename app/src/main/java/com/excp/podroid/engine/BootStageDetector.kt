@@ -4,21 +4,18 @@
  */
 package com.excp.podroid.engine
 
-import kotlinx.coroutines.flow.MutableStateFlow
-
 /**
  * Engine-agnostic boot-progress detector. Both engines feed it raw guest
- * console bytes; it sets [bootStage] flow markers it observes and flips
- * [state] to Running when "Ready!" appears. Each feed scans the newly-appended
- * region plus a short overlap carried from the previous feed, so a marker that
+ * console bytes; detected stages are returned through [onStage]. Engine-owned
+ * generation gates decide whether a stage may mutate lifecycle state. Each feed
+ * scans the newly-appended region plus a short overlap carried from the previous
+ * feed, so a marker that
  * straddles a read boundary — or sits early in a single oversized chunk — is
  * still caught (see the history of detectBootStage in PodroidQemu pre-refactor).
- * One-shot: stops scanning after the first "Ready!" to keep [onReady] idempotent.
+ * One-shot: stops scanning after the first "Ready!" to keep readiness idempotent.
  */
 class BootStageDetector(
-    private val bootStage: MutableStateFlow<String>,
-    private val state: MutableStateFlow<VmState>,
-    private val onReady: () -> Unit,
+    private val onStage: (String) -> Unit,
 ) {
     private val buf = StringBuilder()
     private val maxKeep = 4096
@@ -53,14 +50,14 @@ class BootStageDetector(
         val tail = buf.substring(from)
         scannedLen = buf.length
         when {
-            tail.contains("Ready!")                 -> { ready = true; bootStage.value = "Ready"; state.value = VmState.Running; onReady() }
-            tail.contains("Almost ready")           -> bootStage.value = "Almost ready..."
-            tail.contains("Starting SSH")           -> bootStage.value = "Starting SSH..."
-            tail.contains("Configuring containers") -> bootStage.value = "Configuring containers..."
-            tail.contains("Network found")          -> bootStage.value = "Network found"
-            tail.contains("Loading kernel modules") -> bootStage.value = "Loading kernel modules..."
-            tail.contains("Mounting storage")       -> bootStage.value = "Mounting storage..."
-            tail.contains("Booting kernel")         -> bootStage.value = "Booting kernel..."
+            tail.contains("Ready!")                 -> { ready = true; onStage("Ready") }
+            tail.contains("Almost ready")           -> onStage("Almost ready...")
+            tail.contains("Starting SSH")           -> onStage("Starting SSH...")
+            tail.contains("Configuring containers") -> onStage("Configuring containers...")
+            tail.contains("Network found")          -> onStage("Network found")
+            tail.contains("Loading kernel modules") -> onStage("Loading kernel modules...")
+            tail.contains("Mounting storage")       -> onStage("Mounting storage...")
+            tail.contains("Booting kernel")         -> onStage("Booting kernel...")
         }
     }
 

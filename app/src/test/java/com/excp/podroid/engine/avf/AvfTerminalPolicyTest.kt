@@ -25,4 +25,19 @@ class AvfTerminalPolicyTest {
             AvfTerminalPolicy.decide(6, 7, VmState.Running, cleanupComplete = false),
         )
     }
+
+    @Test fun `adaptive relaunch fence rejects old callback during cleanup gap`() {
+        val deadAttemptGeneration = 7L
+        val relaunchFenceGeneration = deadAttemptGeneration + 1
+
+        assertEquals(
+            AvfTerminalPolicy.Decision.IGNORE,
+            AvfTerminalPolicy.decide(
+                deadAttemptGeneration,
+                relaunchFenceGeneration,
+                VmState.Starting,
+                cleanupComplete = false,
+            ),
+        )
+    }
 }
