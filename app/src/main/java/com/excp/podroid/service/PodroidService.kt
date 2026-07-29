@@ -19,8 +19,10 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Binder
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.Process
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -34,6 +36,7 @@ import com.excp.podroid.engine.usb.UsbPassthroughManager
 import com.excp.podroid.vm.VmId
 import com.excp.podroid.vm.VmLifecycleState
 import com.excp.podroid.vm.VmManager
+import com.excp.podroid.vm.VmPaths
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.combine
@@ -44,6 +47,7 @@ class PodroidService : Service() {
 
     @Inject lateinit var engine: VmEngine
     @Inject lateinit var vmManager: VmManager
+    @Inject lateinit var vmPaths: VmPaths
     @Inject lateinit var portForwardRepository: PortForwardRepository
     @Inject lateinit var settingsRepository: SettingsRepository
     @Inject lateinit var usbPassthroughManager: UsbPassthroughManager
@@ -64,12 +68,76 @@ class PodroidService : Service() {
     private var notificationBuilder: NotificationCompat.Builder? = null
     private var stopPendingIntent: PendingIntent? = null
     private var openPendingIntent: PendingIntent? = null
+    private lateinit var localBinder: LocalBinder
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    internal class LocalBinder internal constructor(
+        val endpoint: VmServiceEndpoint,
+    ) : Binder()
+
+    override fun onBind(intent: Intent?): IBinder = localBinder
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        val endpoint = LocalVmServiceEndpoint(
+            manager = vmManager,
+            lifecycleCommands = object : VmServiceLifecycleCommands {
+                override fun startForeground() {
+                    ContextCompat.startForegroundService(
+                        this@PodroidService,
+                        Intent(this@PodroidService, PodroidService::class.java).apply { action = ACTION_START },
+                    )
+                }
+
+                override fun stop(force: Boolean) {
+                    requestServiceStop(
+                        failureLog = if (force) "VM force stop failed" else "VM graceful stop failed",
+                        force = force,
+                    )
+                }
+
+                override fun restart() {
+                    ContextCompat.startForegroundService(
+                        this@PodroidService,
+                        Intent(this@PodroidService, PodroidService::class.java).apply { action = ACTION_RESTART },
+                    )
+                }
+            },
+            auxiliary = object : VmServiceAuxiliaryCapabilities {
+                override val headlessMode: kotlinx.coroutines.flow.StateFlow<Boolean>
+                    get() = headlessModeManager.active
+
+                override fun backendProbe(): VmBackendProbe {
+                    val report = com.excp.podroid.engine.avf.AvfDiagnostics.probe(this@PodroidService)
+                    return report.toServiceDto(engine.backendId)
+                }
+
+                override suspend fun runBackendSmokeTest(): String {
+                    val report = com.excp.podroid.engine.avf.AvfDiagnostics.runSmokeTest(
+                        this@PodroidService,
+                        vmPaths,
+                    )
+                    return report
+                        .replace(vmPaths.instanceDirectory.absolutePath, "[default VM]")
+                        .replace(filesDir.absolutePath, "[app files]")
+                }
+
+                override fun setHeadlessMode(active: Boolean) = headlessModeManager.setActive(active)
+
+                override fun createTerminalSession(
+                    client: com.termux.terminal.TerminalSessionClient,
+                ): com.termux.terminal.TerminalSession {
+                    engine.sessionClientDelegate = client
+                    return engine.createTerminalSession(client)
+                }
+
+                override fun releaseTerminalClient(client: com.termux.terminal.TerminalSessionClient) {
+                    if (engine.sessionClientDelegate === client) engine.sessionClientDelegate = null
+                }
+            },
+            caller = CallerUidVerifier.sameUid(Process.myUid()) { Binder.getCallingUid() },
+        )
+        localBinder = LocalBinder(endpoint)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -99,7 +167,7 @@ class PodroidService : Service() {
                 startSupervision()
                 requestServiceRestart("VM restart stop failed")
             }
-            ACTION_STOP -> requestServiceStop("VM graceful stop failed")
+            ACTION_STOP -> requestServiceStop("VM graceful stop failed", force = false)
             else -> {
                 // Null/unrecognized action (e.g. a system redelivery): we never
                 // called startForeground for this start, so just stop to avoid a
@@ -145,23 +213,36 @@ class PodroidService : Service() {
         super.onTaskRemoved(rootIntent)
         // App swiped from recents uses the same generation invalidation, launch
         // cancellation/join, and bounded manager stop as the notification action.
-        requestServiceStop("Task-removal graceful stop failed")
+        requestServiceStop("Task-removal graceful stop failed", force = false)
     }
 
-    private fun requestServiceStop(failureLog: String) {
+    private fun requestServiceStop(failureLog: String, force: Boolean) {
         val wasBusy = vmManager.busy(VmId.DEFAULT).value || launchCoordinator.ownershipActive.value
-        dispatchServiceStop(launchCoordinator.beginStop(), failureLog, wasBusy)
+        val stop = launchCoordinator.beginStop()
+        if (force && !stop.shouldExecute) {
+            // A graceful service stop already owns launch joining/teardown. Route
+            // the stronger duplicate to the manager so its force signal can
+            // escalate that exact in-flight stop without starting a second
+            // service teardown sequence.
+            serviceScope.launch(Dispatchers.IO) {
+                runCatching { vmManager.forceStop(VmId.DEFAULT) }
+                    .onFailure { Log.e(TAG, failureLog, it) }
+            }
+            return
+        }
+        dispatchServiceStop(stop, failureLog, wasBusy, force)
     }
 
     private fun requestServiceRestart(failureLog: String) {
         val wasBusy = vmManager.busy(VmId.DEFAULT).value || launchCoordinator.ownershipActive.value
-        dispatchServiceStop(launchCoordinator.beginRestart(), failureLog, wasBusy)
+        dispatchServiceStop(launchCoordinator.beginRestart(), failureLog, wasBusy, force = false)
     }
 
     private fun dispatchServiceStop(
         stop: ServiceLaunchCoordinator.Stop<ServiceLaunchOwner>,
         failureLog: String,
         wasBusy: Boolean,
+        force: Boolean,
     ) {
         if (!stop.shouldExecute) return
 
@@ -169,7 +250,7 @@ class PodroidService : Service() {
         val stopScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         stopScope.launch {
             try {
-                stopAndApplyPolicy(stop, failureLog)
+                stopAndApplyPolicy(stop, failureLog, force)
             } finally {
                 stopScope.cancel()
             }
@@ -182,12 +263,17 @@ class PodroidService : Service() {
     private suspend fun stopAndApplyPolicy(
         stop: ServiceLaunchCoordinator.Stop<ServiceLaunchOwner>,
         failureLog: String,
+        force: Boolean,
     ) {
         val stopResult = coroutineScope {
             // Start manager.stop together with the bounded join. If cancellation
             // landed during manager acceptance, its manager-owned cleanup and
             // this stop operation serialize at the manager lifecycle boundary.
-            val managerStop = async { runCatching { vmManager.stop(VmId.DEFAULT) } }
+            val managerStop = async {
+                runCatching {
+                    if (force) vmManager.forceStop(VmId.DEFAULT) else vmManager.stop(VmId.DEFAULT)
+                }
+            }
             val joined = withTimeoutOrNull(SERVICE_LAUNCH_JOIN_TIMEOUT_MS) {
                 stop.launchOwner?.job?.join()
                 true
@@ -567,3 +653,18 @@ class PodroidService : Service() {
         }
     }
 }
+
+private fun com.excp.podroid.engine.avf.AvfReport.toServiceDto(activeBackendId: String) =
+    VmBackendProbe(
+        featureSupported = featureSupported,
+        managePermissionGranted = managePermissionGranted,
+        customPermissionGranted = customPermissionGranted,
+        virtApexPresent = virtApexPresent,
+        managerClassPresent = managerClassPresent,
+        serviceReachable = serviceReachable,
+        customVmConfigSupported = customVmConfigSupported,
+        capabilitiesRaw = capabilitiesRaw,
+        capabilitiesDecoded = capabilitiesDecoded,
+        activeBackend = activeBackendId,
+        smokeTestResult = smokeTestResult,
+    )

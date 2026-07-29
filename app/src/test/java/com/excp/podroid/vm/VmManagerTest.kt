@@ -640,7 +640,13 @@ class VmManagerTest {
         override val vmId = VmId.DEFAULT
         override val state = MutableStateFlow<VmState>(VmState.Idle)
         override val quiescent = MutableStateFlow(true)
+        override val bootStage = MutableStateFlow("")
+        override val stopping = MutableStateFlow(false)
         override val backendId = "qemu"
+        override val runningSinceMs: Long? = null
+        override fun emulatorRssMb(): Long? = null
+        override fun emulatorPid(): Int? = null
+        override fun diagnosticsReport(): String = ""
         var qmpAvailableValue = false
         override val qmpAvailable: Boolean get() = qmpAvailableValue
         var startCalls = 0
@@ -695,6 +701,8 @@ class VmManagerTest {
         override fun isInstalled(vmId: VmId) = installed
         override fun remove(vmId: VmId, policy: VmRemovePolicy) { removePolicies.add(policy) }
         override fun readConsole(vmId: VmId, request: ConsoleLogRequest) = ConsoleLog("", 0, 0, false)
+        override fun storageAllocatedBytes(vmId: VmId): Long = 0L
+        override fun redactPrivatePaths(text: String): String = text
     }
 
     private class FakeConfiguration(var ssh: Boolean = false) : VmConfigurationSource {

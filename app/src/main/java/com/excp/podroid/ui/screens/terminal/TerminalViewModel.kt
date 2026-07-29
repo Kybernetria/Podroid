@@ -40,8 +40,9 @@ import android.view.MotionEvent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.excp.podroid.data.repository.SettingsRepository
-import com.excp.podroid.engine.VmEngine
-import com.excp.podroid.engine.VmState
+import com.excp.podroid.service.VmBindingState
+import com.excp.podroid.service.VmServiceClient
+import com.excp.podroid.service.VmUiState
 import com.excp.podroid.util.LogProxy
 import com.termux.terminal.TerminalEmulator
 import com.termux.terminal.TerminalSession
@@ -52,6 +53,7 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.StateFlow
@@ -62,13 +64,14 @@ import javax.inject.Inject
 @HiltViewModel
 class TerminalViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val engine: VmEngine,
+    private val vmServiceClient: VmServiceClient,
     private val settingsRepository: SettingsRepository,
-    private val headlessModeManager: com.excp.podroid.engine.hostbridge.HeadlessModeManager,
 ) : ViewModel() {
 
-    val vmState: StateFlow<VmState> = engine.state
-    val bootStage: StateFlow<String> = engine.bootStage
+    val vmState: StateFlow<VmUiState> = vmServiceClient.vmState
+    val bootStage: StateFlow<String> = vmServiceClient.observation
+        .map { it.bootStage }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, "")
     val terminalFontSize: StateFlow<Int> = settingsRepository.terminalFontSize
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 20)
 
@@ -110,11 +113,22 @@ class TerminalViewModel @Inject constructor(
         // Each fresh VM run starts with a clean governor, and a stale "exhausted"
         // from a previous run is cleared so the new run's session attaches.
         viewModelScope.launch {
-            engine.state.collect { st ->
-                if (st !is VmState.Running) {
+            vmState.collect { st ->
+                if (st !is VmUiState.Running) {
                     reconnectAttempts = 0
                     reconnectWindowStartMs = 0L
                     _reconnectExhausted.value = false
+                }
+            }
+        }
+        viewModelScope.launch {
+            var connectedOnce = false
+            vmServiceClient.bindingState.collect { binding ->
+                if (binding == VmBindingState.CONNECTED) {
+                    if (connectedOnce && vmState.value is VmUiState.Running && session == null) {
+                        _reconnectSignal.value += 1
+                    }
+                    connectedOnce = true
                 }
             }
         }
@@ -132,7 +146,12 @@ class TerminalViewModel @Inject constructor(
     fun openQuickSettings() { _showQuickSettings.value = true }
     fun closeQuickSettings() { _showQuickSettings.value = false }
 
-    fun enableServerMode() = headlessModeManager.setActive(true)
+    fun enableServerMode() {
+        viewModelScope.launch {
+            runCatching { vmServiceClient.setHeadlessMode(true) }
+                .onFailure { Log.e(TAG, "Enable server mode failed", it) }
+        }
+    }
 
     fun updateShowExtraKeys(value: Boolean) {
         viewModelScope.launch { settingsRepository.setShowExtraKeys(value) }
@@ -540,7 +559,7 @@ class TerminalViewModel @Inject constructor(
             // dead session and reconnect so the user isn't stranded on a
             // "[Process completed]" buffer. On a real VM shutdown vmState is no
             // longer Running, so we leave teardown to the normal path.
-            if (vmState.value !is VmState.Running) return
+            if (vmState.value !is VmUiState.Running) return
             if (_reconnectExhausted.value) return  // waiting on a manual retry
 
             // Governor: a chardev that accepts the connection then immediately
@@ -741,11 +760,14 @@ class TerminalViewModel @Inject constructor(
     fun createSession() {
         if (attached) return
 
-        val sess = runCatching { engine.createTerminalSession(sessionClient) }
+        val sess = runCatching { vmServiceClient.createTerminalSession(sessionClient) }
             .onFailure { e ->
                 // AvfEngine throws UnsupportedOperationException until Task 11
                 // wires the AVF bridge. Don't crash the UI — leave session null.
-                android.util.Log.w(TAG, "createTerminalSession failed on ${engine.backendId}: ${e.message}")
+                android.util.Log.w(
+                    TAG,
+                    "createTerminalSession failed on ${vmServiceClient.observation.value.backendId}: ${e.message}",
+                )
             }
             .getOrNull() ?: return
         session = sess
@@ -835,11 +857,8 @@ class TerminalViewModel @Inject constructor(
 
     override fun onCleared() {
         super.onCleared()
-        // Drop the proxy's pointer to this dead ViewModel — otherwise the singleton
-        // VmEngine keeps forwarding session events into a tombstoned client.
-        if (engine.sessionClientDelegate === sessionClient) {
-            engine.sessionClientDelegate = null
-        }
+        // Drop the service-owned proxy's pointer to this dead ViewModel.
+        vmServiceClient.releaseTerminalClient(sessionClient)
         attached = false
     }
 

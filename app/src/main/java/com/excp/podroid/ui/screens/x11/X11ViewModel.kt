@@ -7,8 +7,8 @@ package com.excp.podroid.ui.screens.x11
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.excp.podroid.data.repository.SettingsRepository
-import com.excp.podroid.engine.VmEngine
-import com.excp.podroid.engine.VmState
+import com.excp.podroid.service.VmServiceClient
+import com.excp.podroid.service.VmUiState
 import com.excp.podroid.x11.AudioStreamer
 import com.excp.podroid.x11.ResolutionMode
 import com.excp.podroid.x11.ResolutionPolicy
@@ -48,11 +48,11 @@ sealed interface X11ConnectionState {
 @OptIn(ExperimentalCoroutinesApi::class)
 @HiltViewModel
 class X11ViewModel @Inject constructor(
-    val engine: VmEngine,
+    private val vmServiceClient: VmServiceClient,
     private val settings: SettingsRepository,
 ) : ViewModel() {
 
-    val vmState: StateFlow<VmState> = engine.state
+    val vmState: StateFlow<VmUiState> = vmServiceClient.vmState
 
     private val _connection = MutableStateFlow<X11ConnectionState>(X11ConnectionState.Disconnected)
     val connection: StateFlow<X11ConnectionState> = _connection.asStateFlow()

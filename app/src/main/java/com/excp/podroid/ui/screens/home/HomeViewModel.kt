@@ -9,9 +9,8 @@ import com.excp.podroid.data.repository.PortForwardRepository
 import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.data.repository.UpdateInfo
 import com.excp.podroid.data.repository.UpdateRepository
-import com.excp.podroid.engine.VmEngine
-import com.excp.podroid.engine.VmState
-import com.excp.podroid.service.PodroidService
+import com.excp.podroid.service.VmServiceClient
+import com.excp.podroid.service.VmUiState
 import com.excp.podroid.util.NetworkUtils
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -22,14 +21,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 
 /**
@@ -54,21 +51,22 @@ data class HomeMeta(
 @HiltViewModel
 class HomeViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val engine: VmEngine,
+    private val vmServiceClient: VmServiceClient,
     private val settingsRepository: SettingsRepository,
     private val portForwardRepository: PortForwardRepository,
     private val containerStatsRepository: ContainerStatsRepository,
     private val updateRepository: UpdateRepository,
 ) : ViewModel() {
 
-    val vmState: StateFlow<VmState> = engine.state
-        .stateIn(viewModelScope, SharingStarted.Eagerly, VmState.Idle)
+    val vmState: StateFlow<VmUiState> = vmServiceClient.vmState
 
     /** True while a stop is tearing the VM down (Running/Starting -> Stopped). */
-    val stopping: StateFlow<Boolean> = engine.stopping
+    val stopping: StateFlow<Boolean> = vmServiceClient.observation
+        .map { it.stopping }
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
-    val bootStage: StateFlow<String> = engine.bootStage
+    val bootStage: StateFlow<String> = vmServiceClient.observation
+        .map { it.bootStage }
         .stateIn(viewModelScope, SharingStarted.Eagerly, "")
 
     private val _containerCount = MutableStateFlow<Int?>(null)
@@ -100,8 +98,8 @@ class HomeViewModel @Inject constructor(
     // Ticker — drives uptime display refresh every second, but only while the VM
     // is Running. Gated via flatMapLatest on vmState so no ticks (and no HomeScreen
     // recompositions) happen while the VM is Idle/Starting/Stopped.
-    val uptimeTicker: StateFlow<Long> = engine.state
-        .map { it is VmState.Running }
+    val uptimeTicker: StateFlow<Long> = vmState
+        .map { it is VmUiState.Running }
         .distinctUntilChanged()
         .flatMapLatest { isRunning ->
             if (isRunning) flow {
@@ -127,28 +125,27 @@ class HomeViewModel @Inject constructor(
      * The AVF probe is fast (no IPC, no binder), so we derive it via a
      * simple map on the dismissed flow rather than a heavy combine.
      */
-    private val _avfProbe = com.excp.podroid.engine.avf.AvfDiagnostics.probe(context)
-    val showAvfHint: StateFlow<Boolean> = settingsRepository.avfHintDismissed
-        .map { dismissed ->
-            _avfProbe.featureSupported &&
-                !_avfProbe.managePermissionGranted &&
-                !dismissed
-        }
+    private val _avfHintAvailable = MutableStateFlow(false)
+    val showAvfHint: StateFlow<Boolean> = combine(
+        settingsRepository.avfHintDismissed,
+        _avfHintAvailable,
+    ) { dismissed, available -> available && !dismissed }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
     /** True when AVF was the active backend and the VM ended in Error
      *  (boot failure / crash). Drives the actionable failure surface. */
-    val avfBootFailure: StateFlow<Boolean> = vmState
-        .map { it is VmState.Error && engine.backendId == "avf" }
+    val avfBootFailure: StateFlow<Boolean> = combine(vmState, vmServiceClient.observation) { state, observation ->
+        state is VmUiState.Error && observation.backendId == "avf"
+    }
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     /** Advice for the failure surface, based on the current vCPU setting. */
-    val avfFailureAdvice: StateFlow<com.excp.podroid.engine.avf.AvfFailureGuidance.Advice> =
+    val avfFailureAdvice: StateFlow<com.excp.podroid.vm.VmFailureAdvice> =
         settingsRepository.vmCpus
-            .map { com.excp.podroid.engine.avf.AvfFailureGuidance.advise(it) }
+            .map { com.excp.podroid.vm.vmFailureAdvice(it) }
             .stateIn(
                 viewModelScope, SharingStarted.Eagerly,
-                com.excp.podroid.engine.avf.AvfFailureGuidance.Advice.SWITCH_TO_QEMU,
+                com.excp.podroid.vm.VmFailureAdvice.SWITCH_TO_QEMU,
             )
 
     fun useOneCoreAndRetry() {
@@ -160,7 +157,7 @@ class HomeViewModel @Inject constructor(
 
     fun switchToQemuAndRetry() {
         viewModelScope.launch {
-            settingsRepository.setEngineSelection(com.excp.podroid.engine.EngineSelection.QEMU)
+            settingsRepository.setEngineSelection(com.excp.podroid.vm.EngineSelection.QEMU)
             restartVm()
         }
     }
@@ -173,36 +170,43 @@ class HomeViewModel @Inject constructor(
     // rotation / Activity recreation doesn't reset the displayed uptime to "Up 0s"
     // while the VM has actually been running for minutes.
     private val runningSinceMs: Long?
-        get() = engine.runningSinceMs ?: fallbackRunningSinceMs
+        get() = vmServiceClient.observation.value.runningSinceMs ?: fallbackRunningSinceMs
 
     init {
         checkForUpdate()
+        viewModelScope.launch {
+            runCatching { vmServiceClient.backendProbe() }.getOrNull()?.let { probe ->
+                _avfHintAvailable.value = probe.featureSupported && !probe.managePermissionGranted
+            }
+        }
         viewModelScope.launch {
             val cached = settingsRepository.getLastContainerCount()
             if (cached != null) _containerCount.value = cached
         }
         viewModelScope.launch {
             var lastRunning = false
-            engine.state.collect { state ->
-                val running = state is VmState.Running
+            vmState.collect { state ->
+                val running = state is VmUiState.Running
                 if (running && !lastRunning) refreshContainerCount()
                 lastRunning = running
             }
         }
         viewModelScope.launch {
             while (true) {
-                if (engine.state.value is VmState.Running) refreshContainerCount()
+                if (vmState.value is VmUiState.Running) refreshContainerCount()
                 delay(5_000)
             }
         }
         // Maintain fallbackRunningSinceMs for engines that don't override runningSinceMs.
         viewModelScope.launch {
             var lastWasRunning = false
-            engine.state.collect { state ->
-                val nowRunning = state is VmState.Running
+            vmState.collect { state ->
+                val nowRunning = state is VmUiState.Running
                 if (nowRunning && !lastWasRunning) {
                     // Only stamp the fallback when the engine doesn't provide the real time.
-                    if (engine.runningSinceMs == null) fallbackRunningSinceMs = System.currentTimeMillis()
+                    if (vmServiceClient.observation.value.runningSinceMs == null) {
+                        fallbackRunningSinceMs = System.currentTimeMillis()
+                    }
                 }
                 if (!nowRunning) fallbackRunningSinceMs = null
                 lastWasRunning = nowRunning
@@ -255,24 +259,16 @@ class HomeViewModel @Inject constructor(
         }
     }
 
-    fun startPodroid() = PodroidService.start(context)
+    fun startPodroid() = launchVmCommand("start") { vmServiceClient.start() }
 
-    fun stopVm() = PodroidService.stop(context)
+    fun stopVm() = launchVmCommand("stop") { vmServiceClient.gracefulStop() }
 
-    fun restartVm() {
-        PodroidService.stop(context)
+    fun restartVm() = launchVmCommand("restart") { vmServiceClient.restart() }
+
+    private fun launchVmCommand(name: String, command: suspend () -> Unit) {
         viewModelScope.launch {
-            // Only start if we observed a terminal state within the timeout window.
-            // A null result means QEMU is still tearing down — starting over it would
-            // race two instances on the same socket files and storage.img.
-            val reached = withTimeoutOrNull(10_000) {
-                engine.state.first { state ->
-                    state is VmState.Stopped || state is VmState.Idle || state is VmState.Error
-                }
-            }
-            if (reached != null) {
-                PodroidService.start(context)
-            }
+            runCatching { command() }
+                .onFailure { android.util.Log.e("HomeViewModel", "VM $name command failed", it) }
         }
     }
 }

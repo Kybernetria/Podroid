@@ -71,9 +71,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.excp.podroid.BuildConfig
 import com.excp.podroid.R
 import com.excp.podroid.data.repository.PortForwardRule
-import com.excp.podroid.engine.EngineSelection
-import com.excp.podroid.engine.VmState
-import com.excp.podroid.engine.avf.AvfDiagnostics
+import com.excp.podroid.vm.EngineSelection
+import com.excp.podroid.service.VmUiState
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.rememberCoroutineScope
 import com.excp.podroid.ui.components.AdaptiveContainer
@@ -125,7 +124,7 @@ fun SettingsScreen(
     var avfRunning by remember { mutableStateOf(false) }
     val avfScope = rememberCoroutineScope()
     val ctx = LocalContext.current
-    val vmNotRunning = vmState !is VmState.Running && vmState !is VmState.Starting
+    val vmNotRunning = vmState !is VmUiState.Running && vmState !is VmUiState.Starting
 
     // Memoize: both values are constant for the process lifetime / until a backend
     // swap, so there's no point re-running reflection on every recomposition.
@@ -390,15 +389,20 @@ fun SettingsScreen(
                         avfRunning = true
                         avfReportText = ctx.getString(R.string.probing_avf)
                         avfScope.launch {
-                            val probe = AvfDiagnostics.probe(ctx)
-                            val smoke = if (probe.featureSupported && probe.managePermissionGranted) {
-                                viewModel.runAvfSmokeTest()
-                            } else null
-                            avfReportText = probe.copy(
-                                smokeTestResult = smoke,
-                                activeBackend = activeBackendId,
-                            ).pretty()
-                            avfRunning = false
+                            try {
+                                val probe = viewModel.backendProbe()
+                                val smoke = if (probe.featureSupported && probe.managePermissionGranted) {
+                                    viewModel.runAvfSmokeTest()
+                                } else null
+                                avfReportText = probe.copy(smokeTestResult = smoke).pretty()
+                            } catch (failure: Exception) {
+                                avfReportText = ctx.getString(
+                                    R.string.avf_diagnostic_unavailable,
+                                    failure.message ?: ctx.getString(R.string.unknown_error),
+                                )
+                            } finally {
+                                avfRunning = false
+                            }
                         }
                     },
                 )

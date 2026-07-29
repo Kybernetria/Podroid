@@ -20,16 +20,16 @@ import com.excp.podroid.data.repository.PortForwardRepository
 import com.excp.podroid.data.repository.PortForwardRule
 import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.di.ApplicationScope
-import com.excp.podroid.engine.EngineSelection
-import com.excp.podroid.engine.SensitiveConsolePolicy
-import com.excp.podroid.engine.VmEngine
-import com.excp.podroid.engine.VmState
+import com.excp.podroid.vm.EngineSelection
+import com.excp.podroid.vm.SensitiveConsolePolicy
+import com.excp.podroid.service.VmBackendProbe
+import com.excp.podroid.service.VmServiceClient
+import com.excp.podroid.service.VmUiState
 import com.excp.podroid.util.DeviceResourcePolicy
 import com.excp.podroid.util.NetworkUtils
 import com.excp.podroid.vm.ConsoleLogRequest
-import com.excp.podroid.vm.VmId
-import com.excp.podroid.vm.VmManager
-import com.excp.podroid.vm.VmPaths
+import com.excp.podroid.vm.VmDiagnosticsRequest
+import com.excp.podroid.vm.VmRemovePolicy
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
@@ -77,9 +77,7 @@ class SettingsViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     private val settingsRepository: SettingsRepository,
     private val portForwardRepository: PortForwardRepository,
-    private val engine: VmEngine,
-    private val vmManager: VmManager,
-    private val vmPaths: VmPaths,
+    private val vmServiceClient: VmServiceClient,
     private val languageManager: LanguageManager,
     @ApplicationScope private val externalScope: CoroutineScope,
 ) : ViewModel() {
@@ -188,8 +186,7 @@ class SettingsViewModel @Inject constructor(
     // Eagerly (like HomeViewModel): WhileSubscribed replays the initial Idle on
     // re-subscription, flashing a "stopped" indicator for a frame when the screen
     // is reopened within the stop-timeout window.
-    val vmState: StateFlow<VmState> = engine.state
-        .stateIn(viewModelScope, SharingStarted.Eagerly, VmState.Idle)
+    val vmState: StateFlow<VmUiState> = vmServiceClient.vmState
 
     fun setDarkTheme(value: Boolean) {
         viewModelScope.launch { settingsRepository.setDarkTheme(value) }
@@ -296,14 +293,14 @@ class SettingsViewModel @Inject constructor(
     val phoneIp: String by lazy { NetworkUtils.localIpv4(context) }
 
     /** Returns the ID string of the currently active VM backend (e.g. "qemu" or "avf"). */
-    fun activeBackendId(): String = engine.backendId
+    fun activeBackendId(): String = vmServiceClient.observation.value.backendId
 
     /**
      * USB passthrough rides the QEMU QMP control socket (add-fd + device_add
      * usb-host); the AVF backend has no QMP channel, so it can never pass a
      * device through. QEMU-only.
      */
-    fun isUsbPassthroughAvailable(): Boolean = engine.backendId == "qemu"
+    fun isUsbPassthroughAvailable(): Boolean = activeBackendId() == "qemu"
 
     private val _exportError = MutableStateFlow<String?>(null)
     /** One-shot export failure message; clear after showing with [clearExportError]. */
@@ -311,11 +308,9 @@ class SettingsViewModel @Inject constructor(
 
     fun clearExportError() { _exportError.value = null }
 
-    suspend fun runAvfSmokeTest(): String = withContext(Dispatchers.IO) {
-        // AvfDiagnostics owns the mandatory readiness and physical-path gates so
-        // every caller, not only this UI entry point, is fail closed.
-        com.excp.podroid.engine.avf.AvfDiagnostics.runSmokeTest(context, vmPaths)
-    }
+    suspend fun backendProbe(): VmBackendProbe = vmServiceClient.backendProbe()
+
+    suspend fun runAvfSmokeTest(): String = vmServiceClient.runBackendSmokeTest()
 
     fun removePortForward(rule: PortForwardRule) {
         viewModelScope.launch { portForwardRepository.removeRule(rule) }
@@ -323,10 +318,8 @@ class SettingsViewModel @Inject constructor(
 
     fun resetVm() {
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-                activityManager.clearApplicationUserData()
-            }
+            runCatching { vmServiceClient.remove(VmRemovePolicy.DELETE_DATA) }
+                .onFailure { Log.e(TAG, "VM reset failed", it) }
         }
     }
 
@@ -426,16 +419,12 @@ class SettingsViewModel @Inject constructor(
             appendLine()
 
             appendLine("=== VM State ===")
-            appendLine("VM id:       ${engine.vmId.serialized}")
-            appendLine("Instance:    ${vmPaths.instanceDirectory.absolutePath}")
-            appendLine("State:       ${engine.state.value}")
-            appendLine("Boot stage:  ${engine.bootStage.value.ifEmpty { "(none)" }}")
-            val storageFile = vmPaths.storageImage
-            appendLine(
-                "Storage img: " + if (storageFile.exists())
-                    "${storageFile.absolutePath} (${storageFile.length() / (1024 * 1024)} MB)"
-                else "(not created)"
-            )
+            val observation = vmServiceClient.observation.value
+            val metrics = runCatching { vmServiceClient.runtimeMetrics() }.getOrNull()
+            appendLine("VM id:       ${observation.vmId.serialized}")
+            appendLine("State:       ${vmServiceClient.vmState.value}")
+            appendLine("Boot stage:  ${observation.bootStage.ifEmpty { "(none)" }}")
+            appendLine("Storage allocated: ${metrics?.storageAllocatedBytes ?: 0L} bytes")
             appendLine()
 
             appendLine("=== Port Forward Rules (${rules.size}) ===")
@@ -448,18 +437,19 @@ class SettingsViewModel @Inject constructor(
             }
             appendLine()
 
-            val avf = com.excp.podroid.engine.avf.AvfDiagnostics.probe(context)
-                .copy(activeBackend = activeBackendId())
+            val avf = runCatching { vmServiceClient.backendProbe() }.getOrNull()
             val cpus = settingsRepository.getVmCpusSnapshot()
             val topology = if (cpus <= 1) "ONE_CPU" else "MATCH_HOST (all host cores)"
             appendLine("== AVF ==")
             appendLine("cpu setting = $cpus -> topology $topology")
-            append(avf.pretty())
+            append(avf?.pretty() ?: "AVF probe unavailable\n")
             appendLine("verboseLogging = ${settingsRepository.getAvfVerboseLoggingSnapshot()}")
             appendLine()
 
             appendLine("=== Engine Diagnostics ===")
-            val engineDiag = runCatching { engine.diagnosticsReport() }.getOrDefault("")
+            val engineDiag = runCatching {
+                vmServiceClient.diagnostics(VmDiagnosticsRequest(VmDiagnosticsRequest.MAX_CHARS)).text
+            }.getOrDefault("")
             append(if (engineDiag.isBlank()) "(none)\n" else engineDiag)
             appendLine()
 
@@ -470,8 +460,7 @@ class SettingsViewModel @Inject constructor(
             appendLine("=== VM Console Log (backend=${activeBackendId()}) ===")
             val consoleText = if (SensitiveConsolePolicy.persistedCaptureAllowed(qemuExtras, kernelExtras)) {
                 runCatching {
-                    vmManager.readConsoleLog(
-                        VmId.DEFAULT,
+                    vmServiceClient.readConsoleLog(
                         ConsoleLogRequest(
                             maxBytes = ConsoleLogRequest.MAX_BYTES,
                             maxLines = ConsoleLogRequest.MAX_LINES,

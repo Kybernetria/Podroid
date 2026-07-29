@@ -5,14 +5,13 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.excp.podroid.data.repository.PortForwardRepository
 import com.excp.podroid.data.repository.SettingsRepository
-import com.excp.podroid.engine.EngineSelection
-import com.excp.podroid.engine.VmEngine
-import com.excp.podroid.engine.VmState
+import com.excp.podroid.vm.EngineSelection
+import com.excp.podroid.service.VmServiceClient
+import com.excp.podroid.service.VmUiState
 import com.excp.podroid.util.HostMetrics
 import com.excp.podroid.util.HostMetricsSnapshot
 import com.excp.podroid.util.NetworkUtils
 import com.excp.podroid.util.VmLoadSampler
-import com.excp.podroid.vm.VmPaths
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.delay
@@ -26,7 +25,7 @@ import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 data class StatusUiState(
-    val vmState: VmState = VmState.Idle,
+    val vmState: VmUiState = VmUiState.Idle,
     val backendId: String = "qemu",
     val engineSelection: EngineSelection = EngineSelection.AUTO,
     val uptimeLabel: String? = null,
@@ -57,8 +56,7 @@ data class StatusUiState(
 @HiltViewModel
 class StatusViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val engine: VmEngine,
-    private val vmPaths: VmPaths,
+    private val vmServiceClient: VmServiceClient,
     private val settingsRepository: SettingsRepository,
     private val portForwardRepository: PortForwardRepository,
 ) : ViewModel() {
@@ -72,7 +70,7 @@ class StatusViewModel @Inject constructor(
 
     val uiState: StateFlow<StatusUiState> = combine(
         combine(
-            engine.state,
+            vmServiceClient.vmState,
             settingsRepository.vmRamMb,
             settingsRepository.vmCpus,
             settingsRepository.storageSizeGb,
@@ -97,11 +95,11 @@ class StatusViewModel @Inject constructor(
             arrayOf(pct, history, unavailable)
         },
     ) { a, b, c ->
-        val vmState = a[0] as VmState
+        val vmState = a[0] as VmUiState
         val tick = b[4] as Long
         StatusUiState(
             vmState = vmState,
-            backendId = engine.backendId,
+            backendId = vmServiceClient.observation.value.backendId,
             engineSelection = b[1] as EngineSelection,
             uptimeLabel = uptimeLabel(vmState, tick),
             phoneIp = NetworkUtils.localIpv4(context),
@@ -125,7 +123,7 @@ class StatusViewModel @Inject constructor(
                 delay(2_000)
                 refreshMetrics()
                 sampleVmLoad()
-                if (engine.state.value is VmState.Running) {
+                if (vmServiceClient.vmState.value is VmUiState.Running) {
                     _uptimeTick.value = System.currentTimeMillis()
                 }
             }
@@ -133,13 +131,18 @@ class StatusViewModel @Inject constructor(
     }
 
     fun refreshMetrics() {
-        val storageImg = vmPaths.storageImage
-        val rss = if (engine.state.value is VmState.Running) engine.emulatorRssMb() else null
-        _metrics.value = HostMetrics.snapshot(context, storageImg, rss)
+        viewModelScope.launch {
+            val serviceMetrics = runCatching { vmServiceClient.runtimeMetrics() }.getOrNull()
+            _metrics.value = HostMetrics.snapshot(
+                context = context,
+                vmDiskImageBytes = serviceMetrics?.storageAllocatedBytes ?: 0L,
+                emulatorRssMb = serviceMetrics?.emulatorRssMb,
+            )
+        }
     }
 
-    private fun sampleVmLoad() {
-        if (engine.state.value !is VmState.Running) {
+    private suspend fun sampleVmLoad() {
+        if (vmServiceClient.vmState.value !is VmUiState.Running) {
             loadSampler.reset()
             _vmLoadPercent.value = null
             _vmLoadHistory.value = emptyList()
@@ -147,7 +150,7 @@ class StatusViewModel @Inject constructor(
             return
         }
 
-        val pid = engine.emulatorPid()
+        val pid = runCatching { vmServiceClient.runtimeMetrics().emulatorPid }.getOrNull()
         if (pid == null) {
             loadSampler.reset()
             _vmLoadPercent.value = null
@@ -162,14 +165,11 @@ class StatusViewModel @Inject constructor(
         _vmLoadHistory.value = (_vmLoadHistory.value + pct).takeLast(VmLoadSampler.MAX_SAMPLES)
     }
 
-    private fun defaultMetrics(): HostMetricsSnapshot {
-        val storageImg = vmPaths.storageImage
-        return HostMetrics.snapshot(context, storageImg, null)
-    }
+    private fun defaultMetrics(): HostMetricsSnapshot = HostMetrics.snapshot(context, 0L, null)
 
-    private fun uptimeLabel(vmState: VmState, tick: Long): String? {
-        if (vmState !is VmState.Running) return null
-        val since = engine.runningSinceMs ?: return null
+    private fun uptimeLabel(vmState: VmUiState, tick: Long): String? {
+        if (vmState !is VmUiState.Running) return null
+        val since = vmServiceClient.observation.value.runningSinceMs ?: return null
         val secs = ((tick.takeIf { it > 0 } ?: System.currentTimeMillis()) - since) / 1000
         if (secs < 0) return null
         val h = secs / 3600

@@ -50,8 +50,8 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.excp.podroid.BuildConfig
 import com.excp.podroid.R
-import com.excp.podroid.engine.VmState
-import com.excp.podroid.engine.avf.AvfFailureGuidance
+import com.excp.podroid.service.VmUiState
+import com.excp.podroid.vm.VmFailureAdvice
 import com.excp.podroid.ui.components.AdaptiveContainer
 import com.excp.podroid.ui.components.PodroidDestructiveButton
 import com.excp.podroid.ui.components.PodroidGhostButton
@@ -85,8 +85,8 @@ fun HomeScreen(
     val stopping by viewModel.stopping.collectAsStateWithLifecycle()
     val containerCount by viewModel.containerCount.collectAsStateWithLifecycle()
 
-    val isRunning  = vmState is VmState.Running
-    val isStarting = vmState is VmState.Starting
+    val isRunning  = vmState is VmUiState.Running
+    val isStarting = vmState is VmUiState.Starting
     // Stop is asynchronous: the engine stays Running/Starting until teardown
     // finishes, so gate the indicator on the engine's stopping signal while the
     // state is still active. The instant state goes terminal, this falls back to
@@ -306,13 +306,13 @@ private fun HomeStatusBlock(
     isStarting: Boolean,
     isRunning: Boolean,
     isStopping: Boolean,
-    vmState: VmState,
+    vmState: VmUiState,
     bootStage: String,
     meta: HomeMeta,
     uptimeLabel: String?,
     containerCount: Int? = null,
     avfBootFailure: Boolean = false,
-    avfFailureAdvice: AvfFailureGuidance.Advice = AvfFailureGuidance.Advice.SWITCH_TO_QEMU,
+    avfFailureAdvice: VmFailureAdvice = VmFailureAdvice.SWITCH_TO_QEMU,
     onUseOneCore: () -> Unit = {},
     onSwitchToQemu: () -> Unit = {},
     onRetry: () -> Unit = {},
@@ -377,7 +377,7 @@ private fun HomeStatusBlock(
             color = MaterialTheme.colorScheme.primary,
         )
     }
-    if (vmState is VmState.Error) {
+    if (vmState is VmUiState.Error) {
         Spacer(Modifier.height(PodroidTokens.Spacing.MD))
         PodroidSectionLabel(stringResource(R.string.error_title))
         Text(
@@ -389,7 +389,7 @@ private fun HomeStatusBlock(
             Spacer(Modifier.height(PodroidTokens.Spacing.MD))
             Text(
                 text = stringResource(
-                    if (avfFailureAdvice == AvfFailureGuidance.Advice.TRY_ONE_CORE)
+                    if (avfFailureAdvice == VmFailureAdvice.TRY_ONE_CORE)
                         R.string.avf_boot_failed_try_one_core
                     else
                         R.string.avf_boot_failed_switch_qemu
@@ -398,7 +398,7 @@ private fun HomeStatusBlock(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(Modifier.height(PodroidTokens.Spacing.SM))
-            if (avfFailureAdvice == AvfFailureGuidance.Advice.TRY_ONE_CORE) {
+            if (avfFailureAdvice == VmFailureAdvice.TRY_ONE_CORE) {
                 PodroidPrimaryButton(
                     text = stringResource(R.string.avf_action_use_one_core),
                     onClick = onUseOneCore,
@@ -427,13 +427,13 @@ private fun HomeStatusBlock(
 private fun HomeDataSection(
     isRunning: Boolean,
     isStopping: Boolean,
-    vmState: VmState,
+    vmState: VmUiState,
     meta: HomeMeta,
     phoneIp: String,
     containerCount: Int?,
 ) {
-    val showStarting = vmState is VmState.Starting
-    val showError = vmState is VmState.Error
+    val showStarting = vmState is VmUiState.Starting
+    val showError = vmState is VmUiState.Error
     if (showStarting || showError || isStopping) return
     Spacer(Modifier.height(PodroidTokens.Spacing.MD))
     if (isRunning) {
@@ -487,7 +487,7 @@ private fun HomeActionButtons(
     isRunning: Boolean,
     isStarting: Boolean,
     isStopping: Boolean,
-    vmState: VmState,
+    vmState: VmUiState,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onRestart: () -> Unit,
@@ -515,7 +515,7 @@ private fun HomeActionButtons(
         }
     } else if (isStarting) {
         PodroidDestructiveButton(text = stringResource(R.string.stop), onClick = onStop)
-    } else if (vmState is VmState.Error) {
+    } else if (vmState is VmUiState.Error) {
         PodroidPrimaryButton(text = stringResource(R.string.try_again), onClick = onStart)
         Spacer(Modifier.height(PodroidTokens.Spacing.SM))
         HomeQuickActions(onBackup = onBackup, onStatus = onStatus)

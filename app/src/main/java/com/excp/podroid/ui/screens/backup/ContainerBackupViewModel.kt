@@ -8,8 +8,8 @@ import androidx.lifecycle.viewModelScope
 import com.excp.podroid.data.repository.ContainerBackupFile
 import com.excp.podroid.data.repository.ContainerBackupRepository
 import com.excp.podroid.data.repository.SettingsRepository
-import com.excp.podroid.engine.VmEngine
-import com.excp.podroid.engine.VmState
+import com.excp.podroid.service.VmServiceClient
+import com.excp.podroid.service.VmUiState
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -33,7 +33,7 @@ class ContainerBackupViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     private val repository: ContainerBackupRepository,
     private val settingsRepository: SettingsRepository,
-    private val engine: VmEngine,
+    private val vmServiceClient: VmServiceClient,
 ) : ViewModel() {
 
     private val _containerName = MutableStateFlow("")
@@ -41,14 +41,14 @@ class ContainerBackupViewModel @Inject constructor(
     private val _backupFiles = MutableStateFlow<List<ContainerBackupFile>>(emptyList())
 
     val uiState: StateFlow<ContainerBackupUiState> = combine(
-        engine.state,
+        vmServiceClient.vmState,
         settingsRepository.storageAccessEnabled,
         _containerName,
         _imageRef,
         _backupFiles,
     ) { vmState, storageAccess, container, image, files ->
         ContainerBackupUiState(
-            vmRunning = vmState is VmState.Running,
+            vmRunning = vmState is VmUiState.Running,
             storageAccessEnabled = storageAccess,
             guestPath = repository.guestBackupPathLabel(),
             backupFiles = files,

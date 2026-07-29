@@ -110,7 +110,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import com.excp.podroid.R
-import com.excp.podroid.engine.VmState
+import com.excp.podroid.service.VmUiState
 import com.excp.podroid.ui.components.AdaptiveContainer
 import com.excp.podroid.ui.components.PodroidGhostButton
 import com.excp.podroid.ui.components.PodroidListRow
@@ -230,7 +230,7 @@ fun TerminalScreen(
         }
 
         when (vmState) {
-            is VmState.Idle, is VmState.Stopped -> {
+            is VmUiState.Idle, is VmUiState.Stopped -> {
                 Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(
@@ -248,7 +248,7 @@ fun TerminalScreen(
                 }
             }
 
-            is VmState.Error -> {
+            is VmUiState.Error -> {
                 Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
@@ -261,7 +261,7 @@ fun TerminalScreen(
                         )
                         Spacer(Modifier.height(PodroidTokens.Spacing.SM))
                         Text(
-                            (vmState as VmState.Error).message,
+                            (vmState as VmUiState.Error).message,
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             textAlign = TextAlign.Center,
@@ -276,7 +276,7 @@ fun TerminalScreen(
                 }
             }
 
-            is VmState.Starting -> {
+            is VmUiState.Starting -> {
                 Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                     Text(
                         text = stringResource(R.string.status_starting) + "…",
@@ -286,7 +286,7 @@ fun TerminalScreen(
                 }
             }
 
-            is VmState.Running -> {
+            is VmUiState.Running -> {
                 // Hoisted into its own composable so toggling chrome state in the
                 // parent (showQuickSettings, showExtraKeys, hapticsEnabled, modifier
                 // keys, etc.) doesn't invalidate the AndroidView slot. TerminalSurface
@@ -384,7 +384,7 @@ private fun TerminalSurface(
         }
 
         // Session/client binding. Keyed on `view` only — we are inside the
-        // VmState.Running branch so vmState identity is stable while we live.
+        // VmUiState.Running branch so vmState identity is stable while we live.
         // (Previous `DisposableEffect(view, vmState)` was wider than necessary;
         // narrowing means transient VM state churn can't re-bind the session.)
         DisposableEffect(view) {

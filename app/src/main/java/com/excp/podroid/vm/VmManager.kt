@@ -93,12 +93,41 @@ data class SshEndpointDiscovery(
     val endpoint: SshEndpoint?,
 )
 
+/** Bounded backend-neutral observation mirrored across the local service boundary. */
+data class VmObservation(
+    val vmId: VmId,
+    val lifecycle: VmLifecycleState,
+    val backendId: String,
+    val errorMessage: String? = null,
+    val bootStage: String = "",
+    val stopping: Boolean = false,
+    val runningSinceMs: Long? = null,
+)
+
+data class VmRuntimeMetrics(
+    val storageAllocatedBytes: Long,
+    val emulatorRssMb: Long?,
+    val emulatorPid: Int?,
+)
+
+data class VmDiagnosticsRequest(val maxChars: Int) {
+    init {
+        require(maxChars in 1..MAX_CHARS) { "maxChars must be in 1..$MAX_CHARS" }
+    }
+
+    companion object { const val MAX_CHARS = 64 * 1024 }
+}
+
+data class VmDiagnostics(val text: String, val truncated: Boolean)
+
 /**
- * Default-instance manager boundary. Every call includes and validates [VmId];
- * the contract deliberately has no Binder, desired-state, or reconciliation API.
+ * Default-instance manager boundary. Every call includes and validates [VmId].
+ * It exposes DTOs only; backend objects, paths, and arbitrary command strings
+ * remain below the manager/service boundary.
  */
 interface VmManager {
     fun lifecycle(vmId: VmId): StateFlow<VmLifecycleState>
+    fun observation(vmId: VmId): StateFlow<VmObservation>
     /** True only after all backend resources for the active generation are released. */
     fun quiescent(vmId: VmId): StateFlow<Boolean>
     /** Manager-owned launch work or a non-quiescent backend generation is in progress. */
@@ -114,6 +143,8 @@ interface VmManager {
     suspend fun readConsoleLog(vmId: VmId, request: ConsoleLogRequest): ConsoleLog
     suspend fun executeQmp(vmId: VmId, operation: VmQmpOperation): VmQmpResult
     suspend fun discoverSshEndpoint(vmId: VmId): SshEndpointDiscovery
+    suspend fun runtimeMetrics(vmId: VmId): VmRuntimeMetrics
+    suspend fun diagnostics(vmId: VmId, request: VmDiagnosticsRequest): VmDiagnostics
 }
 
 internal data class VmLaunchPlan(
@@ -125,8 +156,14 @@ internal interface ManagedVmRuntime {
     val vmId: VmId
     val state: StateFlow<VmState>
     val quiescent: StateFlow<Boolean>
+    val bootStage: StateFlow<String>
+    val stopping: StateFlow<Boolean>
     val backendId: String
+    val runningSinceMs: Long?
     val qmpAvailable: Boolean
+    fun emulatorRssMb(): Long?
+    fun emulatorPid(): Int?
+    fun diagnosticsReport(): String
     suspend fun start(plan: VmLaunchPlan)
     fun stop()
     fun forceStop()
@@ -158,6 +195,8 @@ internal interface VmFiles {
     fun isInstalled(vmId: VmId): Boolean
     fun remove(vmId: VmId, policy: VmRemovePolicy)
     fun readConsole(vmId: VmId, request: ConsoleLogRequest): ConsoleLog
+    fun storageAllocatedBytes(vmId: VmId): Long
+    fun redactPrivatePaths(text: String): String
 }
 
 /** Production implementation; dependencies are narrow so manager policy is JVM-testable. */
@@ -184,6 +223,38 @@ class DefaultVmManager internal constructor(
     private val lifecycleFlow: StateFlow<VmLifecycleState> = runtime.state
         .combine(launchPending) { state, pending -> effectiveLifecycle(state, pending) }
         .stateIn(scope, SharingStarted.Eagerly, effectiveLifecycle(runtime.state.value, false))
+    private val observationFlow: StateFlow<VmObservation> = combine(
+        runtime.state,
+        runtime.bootStage,
+        runtime.stopping,
+        launchPending,
+    ) { state, stage, stopping, pending ->
+        VmObservation(
+            vmId = VmId.DEFAULT,
+            lifecycle = effectiveLifecycle(state, pending),
+            backendId = runtime.backendId.take(MAX_BACKEND_ID_CHARS),
+            errorMessage = (state as? VmState.Error)?.message
+                ?.let(files::redactPrivatePaths)
+                ?.take(MAX_OBSERVATION_TEXT_CHARS),
+            bootStage = stage.take(MAX_OBSERVATION_TEXT_CHARS),
+            stopping = stopping,
+            runningSinceMs = runtime.runningSinceMs,
+        )
+    }.stateIn(
+        scope,
+        SharingStarted.Eagerly,
+        VmObservation(
+            vmId = VmId.DEFAULT,
+            lifecycle = effectiveLifecycle(runtime.state.value, false),
+            backendId = runtime.backendId.take(MAX_BACKEND_ID_CHARS),
+            errorMessage = (runtime.state.value as? VmState.Error)?.message
+                ?.let(files::redactPrivatePaths)
+                ?.take(MAX_OBSERVATION_TEXT_CHARS),
+            bootStage = runtime.bootStage.value.take(MAX_OBSERVATION_TEXT_CHARS),
+            stopping = runtime.stopping.value,
+            runningSinceMs = runtime.runningSinceMs,
+        ),
+    )
     private val busyUpdates: StateFlow<Boolean> = runtime.quiescent
         .combine(launchPending) { quiescent, pending -> pending || !quiescent }
         .stateIn(scope, SharingStarted.Eagerly, launchPending.value || !runtime.quiescent.value)
@@ -203,6 +274,11 @@ class DefaultVmManager internal constructor(
     override fun lifecycle(vmId: VmId): StateFlow<VmLifecycleState> {
         requireDefault(vmId)
         return lifecycleFlow
+    }
+
+    override fun observation(vmId: VmId): StateFlow<VmObservation> {
+        requireDefault(vmId)
+        return observationFlow
     }
 
     override fun quiescent(vmId: VmId): StateFlow<Boolean> {
@@ -225,8 +301,10 @@ class DefaultVmManager internal constructor(
             vmId = vmId,
             installed = files.isInstalled(vmId),
             lifecycle = effectiveLifecycle(state, launchPending.value),
-            backendId = runtime.backendId,
-            errorMessage = (state as? VmState.Error)?.message,
+            backendId = runtime.backendId.take(MAX_BACKEND_ID_CHARS),
+            errorMessage = (state as? VmState.Error)?.message
+                ?.let(files::redactPrivatePaths)
+                ?.take(MAX_OBSERVATION_TEXT_CHARS),
         )
     }
 
@@ -305,6 +383,20 @@ class DefaultVmManager internal constructor(
             reachable = reachable,
             endpoint = if (reachable) SshEndpoint(SSH_HOST, SSH_HOST_PORT) else null,
         )
+    }
+
+    override suspend fun runtimeMetrics(vmId: VmId): VmRuntimeMetrics = withTree(vmId) {
+        VmRuntimeMetrics(
+            storageAllocatedBytes = files.storageAllocatedBytes(vmId),
+            emulatorRssMb = runtime.emulatorRssMb(),
+            emulatorPid = runtime.emulatorPid(),
+        )
+    }
+
+    override suspend fun diagnostics(vmId: VmId, request: VmDiagnosticsRequest): VmDiagnostics {
+        awaitInitial(vmId)
+        val raw = files.redactPrivatePaths(runtime.diagnosticsReport())
+        return VmDiagnostics(raw.takeLast(request.maxChars), raw.length > request.maxChars)
     }
 
     private suspend fun ensureInstalledLocked(vmId: VmId, lease: VmAssetTreeLease) {
@@ -477,6 +569,8 @@ class DefaultVmManager internal constructor(
         const val SSH_HOST_PORT = 9922
         const val SSH_HOST = "127.0.0.1"
         private const val STOP_POLL_MS = 10L
+        private const val MAX_OBSERVATION_TEXT_CHARS = 512
+        private const val MAX_BACKEND_ID_CHARS = 32
 
         internal fun mapLifecycle(state: VmState): VmLifecycleState = when (state) {
             is VmState.Idle -> VmLifecycleState.IDLE
@@ -500,8 +594,14 @@ internal class EngineManagedVmRuntime(private val engine: VmEngine) : ManagedVmR
     override val vmId: VmId get() = engine.vmId
     override val state: StateFlow<VmState> get() = engine.state
     override val quiescent: StateFlow<Boolean> get() = engine.quiescent
+    override val bootStage: StateFlow<String> get() = engine.bootStage
+    override val stopping: StateFlow<Boolean> get() = engine.stopping
     override val backendId: String get() = engine.backendId
+    override val runningSinceMs: Long? get() = engine.runningSinceMs
     override val qmpAvailable: Boolean get() = engine.qmpController != null
+    override fun emulatorRssMb(): Long? = engine.emulatorRssMb()
+    override fun emulatorPid(): Int? = engine.emulatorPid()
+    override fun diagnosticsReport(): String = engine.diagnosticsReport()
 
     override suspend fun start(plan: VmLaunchPlan) = engine.start(plan.portForwards, plan.config)
     override fun stop() = engine.stop()
@@ -575,6 +675,23 @@ internal class VmPathFiles(private val paths: VmPaths) : VmFiles {
             Files.delete(instanceRoot)
         }
         VmPathSecurity.forceDirectory(paths.instancesDirectory.toPath())
+    }
+
+    override fun redactPrivatePaths(text: String): String = text
+        .replace(paths.instanceDirectory.absolutePath, "[default VM]")
+        .replace(paths.filesDirectory.absolutePath, "[app files]")
+
+    override fun storageAllocatedBytes(vmId: VmId): Long {
+        requireVm(vmId)
+        if (!instanceExistsSafely()) return 0L
+        val storage = paths.storageImage.toPath().toAbsolutePath().normalize()
+        if (!exists(storage)) return 0L
+        if (!regular(storage)) throw IOException("Persistent storage is not a regular no-follow file")
+        return try {
+            android.system.Os.stat(storage.toString()).st_blocks * 512L
+        } catch (_: Exception) {
+            Files.size(storage)
+        }
     }
 
     override fun readConsole(vmId: VmId, request: ConsoleLogRequest): ConsoleLog {

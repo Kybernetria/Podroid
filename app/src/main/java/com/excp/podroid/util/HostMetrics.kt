@@ -31,6 +31,16 @@ object HostMetrics {
         context: Context,
         storageImg: File,
         emulatorRssMb: Long?,
+    ): HostMetricsSnapshot = snapshot(
+        context = context,
+        vmDiskImageBytes = if (storageImg.isFile) diskFootprintBytes(storageImg) else 0L,
+        emulatorRssMb = emulatorRssMb,
+    )
+
+    fun snapshot(
+        context: Context,
+        vmDiskImageBytes: Long,
+        emulatorRssMb: Long?,
     ): HostMetricsSnapshot {
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val mem = ActivityManager.MemoryInfo()
@@ -48,7 +58,7 @@ object HostMetrics {
             loadAvg15 = load?.third,
             phoneStorageTotalGb = stat.totalBytes / (1024.0 * 1024 * 1024),
             phoneStorageAvailGb = stat.availableBytes / (1024.0 * 1024 * 1024),
-            vmDiskImageBytes = if (storageImg.isFile) diskFootprintBytes(storageImg) else 0L,
+            vmDiskImageBytes = vmDiskImageBytes,
             emulatorRssMb = emulatorRssMb,
         )
     }

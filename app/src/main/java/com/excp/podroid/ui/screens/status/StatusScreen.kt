@@ -30,8 +30,8 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.excp.podroid.R
-import com.excp.podroid.engine.EngineSelection
-import com.excp.podroid.engine.VmState
+import com.excp.podroid.vm.EngineSelection
+import com.excp.podroid.service.VmUiState
 import com.excp.podroid.ui.components.AdaptiveContainer
 import com.excp.podroid.ui.components.PodroidListRow
 import com.excp.podroid.ui.components.PodroidSectionLabel
@@ -136,7 +136,7 @@ fun StatusScreen(
                     samples = ui.vmLoadHistory,
                     currentPercent = ui.vmLoadPercent,
                     unavailableReason = when {
-                        ui.vmState !is VmState.Running -> stringResource(R.string.status_vm_load_stopped)
+                        ui.vmState !is VmUiState.Running -> stringResource(R.string.status_vm_load_stopped)
                         ui.vmLoadGraphUnavailable == "avf" -> stringResource(R.string.status_vm_load_avf_only)
                         else -> null
                     },
@@ -242,11 +242,11 @@ private fun StatusMetricBar(
 }
 
 @Composable
-private fun vmStatusLabel(vmState: VmState, uptime: String?): String = when (vmState) {
-    is VmState.Running -> uptime?.let { "${stringResource(R.string.status_running)} · $it" }
+private fun vmStatusLabel(vmState: VmUiState, uptime: String?): String = when (vmState) {
+    is VmUiState.Running -> uptime?.let { "${stringResource(R.string.status_running)} · $it" }
         ?: stringResource(R.string.status_running)
-    is VmState.Starting -> stringResource(R.string.status_starting)
-    is VmState.Error -> stringResource(R.string.status_error)
+    is VmUiState.Starting -> stringResource(R.string.status_starting)
+    is VmUiState.Error -> stringResource(R.string.status_error)
     else -> stringResource(R.string.status_stopped)
 }
 

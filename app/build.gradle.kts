@@ -117,6 +117,28 @@ val testVmInstancePathVerifier by tasks.registering(Exec::class) {
     )
 }
 
+val verifyUiVmBoundary by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Rejects Android UI access that bypasses VmServiceClient."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", rootProject.file("tests/verify_ui_vm_boundary.py"))
+    inputs.files(
+        rootProject.fileTree("app/src/main/java/com/excp/podroid/ui") { include("**/*.kt") },
+        rootProject.file("tests/verify_ui_vm_boundary.py")
+    )
+}
+
+val testUiVmBoundaryVerifier by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Runs UI VM boundary verifier regression tests."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", "-m", "unittest", "-v", "tests/test_verify_ui_vm_boundary.py")
+    inputs.files(
+        rootProject.file("tests/test_verify_ui_vm_boundary.py"),
+        rootProject.file("tests/verify_ui_vm_boundary.py")
+    )
+}
+
 val requireGuestRootfsForRelease by tasks.registering(Exec::class) {
     group = "verification"
     description = "Requires a verified guest rootfs for release packaging."
@@ -194,7 +216,8 @@ tasks.named("preBuild") {
         verifyGuestCredentialArtifact,
         verifyMinimalGuestSources,
         verifyMinimalGuestArtifact,
-        verifyVmInstancePaths
+        verifyVmInstancePaths,
+        verifyUiVmBoundary
     )
 }
 
@@ -219,7 +242,9 @@ tasks.named("check") {
         verifyMinimalGuestArtifact,
         testMinimalGuestVerifier,
         verifyVmInstancePaths,
-        testVmInstancePathVerifier
+        testVmInstancePathVerifier,
+        verifyUiVmBoundary,
+        testUiVmBoundaryVerifier
     )
 }
 
@@ -228,7 +253,9 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
         testGuestCredentialVerifier,
         testMinimalGuestVerifier,
         verifyVmInstancePaths,
-        testVmInstancePathVerifier
+        testVmInstancePathVerifier,
+        verifyUiVmBoundary,
+        testUiVmBoundaryVerifier
     )
 }
 

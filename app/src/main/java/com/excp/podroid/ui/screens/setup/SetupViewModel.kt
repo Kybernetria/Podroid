@@ -3,7 +3,7 @@ package com.excp.podroid.ui.screens.setup
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.excp.podroid.data.repository.SettingsRepository
-import com.excp.podroid.engine.VmEngine
+import com.excp.podroid.service.VmServiceClient
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -14,7 +14,7 @@ import javax.inject.Inject
 @HiltViewModel
 class SetupViewModel @Inject constructor(
     private val settingsRepository: SettingsRepository,
-    private val engine: VmEngine,
+    private val vmServiceClient: VmServiceClient,
 ) : ViewModel() {
 
     private val _setupComplete = MutableStateFlow(false)
@@ -27,7 +27,8 @@ class SetupViewModel @Inject constructor(
      * so on an AVF device this can briefly read available; the choice is inert
      * on AVF anyway (no QMP, no qemu-xhci) and Settings shows the correct gate.
      */
-    fun usbPassthroughAvailable(): Boolean = engine.backendId == "qemu"
+    fun usbPassthroughAvailable(): Boolean =
+        vmServiceClient.observation.value.backendId != "avf"
 
     /**
      * Persists all setup choices in a single DataStore transaction so a process
@@ -44,17 +45,26 @@ class SetupViewModel @Inject constructor(
         bandwidthMbps: Int,
     ) {
         viewModelScope.launch {
-            settingsRepository.completeSetup(
-                storageSizeGb = storageSizeGb,
-                vmRamMb = vmRamMb,
-                vmCpus = vmCpus,
-                sshEnabled = sshEnabled,
-                storageAccessEnabled = storageAccessEnabled,
-                usbPassthroughEnabled = usbPassthroughEnabled,
-                loadBalanceEnabled = loadBalanceEnabled,
-                bandwidthMbps = bandwidthMbps,
-            )
-            _setupComplete.value = true
+            runCatching {
+                // Installation must succeed before DataStore publishes setup as
+                // complete; otherwise a failed extraction would skip the wizard
+                // forever on the next process start.
+                vmServiceClient.ensureInstalled()
+                settingsRepository.completeSetup(
+                    storageSizeGb = storageSizeGb,
+                    vmRamMb = vmRamMb,
+                    vmCpus = vmCpus,
+                    sshEnabled = sshEnabled,
+                    storageAccessEnabled = storageAccessEnabled,
+                    usbPassthroughEnabled = usbPassthroughEnabled,
+                    loadBalanceEnabled = loadBalanceEnabled,
+                    bandwidthMbps = bandwidthMbps,
+                )
+            }.onSuccess {
+                _setupComplete.value = true
+            }.onFailure {
+                android.util.Log.e("SetupViewModel", "VM installation failed", it)
+            }
         }
     }
 }

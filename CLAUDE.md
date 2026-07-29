@@ -64,7 +64,7 @@ Native binaries require **16KB page alignment** (`-Wl,-z,max-page-size=16384`) -
 
 ### VM manager and engine abstraction (the most important thing to understand)
 
-Service-facing lifecycle operations go through the narrow `vm/VmManager.kt` domain contract. `DefaultVmManager` supports only `VmId.DEFAULT`, serializes lifecycle mutations, owns install/config/implicit-SSH assembly, exposes bounded logs and a typed QMP allowlist, and applies explicit preserve/delete-data removal policy. Backend cleanup is tracked by an authoritative `quiescent` flow independent of UI `VmState`; Error is not safe until quiescent, and install/start/removal share the application's exclusive asset-tree lease. `PodroidService` retains only foreground-service, WakeLock, notification, host-bridge, and USB-observer mechanics; it does not assemble backend launch configuration. There is deliberately no Binder or desired-state reconciliation API yet.
+Service-facing lifecycle operations go through the narrow `vm/VmManager.kt` domain contract. `DefaultVmManager` supports only `VmId.DEFAULT`, serializes lifecycle mutations, owns install/config/implicit-SSH assembly, exposes bounded logs and a typed QMP allowlist, and applies explicit preserve/delete-data removal policy. Backend cleanup is tracked by an authoritative `quiescent` flow independent of UI state; Error is not safe until quiescent, and install/start/removal share the application's exclusive asset-tree lease. `PodroidService` retains foreground-service, WakeLock, notification, host-bridge, USB-observer, and same-UID local-Binder mechanics; it does not assemble backend launch configuration. UI code uses the application-lifetime `VmServiceClient`, whose DTO mirror survives Activity recreation and whose binding loss never requests VM stop. The manifest service is non-exported and every endpoint call verifies the Binder caller UID. There is deliberately no desired-state reconciliation API yet.
 
 Below the manager, backend operations go through `engine/VmEngine.kt`, a single interface implemented by two backends and one router. The MVP instance identity is exactly `VmId.DEFAULT` (`default`), and the injected `vm/VmPaths.kt` confines its files to `filesDir/instances/default`; `PodroidApplication` runs the fail-closed legacy move before extracting assets or allowing launch:
 
@@ -77,8 +77,8 @@ When you touch VM behavior, decide whether it is backend-neutral (put it behind 
 ### Data flow
 
 ```
-Terminal UI (Compose)
-    | TerminalSession (vendored Termux JNI)
+Terminal UI (Compose) -> VmServiceClient -> PodroidService local Binder
+    | same-process TerminalSession capability (vendored Termux JNI)
 libpodroid-bridge.so  <->  terminal.sock + ctrl.sock  <->  VM  <->  hvc0 + hvc1
 boot monitor          <->  serial.sock (QEMU) / console stream (AVF)  ->  console.log + boot-stage detector
 QmpClient             <->  qmp.sock (QEMU only)        -> runtime port forwards (netdev_add/remove)
