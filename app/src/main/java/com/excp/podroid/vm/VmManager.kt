@@ -97,6 +97,10 @@ data class SshEndpointDiscovery(
  */
 interface VmManager {
     fun lifecycle(vmId: VmId): StateFlow<VmLifecycleState>
+    /** True only after all backend resources for the active generation are released. */
+    fun quiescent(vmId: VmId): StateFlow<Boolean>
+    /** Manager-owned launch work or a non-quiescent backend generation is in progress. */
+    fun busy(vmId: VmId): StateFlow<Boolean>
     suspend fun list(vmId: VmId): List<VmSummary>
     suspend fun status(vmId: VmId): VmStatus
     suspend fun ensureInstalled(vmId: VmId)
@@ -171,12 +175,22 @@ class DefaultVmManager internal constructor(
     private val stopTaskMutex = Mutex()
     @Volatile private var stopTask: Deferred<Unit>? = null
     @Volatile private var stopForceSignal: CompletableDeferred<Unit>? = null
+    @Volatile private var startTask: Deferred<Unit>? = null
     private var installationEnsured = false
     private val launchPending = MutableStateFlow(false)
 
     private val lifecycleFlow: StateFlow<VmLifecycleState> = runtime.state
         .combine(launchPending) { state, pending -> effectiveLifecycle(state, pending) }
         .stateIn(scope, SharingStarted.Eagerly, effectiveLifecycle(runtime.state.value, false))
+    private val busyUpdates: StateFlow<Boolean> = runtime.quiescent
+        .combine(launchPending) { quiescent, pending -> pending || !quiescent }
+        .stateIn(scope, SharingStarted.Eagerly, launchPending.value || !runtime.quiescent.value)
+    private val busyFlow: StateFlow<Boolean> = object : StateFlow<Boolean> by busyUpdates {
+        // combine/stateIn propagation is asynchronous; imperative duplicate/stop
+        // decisions require an exact current snapshot.
+        override val value: Boolean
+            get() = launchPending.value || !runtime.quiescent.value
+    }
 
     init {
         require(runtime.vmId == VmId.DEFAULT) { "Only the default VM runtime is supported" }
@@ -187,6 +201,16 @@ class DefaultVmManager internal constructor(
     override fun lifecycle(vmId: VmId): StateFlow<VmLifecycleState> {
         requireDefault(vmId)
         return lifecycleFlow
+    }
+
+    override fun quiescent(vmId: VmId): StateFlow<Boolean> {
+        requireDefault(vmId)
+        return runtime.quiescent
+    }
+
+    override fun busy(vmId: VmId): StateFlow<Boolean> {
+        requireDefault(vmId)
+        return busyFlow
     }
 
     override suspend fun list(vmId: VmId): List<VmSummary> = withTree(vmId) {
@@ -215,7 +239,7 @@ class DefaultVmManager internal constructor(
     override suspend fun start(vmId: VmId) {
         awaitInitial(vmId)
         lifecycleMutex.withLock {
-            check(runtime.quiescent.value) { "Cannot start while previous VM cleanup is incomplete" }
+            check(!busyFlow.value) { "Cannot start while previous VM work or cleanup is incomplete" }
             installer.withExclusiveTree(vmId) { lease ->
                 ensureInstalledLocked(vmId, lease)
                 startLocked(vmId)
@@ -237,7 +261,7 @@ class DefaultVmManager internal constructor(
         awaitInitial(vmId)
         // Duplicate delivery while the replacement boot is already in progress
         // is satisfied by that in-flight replacement; do not stop it again.
-        if (runtime.state.value is VmState.Starting && !runtime.quiescent.value) return
+        if (busyFlow.value && runtime.state.value is VmState.Starting) return
         requestStop(force = false).await()
         lifecycleMutex.withLock {
             check(runtime.quiescent.value) { "Cannot restart while VM cleanup is incomplete" }
@@ -294,6 +318,7 @@ class DefaultVmManager internal constructor(
             val plan = configuration.launchPlan(vmId)
             require(plan.config.vmId == vmId) { "Launch plan VM id mismatch" }
             val task = scope.async { runtime.start(plan) }
+            startTask = task
 
             val accepted = withTimeoutOrNull(startAcceptanceTimeoutMs) {
                 while (!isRuntimeActive() && runtime.state.value !is VmState.Error && !task.isCompleted) {
@@ -302,23 +327,21 @@ class DefaultVmManager internal constructor(
                 true
             } ?: false
             if (!accepted) {
-                task.cancel()
-                runtime.forceStop()
-                // Keep the start deadline bounded, but give the backend's force
-                // behavior its documented cleanup window before returning.
-                awaitQuiescence(forceStopTimeoutMs)
+                // Make force intent authoritative before cancelling the owned
+                // start task, so a backend stalled before process assignment can
+                // observe the stop generation and must not launch later.
+                forceCleanupWithin(forceStopTimeoutMs)
+                // Keep the start deadline bounded, but give backend cleanup and
+                // owned-task joining one shared documented force window.
                 throw IOException("VM start was not accepted within ${startAcceptanceTimeoutMs}ms")
             }
             if (task.isCompleted) task.await()
             val error = runtime.state.value as? VmState.Error
             if (error != null) {
-                // A backend that reports Error must not leave its launch task
-                // unbounded. Give normal cleanup the acceptance budget, then
-                // cancel the manager-owned task before returning the failure.
-                if (!task.isCompleted) {
-                    withTimeoutOrNull(startAcceptanceTimeoutMs) { task.join() }
-                    if (!task.isCompleted) task.cancel()
-                }
+                // Error does not imply cleanup. Keep a still-active start task
+                // owned and routable so stop/force retry can complete the same
+                // generation; cancellation is reserved for an authoritative
+                // force request.
                 throw IOException("VM start failed: ${error.message}")
             }
             check(isRuntimeActive()) { "VM backend returned before reaching an active state" }
@@ -381,10 +404,22 @@ class DefaultVmManager internal constructor(
     }
 
     private suspend fun forceAndAwaitQuiescence() {
-        runtime.forceStop()
-        check(awaitQuiescence(forceStopTimeoutMs)) {
+        // Stop intent must be visible to the backend generation before its
+        // manager-owned start coroutine is cancelled.
+        check(forceCleanupWithin(forceStopTimeoutMs)) {
             "VM backend cleanup did not complete within the force-stop deadline"
         }
+    }
+
+    private suspend fun forceCleanupWithin(timeoutMs: Long): Boolean {
+        runtime.forceStop()
+        val task = startTask
+        if (task?.isActive == true) task.cancel()
+        return withTimeoutOrNull(timeoutMs) {
+            task?.join()
+            if (!runtime.quiescent.value) runtime.quiescent.first { it }
+            true
+        } == true
     }
 
     private suspend fun awaitQuiescenceOrForce(

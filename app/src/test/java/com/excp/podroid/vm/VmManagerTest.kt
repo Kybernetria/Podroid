@@ -289,6 +289,71 @@ class VmManagerTest {
     }
 
     @Test
+    fun `busy and quiescence expose launch ownership through terminal cleanup`() = runBlocking {
+        val runtime = FakeRuntime()
+        val startEntered = CompletableDeferred<Unit>()
+        val releaseStart = CompletableDeferred<Unit>()
+        runtime.onStart = {
+            runtime.state.value = VmState.Starting
+            startEntered.complete(Unit)
+            releaseStart.await()
+        }
+        val manager = manager(runtime = runtime)
+
+        val start = async(Dispatchers.Default) { manager.start(VmId.DEFAULT) }
+        startEntered.await()
+        start.await()
+        assertTrue(manager.busy(VmId.DEFAULT).value)
+        assertFalse(manager.quiescent(VmId.DEFAULT).value)
+
+        runtime.state.value = VmState.Error("cleanup rejected")
+        assertTrue(manager.busy(VmId.DEFAULT).value)
+        assertFalse(manager.quiescent(VmId.DEFAULT).value)
+
+        runtime.quiescent.value = true
+        releaseStart.complete(Unit)
+        repeat(20) {
+            if (!manager.busy(VmId.DEFAULT).value) return@repeat
+            delay(5)
+        }
+        assertFalse(manager.busy(VmId.DEFAULT).value)
+        assertTrue(manager.quiescent(VmId.DEFAULT).value)
+    }
+
+    @Test
+    fun `force intent precedes cancellation and joins manager owned start task`() = runBlocking {
+        val runtime = FakeRuntime()
+        val startEntered = CompletableDeferred<Unit>()
+        val startFinished = CompletableDeferred<Unit>()
+        val events = mutableListOf<String>()
+        runtime.onStart = {
+            runtime.state.value = VmState.Starting
+            startEntered.complete(Unit)
+            try {
+                CompletableDeferred<Unit>().await()
+            } finally {
+                events += "start-finished"
+                startFinished.complete(Unit)
+            }
+        }
+        runtime.onForceStop = {
+            events += "force"
+            runtime.state.value = VmState.Stopped
+            runtime.quiescent.value = true
+        }
+        val manager = manager(runtime = runtime)
+
+        val start = async(Dispatchers.Default) { manager.start(VmId.DEFAULT) }
+        startEntered.await()
+        start.await()
+        manager.forceStop(VmId.DEFAULT)
+
+        startFinished.await()
+        assertEquals(listOf("force", "start-finished"), events)
+        assertTrue(manager.quiescent(VmId.DEFAULT).value)
+    }
+
+    @Test
     fun `error is not safe and destructive operations reject until cleanup completes`() = runBlocking {
         val runtime = FakeRuntime().apply {
             state.value = VmState.Error("stop rejected")

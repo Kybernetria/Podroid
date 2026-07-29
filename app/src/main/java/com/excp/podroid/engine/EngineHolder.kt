@@ -32,10 +32,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
@@ -80,10 +78,9 @@ class EngineHolder @Inject constructor(
     // exactly once; both callers pass the same resolved firstPick value anyway.
     private val firstPickPublished = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    private val _currentFlow: MutableStateFlow<VmEngine> =
-        MutableStateFlow(qemuProvider.get())
-    val currentFlow: StateFlow<VmEngine> = _currentFlow.asStateFlow()
-    private val current: VmEngine get() = _currentFlow.value
+    private val engineRouter = EngineClaimRouter<VmEngine>(qemuProvider.get())
+    val currentFlow: StateFlow<VmEngine> = engineRouter.routed
+    private val current: VmEngine get() = currentFlow.value
 
     /** Last rule set we pushed into the engine, used to compute add/remove diffs. */
     @Volatile private var appliedRules: Set<PortForwardRule> = emptySet()
@@ -263,39 +260,52 @@ class EngineHolder @Inject constructor(
      * the sole writer thereafter — both run on the single-thread scope, so the
      * flag check + write don't interleave.
      */
-    private fun publishFirstPick(first: VmEngine) {
+    private suspend fun publishFirstPick(first: VmEngine) {
         if (!firstPickPublished.compareAndSet(false, true)) return
-        if (first !== _currentFlow.value) {
-            android.util.Log.i(TAG, "first pick: ${_currentFlow.value.backendId} → ${first.backendId}")
+        val previous = engineRouter.selectedSnapshot
+        if (engineRouter.publishInitial(first) && first !== previous) {
+            android.util.Log.i(TAG, "first pick: ${previous.backendId} → ${first.backendId}")
             // Fresh selection: this engine has not been started this cycle, so its
             // surfaced state is normalized to Idle until start() runs.
             startedEngine = null
-            _currentFlow.value = first
         }
     }
 
     private suspend fun trySwap(newSel: EngineSelection) {
-        // The swap observer drops emit #0, so it never fires before the first
-        // pick is published; firstPick is already resolved by the time a user
-        // changes the backend chip. Defensive: also wait for a swappable state
-        // even though Settings UI gates chips.
-        // Backend state can become Error before a rejected stop has released
-        // its framework handle. Swap only on the authoritative cleanup signal.
-        currentFlow.value.quiescent.first { it }
-        // A swap is the authoritative selection from here on. Mark first-pick
-        // published so a late init/start publish (firstPick that hadn't resolved
-        // when this swap fired — only possible if the user changed the backend
-        // within ~ms of cold launch) can never clobber the swapped engine.
-        firstPickPublished.set(true)
-        val next = pick(newSel)
-        if (next === currentFlow.value) return
-        android.util.Log.i(TAG, "swap: ${currentFlow.value.backendId} → ${next.backendId}")
-        appliedRules = emptySet()
-        // Fresh selection: the swapped-in @Singleton engine may retain a stale
-        // terminal state from a prior cycle; clear the marker so the state flow
-        // surfaces Idle until this engine is started again.
-        startedEngine = null
-        _currentFlow.value = next
+        // Quiescence may change while pick() performs binder work. Publication
+        // and start claim therefore share EngineClaimRouter's short gate and
+        // recheck the observed engine under it. If start wins, keep routing to
+        // that claimed engine until cleanup and retry the selection afterwards.
+        while (true) {
+            val observed = engineRouter.selectedSnapshot
+            observed.quiescent.first { it }
+            firstPickPublished.set(true)
+            val next = pick(newSel)
+            val published = engineRouter.publishSelection(
+                expected = observed,
+                next = next,
+                canPublish = { it.quiescent.value },
+            )
+            if (published) {
+                if (next !== observed) {
+                    android.util.Log.i(TAG, "swap: ${observed.backendId} → ${next.backendId}")
+                    appliedRules = emptySet()
+                    // Fresh selection: the swapped-in @Singleton engine may retain a stale
+                    // terminal state from a prior cycle; clear the marker so the state flow
+                    // surfaces Idle until this engine is started again.
+                    startedEngine = null
+                }
+                return
+            }
+            // A lifecycle claim won the race. Do not spin or hold the gate for
+            // its lifetime; wait on the claimed engine's cleanup signal.
+            val claimed = currentFlow.value
+            claimed.quiescent.first { it }
+            // The cleanup signal itself is sufficient to release the matching
+            // claim. This also avoids a retry loop starving the watcher on the
+            // holder's single-thread dispatcher once quiescence is already true.
+            engineRouter.releaseClaim(claimed)
+        }
     }
 
     override val vmId: VmId get() = current.vmId
@@ -358,14 +368,28 @@ class EngineHolder @Inject constructor(
         } catch (e: Exception) {
             android.util.Log.w(TAG, "first pick failed; recovering for start()", e)
             runCatching { pick(settings.getEngineSelectionSnapshot()) }
-                .getOrElse { _currentFlow.value }
+                .getOrElse { currentFlow.value }
         }
         publishFirstPick(picked)
-        // Capture the launch set for the diff loop's →Running seeding, and mark
-        // this engine started so its state passes through un-normalized.
+        // The claim and a concurrent swap publish are one atomic decision. The
+        // gate is released immediately; only the engine identity remains bound
+        // until its authoritative cleanup-complete signal.
+        val claimedEngine = engineRouter.claimSelected { it.quiescent.value }
+        require(config.vmId == claimedEngine.vmId) {
+            "Engine holder ${claimedEngine.vmId.serialized} cannot start ${config.vmId.serialized}"
+        }
         launchRules = portForwards.toSet()
-        startedEngine = current
-        current.start(portForwards, config)
+        startedEngine = claimedEngine
+        try {
+            claimedEngine.start(portForwards, config)
+        } finally {
+            // AVF start may return before its lifecycle ends; QEMU normally
+            // returns after cleanup. In both cases release only after quiescence.
+            scope.launch {
+                claimedEngine.quiescent.first { it }
+                engineRouter.releaseClaim(claimedEngine)
+            }
+        }
     }
     override fun stop() = current.stop()
     override fun forceStop() = current.forceStop()

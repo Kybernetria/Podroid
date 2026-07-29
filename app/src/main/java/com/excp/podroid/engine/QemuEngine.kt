@@ -170,6 +170,8 @@ class QemuEngine @Inject constructor(
      * deadlock with cleanup()/stop().
      */
     private val startMutex = Mutex()
+    private val launchGate = QemuLaunchGate()
+    @Volatile private var activeLaunchGeneration: Long? = null
 
     /**
      * Proxy TerminalSessionClient — delegates to whatever real client is set.
@@ -284,17 +286,20 @@ class QemuEngine @Inject constructor(
         // Atomically check the re-entrancy guard AND claim Starting before any
         // I/O, so two concurrent ACTION_STARTs can't both pass the guard and
         // launch a second QEMU. Held only across the guard + state flip.
-        startMutex.withLock {
+        val generation = startMutex.withLock {
             if (!_quiescent.value || _state.value is VmState.Starting || _state.value is VmState.Running) {
                 Log.w(TAG, "start() called before prior cleanup completed (${_state.value}), ignoring")
                 return
             }
+            val claimedGeneration = launchGate.begin()
+            activeLaunchGeneration = claimedGeneration
             cleanedUp.set(false)
             // Publish before disk/process/socket resources can be acquired.
             _quiescent.value = false
             bootStartTime = System.currentTimeMillis()
             _stopping.value = false
             _state.value = VmState.Starting
+            claimedGeneration
         }
 
         val qemuExe = qemuExecutable() ?: run {
@@ -302,10 +307,7 @@ class QemuEngine @Inject constructor(
             // restore the "cleanedUp=false ⟺ a VM lifetime is in progress"
             // invariant on this early-error return, matching the other error
             // paths (which run cleanup()). No process/scope exists yet.
-            cleanedUp.set(true)
-            bootStartTime = 0L
-            _state.value = VmState.Error("QEMU binary not found.")
-            _quiescent.value = true
+            finishBeforeProcess(generation, VmState.Error("QEMU binary not found."))
             return
         }
 
@@ -316,10 +318,18 @@ class QemuEngine @Inject constructor(
         } catch (e: java.io.IOException) {
             // Restore the "cleanedUp=false ⟺ VM lifetime in progress" invariant
             // (same as the qemuExecutable() path); no process/scope exists yet.
-            cleanedUp.set(true)
-            bootStartTime = 0L
-            _state.value = VmState.Error(e.message ?: "Could not prepare the VM disk image.")
-            _quiescent.value = true
+            finishBeforeProcess(
+                generation,
+                VmState.Error(e.message ?: "Could not prepare the VM disk image."),
+            )
+            return
+        }
+
+        // stop()/forceStop() can arrive while path validation or sparse-image
+        // preparation blocks. Its generation intent wins before any process is
+        // constructed or assigned.
+        if (!launchGate.mayLaunch(generation)) {
+            finishBeforeProcess(generation, VmState.Stopped)
             return
         }
 
@@ -333,6 +343,11 @@ class QemuEngine @Inject constructor(
         // included — a leftover file from a crashed QEMU prevents the new
         // process from binding its QMP server socket.
         qemuRuntimeSockets().forEach { it.delete() }
+
+        if (!launchGate.mayLaunch(generation)) {
+            finishBeforeProcess(generation, VmState.Stopped)
+            return
+        }
 
         try {
             val cmd = buildCommand(qemuExe, portForwards, config)
@@ -360,8 +375,24 @@ class QemuEngine @Inject constructor(
             // Recheck after disk preparation/socket cleanup and directly before
             // the irreversible process launch.
             pathSecurity.validateForLaunch()
-            val proc = withContext(dispatcher) { pb.start() }
-            process = proc
+            val proc = withContext(dispatcher) {
+                // Final check on the process-owning thread, immediately before
+                // ProcessBuilder.start(). A force observed during preparation
+                // therefore prevents a later launch.
+                if (launchGate.mayLaunch(generation)) pb.start() else null
+            }
+            if (proc == null) {
+                finishBeforeProcess(generation, VmState.Stopped)
+                return
+            }
+            if (!launchGate.commitLaunch(generation) { process = proc }) {
+                // Stop intent landed while ProcessBuilder.start() was in flight,
+                // before assignment. Reap the uncommitted child immediately.
+                proc.destroyForcibly()
+                withContext(dispatcher) { proc.waitFor() }
+                finishBeforeProcess(generation, VmState.Stopped)
+                return
+            }
             _bootStage.value = "Booting kernel..."
 
             val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -481,11 +512,12 @@ class QemuEngine @Inject constructor(
      * called cleanup() concurrently and fought over _state.value.
      */
     override fun stop() {
+        if (launchGate.requestStop() == null) return
+        _stopping.value = true
         val proc = process ?: return
         // Signal "shutting down" immediately so the UI reflects the stop while the
         // process tears down (state stays Running until cleanup() runs). Cleared in
         // cleanup() on the →Stopped/Error transition.
-        _stopping.value = true
         // Issue the graceful SIGTERM immediately (non-blocking), then run the
         // graceful-wait → forceful-escalation off the caller's thread. stop() is
         // called from PodroidService on the main thread, so blocking up to ~5s
@@ -506,9 +538,9 @@ class QemuEngine @Inject constructor(
     }
 
     override fun forceStop() {
-        val proc = process ?: return
+        if (launchGate.requestStop() == null) return
         _stopping.value = true
-        proc.destroyForcibly()
+        process?.destroyForcibly()
     }
 
     override fun openHostTransport(): com.excp.podroid.engine.hostbridge.HostTransport? =
@@ -535,6 +567,13 @@ class QemuEngine @Inject constructor(
             .getOrThrow()
     }
 
+    private fun finishBeforeProcess(generation: Long, terminalState: VmState) {
+        check(process == null) { "Pre-process cleanup cannot own a QEMU process" }
+        cleanup()
+        _state.value = terminalState
+        launchGate.complete(generation)
+    }
+
     @Synchronized
     private fun cleanup() {
         if (cleanedUp.getAndSet(true)) return
@@ -555,6 +594,8 @@ class QemuEngine @Inject constructor(
         _runningSinceMs = null
         qemuRuntimeSockets().forEach { it.delete() }
         _bootStage.value = ""
+        activeLaunchGeneration?.let(launchGate::complete)
+        activeLaunchGeneration = null
         // Last cleanup write: terminal UI state may have changed earlier, but
         // destructive manager operations are released only after this point.
         _quiescent.value = true
