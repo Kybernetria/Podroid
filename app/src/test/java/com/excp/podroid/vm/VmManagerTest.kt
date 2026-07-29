@@ -444,6 +444,199 @@ class VmManagerTest {
     }
 
     @Test
+    fun `newer start prepared before final stop admission prevents backend stop`() = runBlocking {
+        val supervisor = FakeSupervisor()
+        val stopAtFence = CompletableDeferred<Unit>()
+        val releaseStopFence = CompletableDeferred<Unit>()
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+        }
+        val manager = manager(
+            runtime = runtime,
+            supervisor = supervisor,
+            beforeFinalStopAuthorization = { command ->
+                if (command.operation == LifecycleOperation.STOP) {
+                    stopAtFence.complete(Unit)
+                    releaseStopFence.await()
+                }
+            },
+        )
+        val stop = manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.STOP, 1L)
+        val stopExecution = async(Dispatchers.Default) {
+            manager.executePrepared(VmId.DEFAULT, stop)
+        }
+        stopAtFence.await()
+
+        val newerStart = manager.prepareLifecycleCommand(
+            VmId.DEFAULT,
+            LifecycleOperation.START,
+            2L,
+        )
+        releaseStopFence.complete(Unit)
+
+        assertFalse(stopExecution.await())
+        assertEquals(0, runtime.stopCalls)
+        assertEquals(0, runtime.forceStopCalls)
+        assertEquals(newerStart.id, supervisor.snapshot().latestTransaction?.id)
+        assertEquals(VmDesiredState.RUNNING, supervisor.snapshot().desiredState)
+    }
+
+    @Test
+    fun `newer start prepared before final force admission prevents backend force`() = runBlocking {
+        val supervisor = FakeSupervisor()
+        val forceAtFence = CompletableDeferred<Unit>()
+        val releaseForceFence = CompletableDeferred<Unit>()
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+        }
+        val manager = manager(
+            runtime = runtime,
+            supervisor = supervisor,
+            beforeFinalStopAuthorization = { command ->
+                if (command.operation == LifecycleOperation.FORCE_STOP) {
+                    forceAtFence.complete(Unit)
+                    releaseForceFence.await()
+                }
+            },
+        )
+        val force = manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.FORCE_STOP, 1L)
+        val forceExecution = async(Dispatchers.Default) {
+            manager.executePrepared(VmId.DEFAULT, force)
+        }
+        forceAtFence.await()
+
+        manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.START, 2L)
+        releaseForceFence.complete(Unit)
+
+        assertFalse(forceExecution.await())
+        assertEquals(0, runtime.forceStopCalls)
+        assertEquals(0, runtime.stopCalls)
+    }
+
+    @Test
+    fun `newer start after admitted stop waits without holding authority then launches once`() = runBlocking {
+        val supervisor = FakeSupervisor()
+        val stopTaskEstablished = CompletableDeferred<Unit>()
+        val releaseStopTask = CompletableDeferred<Unit>()
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+        }
+        val manager = manager(
+            runtime = runtime,
+            supervisor = supervisor,
+            beforeCoordinatedStop = {
+                stopTaskEstablished.complete(Unit)
+                releaseStopTask.await()
+            },
+        )
+        val stop = manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.STOP, 1L)
+        val stopExecution = async(Dispatchers.Default) {
+            manager.executePrepared(VmId.DEFAULT, stop)
+        }
+        stopTaskEstablished.await()
+
+        // Preparation must complete after task admission but before that task
+        // can issue runtime.stop(): command authority is not held for cleanup.
+        val newerStart = manager.prepareLifecycleCommand(
+            VmId.DEFAULT,
+            LifecycleOperation.START,
+            2L,
+        )
+        val startExecution = async(Dispatchers.Unconfined) {
+            manager.executePrepared(VmId.DEFAULT, newerStart)
+        }
+        assertFalse(startExecution.isCompleted)
+        assertEquals(0, runtime.stopCalls)
+        assertEquals(0, runtime.startCalls)
+
+        releaseStopTask.complete(Unit)
+        stopExecution.await()
+        assertTrue(startExecution.await())
+
+        assertEquals(1, runtime.stopCalls)
+        assertEquals(1, runtime.startCalls)
+        assertEquals(1L, supervisor.snapshot().runtimeGeneration)
+        assertEquals(newerStart.id, supervisor.snapshot().latestTransaction?.id)
+    }
+
+    @Test
+    fun `newer start after admitted force waits then launches one generation`() = runBlocking {
+        val supervisor = FakeSupervisor()
+        val forceIssued = CompletableDeferred<Unit>()
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+            onForceStop = { forceIssued.complete(Unit) }
+        }
+        val manager = manager(runtime = runtime, supervisor = supervisor)
+        val force = manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.FORCE_STOP, 1L)
+        val forceExecution = async(Dispatchers.Default) {
+            manager.executePrepared(VmId.DEFAULT, force)
+        }
+        forceIssued.await()
+
+        val newerStart = manager.prepareLifecycleCommand(
+            VmId.DEFAULT,
+            LifecycleOperation.START,
+            2L,
+        )
+        val startExecution = async(Dispatchers.Unconfined) {
+            manager.executePrepared(VmId.DEFAULT, newerStart)
+        }
+        assertFalse(startExecution.isCompleted)
+
+        runtime.state.value = VmState.Stopped
+        runtime.quiescent.value = true
+        forceExecution.await()
+        assertTrue(startExecution.await())
+
+        assertEquals(1, runtime.forceStopCalls)
+        assertEquals(0, runtime.stopCalls)
+        assertEquals(1, runtime.startCalls)
+        assertEquals(1L, supervisor.snapshot().runtimeGeneration)
+    }
+
+    @Test
+    fun `newer start superseding admitted restart shutdown launches replacement once`() = runBlocking {
+        val supervisor = FakeSupervisor()
+        val stopIssued = CompletableDeferred<Unit>()
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+            onStop = { stopIssued.complete(Unit) }
+        }
+        val manager = manager(runtime = runtime, supervisor = supervisor)
+        val restart = manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.RESTART, 1L)
+        val restartExecution = async(Dispatchers.Default) {
+            manager.executePrepared(VmId.DEFAULT, restart)
+        }
+        stopIssued.await()
+
+        val newerStart = manager.prepareLifecycleCommand(
+            VmId.DEFAULT,
+            LifecycleOperation.START,
+            2L,
+        )
+        val startExecution = async(Dispatchers.Unconfined) {
+            manager.executePrepared(VmId.DEFAULT, newerStart)
+        }
+        assertFalse(startExecution.isCompleted)
+
+        runtime.state.value = VmState.Stopped
+        runtime.quiescent.value = true
+        assertFalse(restartExecution.await())
+        assertTrue(startExecution.await())
+
+        assertEquals(1, runtime.stopCalls)
+        assertEquals(1, runtime.startCalls)
+        assertEquals(1L, supervisor.snapshot().runtimeGeneration)
+        assertEquals(newerStart.id, supervisor.snapshot().latestTransaction?.id)
+    }
+
+    @Test
     fun `queued start authority is durable before later execution`() = runBlocking {
         val supervisor = FakeSupervisor()
         val manager = manager(supervisor = supervisor)
@@ -958,6 +1151,8 @@ class VmManagerTest {
         supervisor: HostSupervisorTransactions = FakeSupervisor(),
         guestTimeoutMs: Long = 50,
         beforeFinalLaunchAuthorization: suspend (LifecycleTransactionToken) -> Unit = {},
+        beforeFinalStopAuthorization: suspend (LifecycleTransactionToken) -> Unit = {},
+        beforeCoordinatedStop: suspend () -> Unit = {},
     ): DefaultVmManager {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default).also(scopes::add)
         return DefaultVmManager(
@@ -973,6 +1168,8 @@ class VmManagerTest {
             forceStopTimeoutMs = 100,
             qmpTimeoutMs = 100,
             beforeFinalLaunchAuthorization = beforeFinalLaunchAuthorization,
+            beforeFinalStopAuthorization = beforeFinalStopAuthorization,
+            beforeCoordinatedStop = beforeCoordinatedStop,
         )
     }
 

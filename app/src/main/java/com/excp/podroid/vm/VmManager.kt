@@ -21,6 +21,7 @@ import java.util.ArrayDeque
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
@@ -241,8 +242,10 @@ class DefaultVmManager internal constructor(
     private val backendStopTimeoutMs: Long = 15_000L,
     private val forceStopTimeoutMs: Long = 7_000L,
     private val qmpTimeoutMs: Long = 5_000L,
-    /** Deterministic seam immediately before the final command-authority fence. */
+    /** Deterministic test seams around command admission and backend task dispatch. */
     private val beforeFinalLaunchAuthorization: suspend (LifecycleTransactionToken) -> Unit = {},
+    private val beforeFinalStopAuthorization: suspend (LifecycleTransactionToken) -> Unit = {},
+    private val beforeCoordinatedStop: suspend () -> Unit = {},
 ) : VmManager {
     private val lifecycleMutex = Mutex()
     private val stopTaskMutex = Mutex()
@@ -406,11 +409,11 @@ class DefaultVmManager internal constructor(
                         }
                         LifecycleOperation.START -> startEffect(vmId, command)
                         LifecycleOperation.STOP -> {
-                            stopEffect(vmId, force = false)
+                            stopEffect(vmId, command, force = false)
                             false
                         }
                         LifecycleOperation.FORCE_STOP -> {
-                            stopEffect(vmId, force = true)
+                            stopEffect(vmId, command, force = true)
                             false
                         }
                         LifecycleOperation.RESTART -> restartEffect(vmId, command)
@@ -606,6 +609,10 @@ class DefaultVmManager internal constructor(
         command: LifecycleTransactionToken,
     ): Boolean {
         awaitInitial(vmId)
+        // An older STOP may already own cleanup even while the runtime still
+        // reports Running. Join it before deciding that this newer START is a
+        // duplicate; the final launch fence below still rejects a newer STOP.
+        awaitStoppingRuntimeBeforeStart()
         return lifecycleMutex.withLock {
             if (isRuntimeActive()) return@withLock false
             check(!busyFlow.value) { "Cannot start while previous VM work or cleanup is incomplete" }
@@ -622,9 +629,22 @@ class DefaultVmManager internal constructor(
         }
     }
 
-    private suspend fun stopEffect(vmId: VmId, force: Boolean) {
+    private suspend fun stopEffect(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+        force: Boolean,
+    ): Boolean {
         awaitInitial(vmId)
-        requestStop(force).await()
+        beforeFinalStopAuthorization(command)
+        val admittedTask = commandAuthorityMutex.withLock {
+            if (!supervisor.isCurrent(command)) return@withLock null
+            // Establish or join the backend stop while command preparation is
+            // excluded. Quiescence is deliberately awaited after releasing
+            // authority so a newer START can durably supersede this command.
+            requestStop(force)
+        } ?: return false
+        awaitStopTask(admittedTask)
+        return true
     }
 
     /** One durable RESTART remains pending across the stop-to-start handoff. */
@@ -636,7 +656,7 @@ class DefaultVmManager internal constructor(
         // Duplicate direct convenience calls during an already accepted
         // replacement do not create another replacement generation.
         if (runtime.state.value is VmState.Starting && !runtime.quiescent.value) return false
-        requestStop(force = false).await()
+        if (!stopEffect(vmId, command, force = false)) return false
         lifecycleMutex.withLock {
             check(runtime.quiescent.value) { "Cannot restart while VM cleanup is incomplete" }
             return installer.withExclusiveTree(vmId) { lease ->
@@ -651,6 +671,35 @@ class DefaultVmManager internal constructor(
                 withCurrentCommand(command) { startLocked(plan) }
             }
         }
+    }
+
+    private suspend fun awaitStoppingRuntimeBeforeStart() {
+        stopTask?.takeIf { it.isActive }?.let { awaitStopTask(it) }
+        if (runtime.stopping.value && !runtime.quiescent.value) {
+            val stopped = withTimeoutOrNull(stopCompletionTimeoutMs()) {
+                while (!runtime.quiescent.value) delay(STOP_POLL_MS)
+                true
+            } == true
+            if (!stopped) throw IOException("VM stop did not complete within the bounded deadline")
+        }
+    }
+
+    private suspend fun awaitStopTask(task: Deferred<Unit>) {
+        val stopped = withTimeoutOrNull(stopCompletionTimeoutMs()) {
+            task.await()
+            true
+        } == true
+        if (!stopped) throw IOException("VM stop did not complete within the bounded deadline")
+    }
+
+    private fun stopCompletionTimeoutMs(): Long = listOf(
+        startAcceptanceTimeoutMs,
+        qmpTimeoutMs,
+        guestShutdownTimeoutMs,
+        backendStopTimeoutMs,
+        forceStopTimeoutMs,
+    ).fold(0L) { total, timeout ->
+        if (Long.MAX_VALUE - total < timeout) Long.MAX_VALUE else total + timeout
     }
 
     /**
@@ -747,9 +796,15 @@ class DefaultVmManager internal constructor(
         val forceSignal = CompletableDeferred<Unit>()
         if (force) forceSignal.complete(Unit)
         stopForceSignal = forceSignal
-        scope.async {
+        val task = scope.async(start = CoroutineStart.LAZY) {
+            beforeCoordinatedStop()
             lifecycleMutex.withLock { coordinatedStopLocked(forceSignal) }
-        }.also { stopTask = it }
+        }
+        // Publish ownership before dispatch so a superseding START cannot miss
+        // a task that has begun but has not yet reached its backend signal.
+        stopTask = task
+        task.start()
+        task
     }
 
     private suspend fun coordinatedStopLocked(forceSignal: CompletableDeferred<Unit>) {
