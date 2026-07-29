@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.verify_ui_vm_boundary import verify
+from tests.verify_ui_vm_boundary import verify, verify_project
 
 
 class UiVmBoundaryVerifierTest(unittest.TestCase):
@@ -14,6 +14,49 @@ class UiVmBoundaryVerifierTest(unittest.TestCase):
 
     def assert_rejected(self, source: str):
         self.assertTrue(self.verify_source(source), source)
+
+    def test_missing_and_empty_ui_roots_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            missing = temporary / "missing"
+            self.assertTrue(any("missing" in failure for failure in verify(missing)))
+
+            empty = temporary / "empty"
+            empty.mkdir()
+            self.assertTrue(any("no Kotlin sources" in failure for failure in verify(empty)))
+
+    def test_project_requires_at_least_one_production_ui_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            failures = verify_project(Path(directory))
+            self.assertTrue(any("no production UI roots" in failure for failure in failures))
+
+    def test_project_scans_main_kotlin_and_variant_java_ui_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            main_ui = repository / "app/src/main/kotlin/com/excp/podroid/ui"
+            variant_ui = repository / "app/src/demo/java/com/excp/podroid/ui/screens"
+            main_ui.mkdir(parents=True)
+            variant_ui.mkdir(parents=True)
+            (main_ui / "MainScreen.kt").write_text(
+                "fun bad(engine: VmEngine) = engine",
+                encoding="utf-8",
+            )
+            (variant_ui / "DemoScreen.kt").write_text(
+                "fun bad(paths: VmPaths) = paths",
+                encoding="utf-8",
+            )
+
+            failures = verify_project(repository)
+
+            self.assertTrue(any("MainScreen.kt" in failure for failure in failures))
+            self.assertTrue(any("DemoScreen.kt" in failure for failure in failures))
+
+    def test_project_rejects_discovered_empty_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            (repository / "app/src/main/kotlin/com/excp/podroid/ui").mkdir(parents=True)
+            failures = verify_project(repository)
+            self.assertTrue(any("no Kotlin sources" in failure for failure in failures))
 
     def test_accepts_service_client_and_reviewed_dtos(self):
         self.assertEqual([], self.verify_source(

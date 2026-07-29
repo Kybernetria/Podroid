@@ -98,6 +98,9 @@ ALLOWED_PATH_EXPRESSIONS_BY_SUFFIX = {
     ),
 }
 
+NON_PRODUCTION_SOURCE_SET_PREFIXES = ("androidTest", "test")
+UI_PACKAGE_PARTS = ("com", "excp", "podroid", "ui")
+
 
 def _without_comments(text: str) -> str:
     return re.sub(r"/\*.*?\*/|//[^\n]*", "", text, flags=re.S)
@@ -113,8 +116,16 @@ def _without_comments_or_strings(text: str) -> str:
 
 
 def verify(root: Path) -> list[str]:
+    if not root.exists():
+        return [f"{root}: production UI root is missing"]
+    if not root.is_dir():
+        return [f"{root}: production UI root is not a directory"]
+    kotlin_sources = sorted(root.rglob("*.kt"))
+    if not kotlin_sources:
+        return [f"{root}: production UI root contains no Kotlin sources"]
+
     failures: list[str] = []
-    for path in sorted(root.rglob("*.kt")):
+    for path in kotlin_sources:
         text = path.read_text(encoding="utf-8")
         uncommented = _without_comments(text)
         # Kotlin permits backtick-escaped identifiers in imports and qualified
@@ -151,11 +162,43 @@ def verify(root: Path) -> list[str]:
     return failures
 
 
+def production_ui_roots(repo_root: Path) -> list[Path]:
+    app_src = repo_root / "app" / "src"
+    if not app_src.is_dir():
+        return []
+    roots: list[Path] = []
+    for source_set in sorted(app_src.iterdir()):
+        if not source_set.is_dir() or source_set.name.startswith(
+            NON_PRODUCTION_SOURCE_SET_PREFIXES
+        ):
+            continue
+        for language in ("java", "kotlin"):
+            candidate = source_set / language
+            for part in UI_PACKAGE_PARTS:
+                candidate /= part
+            if candidate.exists():
+                roots.append(candidate)
+    return roots
+
+
+def verify_project(repo_root: Path) -> list[str]:
+    roots = production_ui_roots(repo_root)
+    if not roots:
+        return [
+            f"{repo_root / 'app' / 'src'}: no production UI roots found under "
+            "*/{java,kotlin}/com/excp/podroid/ui"
+        ]
+    failures: list[str] = []
+    for root in roots:
+        failures.extend(verify(root))
+    return failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("root", nargs="?", default="app/src/main/java/com/excp/podroid/ui")
+    parser.add_argument("repo_root", nargs="?", default=".")
     args = parser.parse_args()
-    failures = verify(Path(args.root))
+    failures = verify_project(Path(args.repo_root))
     if failures:
         print("UI VM boundary verification failed:", file=sys.stderr)
         for failure in failures:

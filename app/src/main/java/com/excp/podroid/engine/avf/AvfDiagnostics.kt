@@ -26,9 +26,11 @@ import com.excp.podroid.vm.VmPathSecurity
 import com.excp.podroid.vm.VmPaths
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** One-line entries in the diagnostic report; UI just joins them. */
 data class AvfReport(
@@ -157,25 +159,63 @@ object AvfDiagnostics {
 
     internal fun boundSmokeTestResult(result: String): String = result.take(MAX_SMOKE_RESULT_CHARS)
 
+    /** Returns the caller's remaining total budget, or null when readiness never arrives. */
+    internal suspend fun awaitSmokeReadiness(
+        totalTimeoutMs: Long,
+        nanoTime: () -> Long = System::nanoTime,
+        awaitReady: suspend () -> Unit,
+    ): Long? {
+        require(totalTimeoutMs > 0) { "totalTimeoutMs must be positive" }
+        val startedNanos = nanoTime()
+        val ready = withTimeoutOrNull(totalTimeoutMs) {
+            awaitReady()
+            true
+        } ?: return null
+        check(ready)
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(
+            (nanoTime() - startedNanos).coerceAtLeast(0L),
+        )
+        return (totalTimeoutMs - elapsedMs).coerceAtLeast(0L)
+    }
+
     private data class SmokeSetup(val manager: Any, val config: Any)
     private class SmokeOutcome(val result: String) : IOException(result)
 
     private suspend fun runSmokeTestOnIo(context: Context, vmPaths: VmPaths): String {
         val application = context.applicationContext as? PodroidApplication
             ?: return "FAILED: Podroid application readiness gate unavailable"
-        try {
-            application.awaitAssetsReady()
+        val remainingTimeoutMs = try {
+            awaitSmokeReadiness(TOTAL_SMOKE_TIMEOUT_MS) {
+                application.awaitAssetsReady()
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Throwable) {
             return "FAILED: default VM migration/assets unavailable: ${failureSummary(failure)}"
+        } ?: return "FAILED: AVF smoke readiness exceeded total ${TOTAL_SMOKE_TIMEOUT_MS}ms deadline"
+        if (remainingTimeoutMs < MIN_EXECUTOR_BUDGET_MS) {
+            return "FAILED: AVF smoke readiness exhausted total ${TOTAL_SMOKE_TIMEOUT_MS}ms deadline"
         }
 
+        // The operation and final-cleanup waits share the budget left by asset
+        // readiness, so the complete Binder smoke call is not readiness time
+        // plus a fresh set of backend deadlines.
+        val operationTimeoutMs = minOf(
+            AvfSmokeTestExecutor.DEFAULT_OPERATION_TIMEOUT_MS,
+            remainingTimeoutMs - 1L,
+        )
+        val cleanupTimeoutMs = minOf(
+            AvfSmokeTestExecutor.DEFAULT_CLEANUP_TIMEOUT_MS,
+            remainingTimeoutMs - operationTimeoutMs,
+        )
         val pathSecurity = VmPathSecurity(vmPaths)
         val kernelSrc = vmPaths.kernel
         val initrd = vmPaths.initrd
         val name = SMOKE_VM_NAME
-        val execution = AvfSmokeTestExecutor().execute(
+        val execution = AvfSmokeTestExecutor(
+            operationTimeoutMs = operationTimeoutMs,
+            cleanupTimeoutMs = cleanupTimeoutMs,
+        ).execute(
             setup = {
                 try {
                     pathSecurity.validateForLaunch()
@@ -231,16 +271,18 @@ object AvfDiagnostics {
         )
 
         if (execution.busy) {
-            return "FAILED: another AVF smoke attempt is still active; no concurrent attempt was started"
+            return "FAILED: another AVF smoke operation/final cleanup is pending; " +
+                "admission remains closed and no concurrent attempt was started"
         }
         val deleteStatus = when {
+            execution.cleanupPending -> "named delete=pending; admission remains closed"
             !execution.deleteAttempted -> "named delete=not needed"
             execution.deleteFailure == null -> "named delete=completed"
             else -> "named delete=${failureSummary(execution.deleteFailure)}"
         }
         if (execution.timedOut) {
             return "FAILED: caller stopped waiting after " +
-                "${AvfSmokeTestExecutor.DEFAULT_OPERATION_TIMEOUT_MS}ms at ${execution.timeoutStage}; " +
+                "${operationTimeoutMs}ms at ${execution.timeoutStage}; " +
                 "cancellation was requested best-effort and vendor work may still be running; " +
                 deleteStatus
         }
@@ -370,4 +412,6 @@ object AvfDiagnostics {
 
     private const val SMOKE_VM_NAME = "podroid-avf-smoke"
     private const val MAX_SMOKE_RESULT_CHARS = 4 * 1024
+    private const val TOTAL_SMOKE_TIMEOUT_MS = 15_000L
+    private const val MIN_EXECUTOR_BUDGET_MS = 2L
 }

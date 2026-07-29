@@ -17,9 +17,11 @@ import com.excp.podroid.vm.VmStatus
 import com.excp.podroid.vm.VmSummary
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -88,6 +90,28 @@ class VmServiceContractTest {
     }
 
     @Test
+    fun `Binder smoke path bounds forever pending readiness and releases command admission`() = runBlocking {
+        val manager = FakeManager()
+        val neverReady = object : VmServiceAuxiliaryCapabilities by FakeAuxiliary {
+            override suspend fun runBackendSmokeTest(): String = awaitCancellation()
+        }
+        val endpoint = endpoint(
+            manager = manager,
+            auxiliary = neverReady,
+            backendSmokeTotalDeadlineMs = 50,
+        )
+        val startedNanos = System.nanoTime()
+
+        val result = endpoint.runBackendSmokeTest()
+        endpoint.status()
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos)
+
+        assertTrue(result.contains("exceeded total 50ms Binder deadline"))
+        assertEquals(listOf("status"), manager.calls)
+        assertTrue("elapsed=${elapsedMs}ms", elapsedMs < 500)
+    }
+
+    @Test
     fun `binding loss keeps last DTO and rebind mirrors fresh state without stop`() = runBlocking {
         val scopeJob = SupervisorJob()
         val scope = CoroutineScope(scopeJob + Dispatchers.Default)
@@ -140,7 +164,15 @@ class VmServiceContractTest {
         manager: VmManager = FakeManager(),
         verifier: CallerUidVerifier = CallerUidVerifier { },
         lifecycle: VmServiceLifecycleCommands = NoopLifecycle,
-    ) = LocalVmServiceEndpoint(manager, lifecycle, FakeAuxiliary, verifier)
+        auxiliary: VmServiceAuxiliaryCapabilities = FakeAuxiliary,
+        backendSmokeTotalDeadlineMs: Long = 15_000,
+    ) = LocalVmServiceEndpoint(
+        manager,
+        lifecycle,
+        auxiliary,
+        verifier,
+        backendSmokeTotalDeadlineMs,
+    )
 
     private class FakeManager(
         private val onCall: () -> Unit = {},

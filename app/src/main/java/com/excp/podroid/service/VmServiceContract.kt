@@ -34,6 +34,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** DTO returned by the service-owned AVF capability probe. */
 sealed interface VmUiState {
@@ -139,8 +140,15 @@ internal class LocalVmServiceEndpoint(
     private val lifecycleCommands: VmServiceLifecycleCommands,
     private val auxiliary: VmServiceAuxiliaryCapabilities,
     private val caller: CallerUidVerifier,
+    private val backendSmokeTotalDeadlineMs: Long = DEFAULT_BACKEND_SMOKE_TOTAL_DEADLINE_MS,
 ) : VmServiceEndpoint {
     private val commands = Mutex()
+
+    init {
+        require(backendSmokeTotalDeadlineMs > 0) {
+            "backendSmokeTotalDeadlineMs must be positive"
+        }
+    }
 
     override val observation: StateFlow<VmObservation>
         get() {
@@ -180,7 +188,10 @@ internal class LocalVmServiceEndpoint(
         }
     }
     override suspend fun runBackendSmokeTest(): String = command {
-        auxiliary.runBackendSmokeTest().take(MAX_AUX_TEXT_CHARS)
+        withTimeoutOrNull(backendSmokeTotalDeadlineMs) {
+            auxiliary.runBackendSmokeTest().take(MAX_AUX_TEXT_CHARS)
+        } ?: "FAILED: backend smoke readiness exceeded total " +
+            "${backendSmokeTotalDeadlineMs}ms Binder deadline"
     }
     override suspend fun setHeadlessMode(active: Boolean) = command { auxiliary.setHeadlessMode(active) }
 
@@ -208,6 +219,7 @@ internal class LocalVmServiceEndpoint(
         private const val MAX_BACKEND_ID_CHARS = 32
         private const val MAX_SHORT_TEXT_CHARS = 256
         private const val MAX_AUX_TEXT_CHARS = 64 * 1024
+        private const val DEFAULT_BACKEND_SMOKE_TOTAL_DEADLINE_MS = 15_000L
     }
 }
 

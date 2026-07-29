@@ -123,7 +123,15 @@ val verifyUiVmBoundary by tasks.registering(Exec::class) {
     workingDir(rootProject.projectDir)
     commandLine("python3", rootProject.file("tests/verify_ui_vm_boundary.py"))
     inputs.files(
-        rootProject.fileTree("app/src/main/java/com/excp/podroid/ui") { include("**/*.kt") },
+        rootProject.fileTree("app/src") {
+            include(
+                "*/java/com/excp/podroid/ui",
+                "*/java/com/excp/podroid/ui/**",
+                "*/kotlin/com/excp/podroid/ui",
+                "*/kotlin/com/excp/podroid/ui/**"
+            )
+            exclude("test*/**", "androidTest*/**")
+        },
         rootProject.file("tests/verify_ui_vm_boundary.py")
     )
 }

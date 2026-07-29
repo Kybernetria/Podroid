@@ -6,6 +6,7 @@ package com.excp.podroid.engine.avf
 
 import java.io.IOException
 import java.util.concurrent.Callable
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Future
 import java.util.concurrent.FutureTask
@@ -52,13 +53,13 @@ internal class AvfSmokeAttemptGate {
 }
 
 /**
- * Hard caller-side deadline for reflective AVF smoke work.
+ * Hard caller-side deadlines for reflective AVF smoke work.
  *
- * Vendor Binder/reflection may ignore interruption. The complete setup through
- * stop sequence therefore runs in one daemon [Future]. The caller only waits via
- * Future.get(timeout), requests cancellation best-effort, and never joins a
- * timed-out worker. A separately bounded daemon Future always attempts the
- * fixed-name delete after a create attempt or operation timeout.
+ * One daemon owns setup, create, run, stop, and the final fixed-name delete.
+ * Vendor Binder/reflection may ignore interruption, so a timed-out caller never
+ * joins that daemon. The admission lease remains held until the daemon and its
+ * ordered final delete actually exit; a permanently stuck operation therefore
+ * deliberately keeps later attempts closed.
  */
 internal class AvfSmokeTestExecutor(
     private val operationTimeoutMs: Long = DEFAULT_OPERATION_TIMEOUT_MS,
@@ -74,11 +75,13 @@ internal class AvfSmokeTestExecutor(
         val stopFailure: Throwable?,
         val deleteAttempted: Boolean,
         val deleteFailure: Throwable?,
+        val cleanupPending: Boolean,
     )
 
     private data class OperationResult(
         val failure: Throwable?,
         val stopFailure: Throwable?,
+        val deleteFailure: Throwable?,
     )
 
     private enum class Stage(val reportName: String) {
@@ -87,6 +90,7 @@ internal class AvfSmokeTestExecutor(
         RUN("run"),
         WAIT("startup observation"),
         STOP("stop"),
+        DELETE("named delete"),
         COMPLETE("complete"),
     }
 
@@ -113,22 +117,27 @@ internal class AvfSmokeTestExecutor(
             stopFailure = null,
             deleteAttempted = false,
             deleteFailure = null,
+            cleanupPending = true,
         )
         val stage = AtomicReference(Stage.SETUP)
         val createAttempted = AtomicBoolean(false)
+        val deleteAttempted = AtomicBoolean(false)
+        val operationExited = CountDownLatch(1)
+        val workerFinished = AtomicBoolean(false)
+        val operationResult = AtomicReference<OperationResult?>()
         var timedOut = false
         var timeoutStage: String? = null
-        var operationResult: OperationResult? = null
         var awaitFailure: Throwable? = null
-        var deleteAttempted = false
-        var deleteFailure: Throwable? = null
+        var cleanupWaitFailure: Throwable? = null
         var callerInterrupted: InterruptedException? = null
+        var cleanupCompleted = false
 
         try {
             val operationFuture = startDaemonFuture("avf-smoke-operation", lease) {
                 var vm: T? = null
                 var failure: Throwable? = null
                 var stopFailure: Throwable? = null
+                var deleteFailure: Throwable? = null
                 try {
                     val prepared = setup()
                     stage.set(Stage.CREATE)
@@ -151,48 +160,55 @@ internal class AvfSmokeTestExecutor(
                             stopFailure = caught
                         }
                     }
+
+                    // Publish operation/stop completion before final cleanup so
+                    // the caller can apply its separate bounded cleanup wait.
+                    operationResult.set(OperationResult(failure, stopFailure, null))
+                    operationExited.countDown()
+
+                    if (createAttempted.get()) {
+                        stage.set(Stage.DELETE)
+                        deleteAttempted.set(true)
+                        try {
+                            deleteByFixedName()
+                        } catch (caught: Throwable) {
+                            deleteFailure = caught
+                        }
+                    }
+                    operationResult.set(OperationResult(failure, stopFailure, deleteFailure))
                     stage.set(Stage.COMPLETE)
                 }
-                OperationResult(failure, stopFailure)
+                OperationResult(failure, stopFailure, deleteFailure)
             }
 
             try {
-                operationResult = operationFuture.get(operationTimeoutMs, TimeUnit.MILLISECONDS)
-            } catch (_: TimeoutException) {
-                timedOut = true
-                timeoutStage = stage.get().reportName
-                operationFuture.cancel(true)
-            } catch (failure: ExecutionException) {
-                awaitFailure = failure.cause ?: failure
+                if (!operationExited.await(operationTimeoutMs, TimeUnit.MILLISECONDS)) {
+                    timedOut = true
+                    timeoutStage = stage.get().reportName
+                    operationFuture.cancel(true)
+                } else {
+                    try {
+                        operationFuture.get(cleanupTimeoutMs, TimeUnit.MILLISECONDS)
+                        cleanupCompleted = true
+                    } catch (_: TimeoutException) {
+                        operationFuture.cancel(true)
+                        cleanupWaitFailure = IOException(
+                            "AVF smoke final cleanup exceeded ${cleanupTimeoutMs}ms; " +
+                                "cancellation was requested but cleanup remains pending",
+                        )
+                    } catch (failure: ExecutionException) {
+                        awaitFailure = failure.cause ?: failure
+                    }
+                }
             } catch (interrupted: InterruptedException) {
-                // InterruptedException clears the flag. Keep it clear while the
-                // independently bounded delete is scheduled, then restore and
-                // propagate only after cleanup registration is complete.
                 timeoutStage = stage.get().reportName
                 operationFuture.cancel(true)
                 callerInterrupted = interrupted
             }
 
-            deleteAttempted = createAttempted.get() || timedOut || callerInterrupted != null
-            if (deleteAttempted) {
-                val deleteFuture = startDaemonFuture("avf-smoke-delete", lease) {
-                    deleteByFixedName()
-                }
-                try {
-                    deleteFuture.get(cleanupTimeoutMs, TimeUnit.MILLISECONDS)
-                } catch (_: TimeoutException) {
-                    deleteFuture.cancel(true)
-                    deleteFailure = IOException(
-                        "AVF smoke named delete exceeded ${cleanupTimeoutMs}ms; " +
-                            "cancellation was requested but vendor work may still be running",
-                    )
-                } catch (failure: ExecutionException) {
-                    deleteFailure = failure.cause ?: failure
-                } catch (interrupted: InterruptedException) {
-                    deleteFuture.cancel(true)
-                    if (callerInterrupted == null) callerInterrupted = interrupted
-                }
-            }
+            // Future cancellation marks a Future done before an interrupt-ignoring
+            // callable exits, so completion is tracked by the daemon wrapper.
+            workerFinished.set(cleanupCompleted || operationFuture.workerHasExited())
         } finally {
             lease.finishRegistration()
         }
@@ -202,14 +218,16 @@ internal class AvfSmokeTestExecutor(
             throw interrupted
         }
 
+        val completed = operationResult.get()
         return Result(
             busy = false,
             timedOut = timedOut,
             timeoutStage = timeoutStage,
-            failure = operationResult?.failure ?: awaitFailure,
-            stopFailure = operationResult?.stopFailure,
-            deleteAttempted = deleteAttempted,
-            deleteFailure = deleteFailure,
+            failure = completed?.failure ?: awaitFailure,
+            stopFailure = completed?.stopFailure,
+            deleteAttempted = deleteAttempted.get(),
+            deleteFailure = completed?.deleteFailure ?: cleanupWaitFailure,
+            cleanupPending = !workerFinished.get(),
         )
     }
 
@@ -217,13 +235,15 @@ internal class AvfSmokeTestExecutor(
         threadNamePrefix: String,
         lease: AvfSmokeAttemptGate.Lease,
         action: () -> T,
-    ): Future<T> {
+    ): TrackedFuture<T> {
         lease.registerTask()
+        val workerExited = AtomicBoolean(false)
         val task = FutureTask(Callable { action() })
         val thread = Thread({
             try {
                 task.run()
             } finally {
+                workerExited.set(true)
                 lease.taskFinished()
             }
         }, "$threadNamePrefix-${threadSequence.incrementAndGet()}").apply {
@@ -235,7 +255,14 @@ internal class AvfSmokeTestExecutor(
             lease.taskFinished()
             throw failure
         }
-        return task
+        return TrackedFuture(task, workerExited)
+    }
+
+    private class TrackedFuture<T>(
+        private val delegate: Future<T>,
+        private val workerExited: AtomicBoolean,
+    ) : Future<T> by delegate {
+        fun workerHasExited(): Boolean = workerExited.get()
     }
 
     companion object {
