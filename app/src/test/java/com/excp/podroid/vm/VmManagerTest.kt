@@ -300,6 +300,105 @@ class VmManagerTest {
     }
 
     @Test
+    fun `newer stop prepared first makes restart stale at final launch gate`() = runBlocking {
+        val supervisor = FakeSupervisor()
+        val handoffPaused = CompletableDeferred<Unit>()
+        val releaseHandoff = CompletableDeferred<Unit>()
+        val stopPrepareEntered = CompletableDeferred<Unit>()
+        val releaseStopPrepare = CompletableDeferred<Unit>()
+        supervisor.onPrepare = { operation ->
+            if (operation == LifecycleOperation.STOP) {
+                stopPrepareEntered.complete(Unit)
+                releaseStopPrepare.await()
+            }
+        }
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+        }
+        val manager = manager(
+            runtime = runtime,
+            supervisor = supervisor,
+            beforeFinalLaunchAuthorization = { command ->
+                if (command.operation == LifecycleOperation.RESTART) {
+                    handoffPaused.complete(Unit)
+                    releaseHandoff.await()
+                }
+            },
+        )
+        val restart = async(Dispatchers.Default) { manager.restart(VmId.DEFAULT) }
+        handoffPaused.await()
+
+        val newerStop = async(Dispatchers.Default) {
+            manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.STOP)
+        }
+        stopPrepareEntered.await() // STOP owns the authority gate inside prepare.
+        releaseHandoff.complete(Unit) // Restart now waits for that same final gate.
+        assertEquals(0, runtime.startCalls)
+
+        releaseStopPrepare.complete(Unit)
+        val stop = newerStop.await()
+        restart.await()
+
+        assertEquals(LifecycleOperation.STOP, stop.operation)
+        assertEquals(0, runtime.startCalls)
+        assertEquals(VmDesiredState.STOPPED, supervisor.snapshot().desiredState)
+        assertEquals(LifecycleOutcome.PENDING, supervisor.snapshot().latestTransaction?.outcome)
+    }
+
+    @Test
+    fun `launch authorization excludes stop prepare until backend acceptance then stop applies`() = runBlocking {
+        val supervisor = FakeSupervisor()
+        val handoffReached = CompletableDeferred<Unit>()
+        val launchEntered = CompletableDeferred<Unit>()
+        val allowAcceptance = CompletableDeferred<Unit>()
+        val releaseRuntimeStart = CompletableDeferred<Unit>()
+        val stopPrepareEntered = CompletableDeferred<Unit>()
+        supervisor.onPrepare = { operation ->
+            if (operation == LifecycleOperation.STOP) stopPrepareEntered.complete(Unit)
+        }
+        val runtime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+            onStart = {
+                launchEntered.complete(Unit)
+                allowAcceptance.await()
+                state.value = VmState.Starting
+                releaseRuntimeStart.await()
+            }
+        }
+        val manager = manager(
+            runtime = runtime,
+            supervisor = supervisor,
+            beforeFinalLaunchAuthorization = { command ->
+                if (command.operation == LifecycleOperation.RESTART) handoffReached.complete(Unit)
+            },
+        )
+        val restart = async(Dispatchers.Default) { manager.restart(VmId.DEFAULT) }
+        handoffReached.await()
+        launchEntered.await()
+
+        // Unconfined enters prepare synchronously until the held authority gate
+        // suspends it, making the exclusion assertion scheduler-independent.
+        val newerStop = async(Dispatchers.Unconfined) {
+            manager.prepareLifecycleCommand(VmId.DEFAULT, LifecycleOperation.STOP)
+        }
+        assertFalse("STOP prepare must wait while launch acceptance owns authority", stopPrepareEntered.isCompleted)
+
+        allowAcceptance.complete(Unit)
+        stopPrepareEntered.await()
+        val stop = newerStop.await()
+        assertEquals(LifecycleOperation.STOP, stop.operation)
+        assertEquals(1, runtime.startCalls)
+
+        assertTrue(manager.executePrepared(VmId.DEFAULT, stop))
+        releaseRuntimeStart.complete(Unit)
+        restart.await()
+        assertEquals(2, runtime.stopCalls) // Restart shutdown plus the newer STOP.
+        assertTrue(runtime.quiescent.value)
+    }
+
+    @Test
     fun `duplicate restart while replacement is starting is idempotent`() = runBlocking {
         val runtime = FakeRuntime().apply {
             state.value = VmState.Starting
@@ -437,14 +536,18 @@ class VmManagerTest {
             manager.executePrepared(VmId.DEFAULT, oldStart)
         }
         oldLaunchEntered.await()
-        val restart = manager.prepareLifecycleCommand(
-            VmId.DEFAULT,
-            LifecycleOperation.RESTART,
-            expectedCommandGeneration = 2L,
-        )
+        val restartPreparation = async(Dispatchers.Unconfined) {
+            manager.prepareLifecycleCommand(
+                VmId.DEFAULT,
+                LifecycleOperation.RESTART,
+                expectedCommandGeneration = 2L,
+            )
+        }
+        assertFalse("new command waits for old launch acceptance", restartPreparation.isCompleted)
 
         releaseOldLaunch.complete(Unit)
-        assertFalse(oldExecution.await())
+        val restart = restartPreparation.await()
+        oldExecution.await()
         assertTrue(manager.executePrepared(VmId.DEFAULT, restart))
 
         assertEquals(2, runtime.startCalls)
@@ -854,6 +957,7 @@ class VmManagerTest {
         configuration: FakeConfiguration = FakeConfiguration(),
         supervisor: HostSupervisorTransactions = FakeSupervisor(),
         guestTimeoutMs: Long = 50,
+        beforeFinalLaunchAuthorization: suspend (LifecycleTransactionToken) -> Unit = {},
     ): DefaultVmManager {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default).also(scopes::add)
         return DefaultVmManager(
@@ -868,6 +972,7 @@ class VmManagerTest {
             backendStopTimeoutMs = 100,
             forceStopTimeoutMs = 100,
             qmpTimeoutMs = 100,
+            beforeFinalLaunchAuthorization = beforeFinalLaunchAuthorization,
         )
     }
 
@@ -883,14 +988,17 @@ class VmManagerTest {
     }
 
     private class FakeSupervisor : HostSupervisorTransactions {
+        private val mutex = kotlinx.coroutines.sync.Mutex()
         private var state = HostSupervisorState.safeDefaults()
+        var onPrepare: suspend (LifecycleOperation) -> Unit = {}
 
-        override suspend fun snapshot(): HostSupervisorState = state
+        override suspend fun snapshot(): HostSupervisorState = mutex.withLock { state }
 
         override suspend fun prepare(
             operation: LifecycleOperation,
             expectedId: Long?,
-        ): LifecycleTransactionToken {
+        ): LifecycleTransactionToken = mutex.withLock {
+            onPrepare(operation)
             val id = (state.latestTransaction?.id ?: 0L) + 1L
             if (expectedId != null && expectedId != id) {
                 throw StaleLifecycleCommandException("stale")
@@ -908,33 +1016,38 @@ class VmManagerTest {
                     id, operation, LifecycleOutcome.PENDING, id, null, null,
                 ),
             )
-            return token
+            token
         }
 
-        override suspend fun claim(token: LifecycleTransactionToken): Boolean {
-            val transaction = state.latestTransaction ?: return false
+        override suspend fun claim(token: LifecycleTransactionToken): Boolean = mutex.withLock {
+            val transaction = state.latestTransaction ?: return@withLock false
             if (transaction.id != token.id || transaction.operation != token.operation ||
                 transaction.outcome != LifecycleOutcome.PENDING || transaction.effectStarted
-            ) return false
+            ) return@withLock false
             state = state.copy(latestTransaction = transaction.copy(effectStarted = true))
-            return true
+            true
         }
 
-        override suspend fun isCurrent(token: LifecycleTransactionToken): Boolean =
+        override suspend fun isCurrent(token: LifecycleTransactionToken): Boolean = mutex.withLock {
             state.latestTransaction?.let {
                 it.id == token.id && it.operation == token.operation &&
                     it.outcome == LifecycleOutcome.PENDING && it.effectStarted
             } == true
+        }
 
         override suspend fun succeed(
             token: LifecycleTransactionToken,
             runtimeStarted: Boolean,
-        ): Boolean = finish(token, LifecycleOutcome.SUCCEEDED, null, runtimeStarted)
+        ): Boolean = mutex.withLock {
+            finish(token, LifecycleOutcome.SUCCEEDED, null, runtimeStarted)
+        }
 
         override suspend fun fail(
             token: LifecycleTransactionToken,
             errorCode: LifecycleErrorCode,
-        ): Boolean = finish(token, LifecycleOutcome.FAILED, errorCode, false)
+        ): Boolean = mutex.withLock {
+            finish(token, LifecycleOutcome.FAILED, errorCode, false)
+        }
 
         private fun finish(
             token: LifecycleTransactionToken,

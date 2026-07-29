@@ -37,7 +37,6 @@ import com.excp.podroid.vm.LifecycleErrorCode
 import com.excp.podroid.vm.LifecycleOperation
 import com.excp.podroid.vm.LifecycleTransactionToken
 import com.excp.podroid.vm.VmId
-import com.excp.podroid.vm.VmLifecycleState
 import com.excp.podroid.vm.VmManager
 import com.excp.podroid.vm.VmPaths
 import dagger.hilt.android.AndroidEntryPoint
@@ -77,6 +76,16 @@ class PodroidService : Service() {
     private var stopPendingIntent: PendingIntent? = null
     private var openPendingIntent: PendingIntent? = null
     private lateinit var localBinder: LocalBinder
+    private val guestPowerRequestHandler by lazy {
+        GuestPowerRequestHandler(
+            lifecycle = { vmManager.lifecycle(VmId.DEFAULT).value },
+            admitAndSchedule = { operation, schedule ->
+                admitAndDispatch(operation, dispatch = schedule)
+            },
+            schedule = ::scheduleGuestPowerCommand,
+            admissionFailed = { Log.e(TAG, "Guest power admission failed", it) },
+        )
+    }
 
     internal class LocalBinder internal constructor(
         val endpoint: VmServiceEndpoint,
@@ -785,53 +794,28 @@ class PodroidService : Service() {
         else -> com.excp.podroid.engine.hostbridge.HostProtocol.err("usage: on|off|status")
     }
 
-    // Reply returned now; the stop/restart is posted to the main looper so the
-    // bridge flushes the response before the VM (and this service) tear down. The
-    // Handler callbacks capture the app-scoped engine + applicationContext (NOT
-    // `this`), so they survive this service's death.
-    private fun handlePowerRequest(action: String): String {
-        val proto = com.excp.podroid.engine.hostbridge.HostProtocol
-        return when (action) {
-            // Map explicitly, not via javaClass.simpleName: R8 obfuscates class
-            // names in release builds, so simpleName returns garbage like "wc2".
-            "status" -> proto.ok(when (vmManager.lifecycle(VmId.DEFAULT).value) {
-                VmLifecycleState.IDLE -> "idle"
-                VmLifecycleState.STARTING -> "starting"
-                VmLifecycleState.RUNNING -> "running"
-                VmLifecycleState.STOPPED -> "stopped"
-                VmLifecycleState.ERROR -> "error"
-            })
-            "stop" -> {
-                scheduleGuestPowerCommand(LifecycleOperation.STOP)
-                proto.ok()
-            }
-            "restart" -> {
-                scheduleGuestPowerCommand(LifecycleOperation.RESTART)
-                proto.ok()
-            }
-            else -> proto.err("usage: stop|restart|status")
-        }
-    }
+    // Admission is suspend-capable: durable desired state + PENDING token must
+    // exist before the bridge receives OK. Only dispatch is delayed so the
+    // response can flush before this service and its VM transport tear down.
+    private suspend fun handlePowerRequest(action: String): String =
+        guestPowerRequestHandler.handle(action)
 
-    private fun scheduleGuestPowerCommand(operation: LifecycleOperation) {
+    private fun scheduleGuestPowerCommand(command: LifecycleTransactionToken) {
+        check(serviceScope.isActive) { "Service is stopping" }
         serviceScope.launch {
-            delay(300L) // allow the host-bridge response to flush first
-            runCatching {
-                admitAndDispatch(operation) { command ->
-                    when (operation) {
-                        LifecycleOperation.STOP -> requestServiceStop(
-                            command,
-                            "Guest graceful stop failed",
-                            force = false,
-                        )
-                        LifecycleOperation.RESTART -> requestServiceRestart(
-                            command,
-                            "Guest restart failed",
-                        )
-                        else -> error("Unsupported guest power operation")
-                    }
-                }
-            }.onFailure { Log.e(TAG, "Guest power admission failed", it) }
+            delay(GUEST_POWER_RESPONSE_FLUSH_MS)
+            when (command.operation) {
+                LifecycleOperation.STOP -> requestServiceStop(
+                    command,
+                    "Guest graceful stop failed",
+                    force = false,
+                )
+                LifecycleOperation.RESTART -> requestServiceRestart(
+                    command,
+                    "Guest restart failed",
+                )
+                else -> error("Unsupported guest power operation")
+            }
         }
     }
 
@@ -840,6 +824,7 @@ class PodroidService : Service() {
         private const val CHANNEL_ID = "podroid_service"
         private const val NOTIFICATION_ID = 1001
         private const val SERVICE_LAUNCH_JOIN_TIMEOUT_MS = 8_000L
+        private const val GUEST_POWER_RESPONSE_FLUSH_MS = 300L
         private const val EXTRA_TRANSACTION_ID =
             "com.excp.podroid.extra.LIFECYCLE_TRANSACTION_ID"
         private const val EXTRA_TRANSACTION_OPERATION =

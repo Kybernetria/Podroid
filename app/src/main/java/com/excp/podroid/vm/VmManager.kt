@@ -241,10 +241,14 @@ class DefaultVmManager internal constructor(
     private val backendStopTimeoutMs: Long = 15_000L,
     private val forceStopTimeoutMs: Long = 7_000L,
     private val qmpTimeoutMs: Long = 5_000L,
+    /** Deterministic seam immediately before the final command-authority fence. */
+    private val beforeFinalLaunchAuthorization: suspend (LifecycleTransactionToken) -> Unit = {},
 ) : VmManager {
     private val lifecycleMutex = Mutex()
     private val stopTaskMutex = Mutex()
     private val launchCompletionMutex = Mutex()
+    /** Serializes durable command authority with just-in-time irreversible effects. */
+    private val commandAuthorityMutex = Mutex()
     private val commandClaimMutex = Mutex()
     private val claimedCommands = mutableMapOf<Long, CommandClaimState>()
     @Volatile private var stopTask: Deferred<Unit>? = null
@@ -355,7 +359,7 @@ class DefaultVmManager internal constructor(
         require(operation != LifecycleOperation.REMOVE) {
             "Prepared service commands cannot carry a remove policy"
         }
-        return supervisor.prepare(operation, expectedCommandGeneration).also { prepared ->
+        return prepareCommand(operation, expectedCommandGeneration).also { prepared ->
             commandClaimMutex.withLock {
                 claimedCommands.entries.removeAll { (id, state) ->
                     id < prepared.id && state == CommandClaimState.READY
@@ -397,10 +401,10 @@ class DefaultVmManager internal constructor(
                 preparedTransaction(command) {
                     when (command.operation) {
                         LifecycleOperation.SETUP -> {
-                            ensureInstalledEffect(vmId)
+                            ensureInstalledEffect(vmId, command)
                             false
                         }
-                        LifecycleOperation.START -> startEffect(vmId)
+                        LifecycleOperation.START -> startEffect(vmId, command)
                         LifecycleOperation.STOP -> {
                             stopEffect(vmId, force = false)
                             false
@@ -488,13 +492,15 @@ class DefaultVmManager internal constructor(
     override suspend fun remove(vmId: VmId, policy: VmRemovePolicy) = lifecycleTransaction(
         vmId = vmId,
         operation = LifecycleOperation.REMOVE,
-    ) {
+    ) { command ->
         awaitInitial(vmId)
         lifecycleMutex.withLock {
             check(runtime.quiescent.value) { "Cannot remove VM while backend cleanup is incomplete" }
             installer.withExclusiveTree(vmId) {
-                files.remove(vmId, policy)
-                installationEnsured = false
+                withCurrentCommand(command) {
+                    files.remove(vmId, policy)
+                    installationEnsured = false
+                }
             }
         }
         false
@@ -544,12 +550,20 @@ class DefaultVmManager internal constructor(
     private suspend fun lifecycleTransaction(
         vmId: VmId,
         operation: LifecycleOperation,
-        effect: suspend () -> Boolean,
+        effect: suspend (LifecycleTransactionToken) -> Boolean,
     ) {
         requireDefault(vmId)
-        val command = supervisor.prepare(operation)
+        val command = prepareCommand(operation)
         if (!supervisor.claim(command)) return
-        preparedTransaction(command, effect)
+        preparedTransaction(command) { effect(command) }
+    }
+
+    /** Every durable authority change shares the gate used by final effect fences. */
+    private suspend fun prepareCommand(
+        operation: LifecycleOperation,
+        expectedId: Long? = null,
+    ): LifecycleTransactionToken = commandAuthorityMutex.withLock {
+        supervisor.prepare(operation, expectedId)
     }
 
     /**
@@ -573,25 +587,38 @@ class DefaultVmManager internal constructor(
         return withContext(NonCancellable) { supervisor.succeed(command, runtimeStarted) }
     }
 
-    private suspend fun ensureInstalledEffect(vmId: VmId) {
+    private suspend fun ensureInstalledEffect(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+    ) {
         awaitInitial(vmId)
         lifecycleMutex.withLock {
             check(runtime.quiescent.value) { "Cannot install while VM cleanup is incomplete" }
-            installer.withExclusiveTree(vmId) { lease -> ensureInstalledLocked(vmId, lease) }
+            installer.withExclusiveTree(vmId) { lease ->
+                withCurrentCommand(command) { ensureInstalledLocked(vmId, lease) }
+            }
         }
     }
 
     /** Returns true only when this command accepted a new backend generation. */
-    private suspend fun startEffect(vmId: VmId): Boolean {
+    private suspend fun startEffect(
+        vmId: VmId,
+        command: LifecycleTransactionToken,
+    ): Boolean {
         awaitInitial(vmId)
         return lifecycleMutex.withLock {
             if (isRuntimeActive()) return@withLock false
             check(!busyFlow.value) { "Cannot start while previous VM work or cleanup is incomplete" }
             installer.withExclusiveTree(vmId) { lease ->
-                ensureInstalledLocked(vmId, lease)
-                startLocked(vmId)
+                if (!withCurrentCommand(command) { ensureInstalledLocked(vmId, lease) }) {
+                    return@withExclusiveTree false
+                }
+                val plan = launchPlan(vmId)
+                // Keep prepare excluded only until this generation is accepted,
+                // never for configuration assembly or the backend's lifetime.
+                beforeFinalLaunchAuthorization(command)
+                withCurrentCommand(command) { startLocked(plan) }
             }
-            true
         }
     }
 
@@ -610,17 +637,33 @@ class DefaultVmManager internal constructor(
         // replacement do not create another replacement generation.
         if (runtime.state.value is VmState.Starting && !runtime.quiescent.value) return false
         requestStop(force = false).await()
-        // A Start/Stop prepared while shutdown was in flight supersedes this
-        // command. Re-load before replacement installation or backend launch.
-        if (!supervisor.isCurrent(command)) return false
         lifecycleMutex.withLock {
             check(runtime.quiescent.value) { "Cannot restart while VM cleanup is incomplete" }
-            installer.withExclusiveTree(vmId) { lease ->
-                ensureInstalledLocked(vmId, lease)
-                startLocked(vmId)
+            return installer.withExclusiveTree(vmId) { lease ->
+                // Shutdown is deliberately outside the authority gate. Fence
+                // installation and launch separately so a newer STOP can become
+                // authoritative between them and prevent replacement launch.
+                if (!withCurrentCommand(command) { ensureInstalledLocked(vmId, lease) }) {
+                    return@withExclusiveTree false
+                }
+                val plan = launchPlan(vmId)
+                beforeFinalLaunchAuthorization(command)
+                withCurrentCommand(command) { startLocked(plan) }
             }
         }
-        return true
+    }
+
+    /**
+     * Atomically revalidates the durable token against command preparation and
+     * keeps newer authority out only until this bounded effect is accepted.
+     */
+    private suspend fun withCurrentCommand(
+        command: LifecycleTransactionToken,
+        effect: suspend () -> Unit,
+    ): Boolean = commandAuthorityMutex.withLock {
+        if (!supervisor.isCurrent(command)) return@withLock false
+        effect()
+        true
     }
 
     private fun classifyLifecycleFailure(failure: Throwable): LifecycleErrorCode = when (failure) {
@@ -640,11 +683,14 @@ class DefaultVmManager internal constructor(
         installationEnsured = true
     }
 
-    private suspend fun startLocked(vmId: VmId) {
+    private suspend fun launchPlan(vmId: VmId): VmLaunchPlan =
+        configuration.launchPlan(vmId).also { plan ->
+            require(plan.config.vmId == vmId) { "Launch plan VM id mismatch" }
+        }
+
+    private suspend fun startLocked(plan: VmLaunchPlan) {
         launchPending.value = true
         try {
-            val plan = configuration.launchPlan(vmId)
-            require(plan.config.vmId == vmId) { "Launch plan VM id mismatch" }
             val task = scope.async { runtime.start(plan) }
             startTask = task
 
