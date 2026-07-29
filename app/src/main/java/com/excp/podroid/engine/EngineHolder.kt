@@ -372,6 +372,7 @@ class EngineHolder @Inject constructor(
         current.start(portForwards, config)
     }
     override fun stop() = current.stop()
+    override fun forceStop() = current.forceStop()
     override fun createTerminalSession(client: TerminalSessionClient) =
         current.createTerminalSession(client)
     override suspend fun addPortForward(rule: PortForwardRule) = current.addPortForward(rule)

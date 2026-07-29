@@ -62,9 +62,11 @@ Native binaries require **16KB page alignment** (`-Wl,-z,max-page-size=16384`) -
 
 ## Architecture
 
-### Engine abstraction (the most important thing to understand)
+### VM manager and engine abstraction (the most important thing to understand)
 
-Everything VM-related goes through `engine/VmEngine.kt`, a single interface implemented by two backends and one router. The MVP instance identity is exactly `VmId.DEFAULT` (`default`), and the injected `vm/VmPaths.kt` confines its files to `filesDir/instances/default`; `PodroidApplication` runs the fail-closed legacy move before extracting assets or allowing launch:
+Service-facing lifecycle operations go through the narrow `vm/VmManager.kt` domain contract. `DefaultVmManager` supports only `VmId.DEFAULT`, serializes lifecycle mutations, owns install/config/implicit-SSH assembly, exposes bounded logs and a typed QMP allowlist, and applies explicit preserve/delete-data removal policy. `PodroidService` retains only foreground-service, WakeLock, notification, host-bridge, and USB-observer mechanics; it does not assemble backend launch configuration. There is deliberately no Binder or desired-state reconciliation API yet.
+
+Below the manager, backend operations go through `engine/VmEngine.kt`, a single interface implemented by two backends and one router. The MVP instance identity is exactly `VmId.DEFAULT` (`default`), and the injected `vm/VmPaths.kt` confines its files to `filesDir/instances/default`; `PodroidApplication` runs the fail-closed legacy move before extracting assets or allowing launch:
 
 - **`QemuEngine.kt`** - QEMU/TCG. Software emulation, SLIRP user-mode networking, control via QMP and virtio-console Unix sockets. No special permission.
 - **`engine/avf/AvfEngine.kt`** - AVF/pKVM. Uses the Android Virtualization Framework (reached by reflection in `AvfReflect.kt`); networking and control ride **vsock**. Hardware-accelerated; needs `MANAGE_VIRTUAL_MACHINE` + `USE_CUSTOM_VIRTUAL_MACHINE` granted via `pm grant`.
@@ -151,7 +153,7 @@ Single-activity Compose app: `ui/navigation/NavGraph.kt` routes `setup → home 
 │       │   │   ├── avf/                  # AVF/pKVM backend (engine, reflection, vsock, console)
 │       │   │   ├── hostbridge/           # guest->Android bridge (transport, server, dispatcher, notify)
 │       │   │   └── usb/                  # UsbPassthroughManager
-│       │   ├── vm/                       # validated VmId, confined VmPaths, legacy path migration
+│       │   ├── vm/                       # VmManager, validated VmId, confined VmPaths, safe install/remove/log access
 │       │   ├── service/PodroidService.kt # foreground service; owns VM lifecycle, wakelock, notification
 │       │   ├── data/repository/          # Settings, PortForward, Update, Language (all DataStore)
 │       │   ├── di/                       # Hilt module

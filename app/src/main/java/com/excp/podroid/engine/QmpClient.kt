@@ -24,6 +24,7 @@ class QmpClient(private val socketPath: String) {
     companion object {
         private const val TAG = "QmpClient"
         private const val SOCKET_TIMEOUT_MS = 5000
+        private const val MAX_QMP_LINE_CHARS = 256 * 1024
 
         /** Verdict for one QMP reply line. */
         sealed class QmpVerdict {
@@ -73,6 +74,19 @@ class QmpClient(private val socketPath: String) {
                 is QmpVerdict.SkipEvent -> null
             }
 
+        private fun readBoundedLine(reader: BufferedReader): String? {
+            val line = StringBuilder()
+            while (true) {
+                val next = reader.read()
+                if (next < 0) return if (line.isEmpty()) null else line.toString()
+                if (next.toChar() == '\n') return line.toString()
+                if (line.length >= MAX_QMP_LINE_CHARS) {
+                    throw java.io.IOException("QMP response line exceeds $MAX_QMP_LINE_CHARS characters")
+                }
+                if (next.toChar() != '\r') line.append(next.toChar())
+            }
+        }
+
         /**
          * human-monitor-command (hostfwd_add/remove) reports failures as plain
          * text in the `"return"` field. Match the QEMU SLIRP/hostfwd error
@@ -111,10 +125,10 @@ class QmpClient(private val socketPath: String) {
                 val out = socket.outputStream
 
                 // Read QMP greeting, then enter command mode.
-                Log.v(TAG, "QMP greeting: ${reader.readLine()}")
+                Log.v(TAG, "QMP greeting: ${readBoundedLine(reader)}")
                 out.write("{\"execute\":\"qmp_capabilities\"}\n".toByteArray())
                 out.flush()
-                Log.v(TAG, "Capabilities response: ${reader.readLine()}")
+                Log.v(TAG, "Capabilities response: ${readBoundedLine(reader)}")
 
                 val cmd = JSONObject().apply {
                     put("execute", command)
@@ -132,7 +146,7 @@ class QmpClient(private val socketPath: String) {
                 // returns null for those so we skip them. A null line = EOF.
                 var result: Result<JSONObject>? = null
                 while (result == null) {
-                    val response = reader.readLine()
+                    val response = readBoundedLine(reader)
                         ?: return@withContext Result.failure(
                             RuntimeException("QMP connection closed before a reply to $command")
                         )
@@ -151,6 +165,22 @@ class QmpClient(private val socketPath: String) {
 
     suspend fun execute(command: String, arguments: JSONObject? = null): Result<JSONObject> =
         exec(command, arguments)
+
+    /** Typed lifecycle command used by VmManager's bounded graceful-stop path. */
+    suspend fun systemPowerdown(): Result<Unit> =
+        exec("system_powerdown", null).map { Unit }
+
+    /** Typed observational commands exposed through VmManager's QMP allowlist. */
+    suspend fun queryStatus(): Result<String> =
+        exec("query-status", null).mapCatching {
+            it.getJSONObject("return").getString("status")
+        }
+
+    suspend fun queryVersion(): Result<Triple<Int, Int, Int>> =
+        exec("query-version", null).mapCatching {
+            val qemu = it.getJSONObject("return").getJSONObject("qemu")
+            Triple(qemu.getInt("major"), qemu.getInt("minor"), qemu.getInt("micro"))
+        }
 
     suspend fun addPortForward(
         hostPort: Int,

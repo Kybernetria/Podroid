@@ -75,6 +75,13 @@ interface VmEngine {
     suspend fun start(portForwards: List<PortForwardRule>, config: VmConfig)
     fun stop()
 
+    /**
+     * Immediately terminate the backend when it supports a distinct force path.
+     * AVF deliberately inherits [stop] because the framework exposes no safer
+     * hard-kill primitive; QEMU overrides this with Process.destroyForcibly().
+     */
+    fun forceStop() = stop()
+
     /** Create (or return the pre-started) terminal session wired to the bridge. */
     fun createTerminalSession(client: TerminalSessionClient): TerminalSession
 

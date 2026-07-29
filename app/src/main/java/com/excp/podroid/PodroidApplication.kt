@@ -21,6 +21,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.lsposed.hiddenapibypass.HiddenApiBypass
 import java.io.File
 import java.util.concurrent.Executors
@@ -33,6 +36,7 @@ class PodroidApplication : Application() {
     @Inject lateinit var vmPaths: VmPaths
 
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val assetInstallMutex = Mutex()
 
     // Completion signal for asset extraction. The VM launch path
     // (PodroidService.launchPodroid) reads the extracted files synchronously,
@@ -48,7 +52,7 @@ class PodroidApplication : Application() {
         // blocking onCreate on first install/upgrade would ANR the cold start.
         appScope.launch {
             try {
-                extractAssets()
+                installVmAssets()
                 assetsReady.complete(Unit)
             } catch (failure: Throwable) {
                 Log.e(TAG, "VM path migration or asset extraction failed", failure)
@@ -65,6 +69,18 @@ class PodroidApplication : Application() {
      * before launching the VM so QEMU/AVF never read a partial or missing file.
      */
     suspend fun awaitAssetsReady() = assetsReady.await()
+
+    /**
+     * Safe installer seam used by VmManager. It is serialized with initial app
+     * extraction and may be called again after an explicit installation remove;
+     * missing assets are then restored through the same atomic NOFOLLOW path.
+     */
+    suspend fun installVmAssets() = withContext(Dispatchers.IO) {
+        assetInstallMutex.withLock { extractAssets() }
+    }
+
+    /** Wait until any initial/reinstall extraction has released its file tree. */
+    suspend fun awaitVmAssetInstallerIdle() = assetInstallMutex.withLock { Unit }
 
     // Android 14+ hides @SystemApi reflection lookups (returning NoSuchMethod
     // even via getDeclared*). Prefixes needing exemption:

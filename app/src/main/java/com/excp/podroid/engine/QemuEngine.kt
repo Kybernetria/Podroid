@@ -499,6 +499,12 @@ class QemuEngine @Inject constructor(
         }, "podroid-qemu-stop").apply { isDaemon = true }.start()
     }
 
+    override fun forceStop() {
+        val proc = process ?: return
+        _stopping.value = true
+        proc.destroyForcibly()
+    }
+
     override fun openHostTransport(): com.excp.podroid.engine.hostbridge.HostTransport? =
         com.excp.podroid.engine.hostbridge.QemuHostTransport.open(hostSockPath)
 
