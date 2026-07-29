@@ -24,6 +24,7 @@ import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.engine.BootStageDetector
 import com.excp.podroid.engine.BootStageGenerationGate
 import com.excp.podroid.engine.BoundedRunLog
+import com.excp.podroid.engine.GenerationBoundTerminalSlot
 import com.excp.podroid.engine.SensitiveConsolePolicy
 import com.excp.podroid.engine.QmpController
 import com.excp.podroid.engine.VmConfig
@@ -105,12 +106,13 @@ class AvfEngine @Inject constructor(
     private val _stopping = MutableStateFlow(false)
     override val stopping: StateFlow<Boolean> = _stopping.asStateFlow()
 
-    // @Volatile: written on the main thread (spawnBridge/createTerminalSession)
-    // and on background threads (cleanup via onVmTerminal or the IO stop path),
-    // read from both — mirrors the other lifecycle fields below.
-    @Volatile
-    override var terminalSession: TerminalSession? = null
-        private set
+    // Every slot access is serialized on this engine's monitor, the same
+    // monitor held by cleanup(), so a session built outside the lock can only
+    // register into its still-live launch generation.
+    private val terminalSlot = GenerationBoundTerminalSlot<TerminalSession>()
+
+    override val terminalSession: TerminalSession?
+        @Synchronized get() = terminalSlot.current()
 
     // Wall-clock millis of the most recent →Running transition (both the
     // detector onReady path and the boot-timeout fallback set it), null until
@@ -329,6 +331,9 @@ class AvfEngine @Inject constructor(
             // Starting under the lock so a re-entrant start() is rejected.
             lastConfig = config
             stopRequested = false
+            // Defensive generation boundary: cleanup normally emptied the slot,
+            // but a stale reference must never suppress this run's bridge.
+            retireTerminalBridge()
             synchronized(lastPortForwards) { lastPortForwards.clear(); lastPortForwards.addAll(portForwards) }
             // Publish before AVF manager/config/stream resources can be acquired.
             _quiescent.value = false
@@ -549,7 +554,7 @@ class AvfEngine @Inject constructor(
             AvfReflect.run(vm)
             val status = runCatching { AvfReflect.getStatus(vm) }.getOrDefault(-1)
             Log.i(TAG, "vm.run() returned — VM booting (status=$status)")
-            spawnBridge()
+            spawnBridge(generation)
 
             // Boot-timeout fallback (mirrors QemuEngine): the engine leaves
             // Starting only via the detector's "Ready!" or a VM callback. If a
@@ -650,26 +655,20 @@ class AvfEngine @Inject constructor(
      * never sees "Ready!". This matches QemuEngine's autoStartBridge pattern but
      * with inverse timing (QEMU spawns AFTER ready; AVF spawns BEFORE ready).
      */
-    private fun spawnBridge() {
+    private fun spawnBridge(generation: Long) {
         android.os.Handler(android.os.Looper.getMainLooper()).post {
-            if (terminalSession != null) return@post
+            if (hasLiveTerminalBridge(generation)) return@post
             val bridgeExe = File(context.applicationInfo.nativeLibraryDir, "libpodroid-bridge.so")
             if (!bridgeExe.exists()) {
                 Log.e(TAG, "bridge missing at ${bridgeExe.absolutePath}")
                 return@post
             }
-            val sess = com.excp.podroid.engine.ResizeNotifyingSession(
-                shellPath = bridgeExe.absolutePath,
-                cwd = vmPaths.avfWorkingDirectory.absolutePath,
-                args = arrayOf(bridgeExe.absolutePath, terminalSockPath, ctrlSockPath),
-                env = null,
-                transcriptRows = 2000,
-                client = proxySessionClient,
-                onResize = { rows, cols -> sendResizeDebounced(rows, cols) },
-            )
-            sess.updateSize(80, 24, 0, 0)
-            terminalSession = sess
-            Log.d(TAG, "AVF bridge auto-spawned (resize-notifying)")
+            // Construction starts the subprocess and therefore stays outside the
+            // engine monitor. Registration below revalidates the exact launch;
+            // cleanup winning this window causes immediate session termination.
+            val sess = newTerminalSession(bridgeExe)
+            val selected = registerTerminalBridge(generation, sess)
+            if (selected === sess) Log.d(TAG, "AVF bridge auto-spawned (resize-notifying)")
         }
     }
 
@@ -820,9 +819,15 @@ class AvfEngine @Inject constructor(
 
     override fun createTerminalSession(client: TerminalSessionClient): TerminalSession {
         sessionClientDelegate = client
-        terminalSession?.let {
-            Log.d(TAG, "Returning auto-spawned AVF terminal session")
-            return it
+        val generation = synchronized(this) {
+            val currentGeneration = activeBootGeneration
+                ?: throw IllegalStateException("AVF terminal requires an active VM generation")
+            terminalSlot.current()?.takeIf { it.isRunning }?.let {
+                Log.d(TAG, "Returning auto-spawned AVF terminal session")
+                return it
+            }
+            terminalSlot.clearDead(currentGeneration) { it.isRunning }?.finishIfRunning()
+            currentGeneration
         }
         // start() hasn't reached spawnBridge yet — spawn synchronously as fallback.
         Log.w(TAG, "createTerminalSession called before bridge auto-spawn; spawning now")
@@ -830,7 +835,13 @@ class AvfEngine @Inject constructor(
         if (!bridgeExe.exists()) {
             throw IllegalStateException("podroid-bridge not found at ${bridgeExe.absolutePath}")
         }
-        val sess = com.excp.podroid.engine.ResizeNotifyingSession(
+        val candidate = newTerminalSession(bridgeExe)
+        return registerTerminalBridge(generation, candidate)
+            ?: throw IllegalStateException("AVF VM generation ended while creating terminal session")
+    }
+
+    private fun newTerminalSession(bridgeExe: File): TerminalSession =
+        com.excp.podroid.engine.ResizeNotifyingSession(
             shellPath = bridgeExe.absolutePath,
             cwd = vmPaths.avfWorkingDirectory.absolutePath,
             args = arrayOf(bridgeExe.absolutePath, terminalSockPath, ctrlSockPath),
@@ -838,10 +849,31 @@ class AvfEngine @Inject constructor(
             transcriptRows = 2000,
             client = proxySessionClient,
             onResize = { rows, cols -> sendResizeDebounced(rows, cols) },
+        ).also { it.updateSize(80, 24, 0, 0) }
+
+    @Synchronized
+    private fun hasLiveTerminalBridge(generation: Long): Boolean =
+        generation == activeBootGeneration && generation == vmGeneration &&
+            terminalSlot.current()?.isRunning == true
+
+    @Synchronized
+    private fun registerTerminalBridge(generation: Long, candidate: TerminalSession): TerminalSession? {
+        terminalSlot.clearDead(generation) { it.isRunning }?.finishIfRunning()
+        val registration = terminalSlot.register(
+            candidate = candidate,
+            candidateGeneration = generation,
+            currentGeneration = activeBootGeneration,
+            active = generation == vmGeneration &&
+                (_state.value is VmState.Starting || _state.value is VmState.Running),
+            nonQuiescent = !_quiescent.value && !cleanedUp.get(),
         )
-        sess.updateSize(80, 24, 0, 0)
-        terminalSession = sess
-        return sess
+        registration.rejected?.finishIfRunning()
+        return registration.selected
+    }
+
+    @Synchronized
+    private fun retireTerminalBridge() {
+        terminalSlot.clear()?.finishIfRunning()
     }
 
     /**
@@ -941,11 +973,9 @@ class AvfEngine @Inject constructor(
             logOut?.close()
         }
         logOut = null
-        // Tear down the old terminal session so the next start()'s spawnBridge
-        // doesn't short-circuit on the stale reference and leave the fanout's
-        // accept() blocked forever (visible as "stuck at Initializing AVF...").
-        runCatching { terminalSession?.finishIfRunning() }
-        terminalSession = null
+        // Detach under the cleanup monitor before publishing quiescence. A
+        // delayed bridge candidate can no longer register for this generation.
+        runCatching { terminalSlot.clear()?.finishIfRunning() }
         vmHandle = null
         // Last cleanup write. Callers establish a terminal state before public
         // quiescence; internal adaptive relaunches deliberately retain Starting.

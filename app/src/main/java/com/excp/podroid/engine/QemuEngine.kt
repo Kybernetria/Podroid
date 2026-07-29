@@ -70,11 +70,13 @@ class QemuEngine @Inject constructor(
 
     private val _bootStage = MutableStateFlow("")
 
-    // @Volatile: written on the main thread (autoStartBridge/createTerminalSession)
-    // and on Dispatchers.IO (cleanup), read from both — like the lifecycle fields below.
-    @Volatile private var _terminalSession: TerminalSession? = null
+    // Every slot access is serialized on this engine's monitor, the same
+    // monitor held by cleanup(), so a session built outside the lock can only
+    // register into its still-live launch generation.
+    private val terminalSlot = GenerationBoundTerminalSlot<TerminalSession>()
 
-    override val terminalSession: TerminalSession? get() = _terminalSession
+    override val terminalSession: TerminalSession?
+        @Synchronized get() = terminalSlot.current()
     override val bootStage: StateFlow<String> = _bootStage.asStateFlow()
 
     override val backendId: String = "qemu"
@@ -165,7 +167,7 @@ class QemuEngine @Inject constructor(
                     }
                 },
             ) && stage == "Ready") {
-            autoStartBridge()
+            autoStartBridge(generation)
         }
     }
 
@@ -223,73 +225,76 @@ class QemuEngine @Inject constructor(
         ioScope?.launch { settingsRepository.setLastBootDurationMs(duration) }
     }
 
-    private fun autoStartBridge() {
+    private fun autoStartBridge(generation: Long) {
         android.os.Handler(android.os.Looper.getMainLooper()).post {
-            if (_terminalSession != null) return@post
-            if (_state.value !is VmState.Running && _state.value !is VmState.Starting) return@post
-            // A late onReady could land after cleanup() already deleted the
-            // sockets; don't arm a bridge against a torn-down VM lifetime.
-            if (cleanedUp.get()) return@post
-
-            // Bridge connects to terminal.sock (virtio-console, separate from serial).
-            // No handoff with the boot monitor needed — they use different sockets.
+            if (hasLiveTerminalBridge(generation)) return@post
             val bridgeExe = File(context.applicationInfo.nativeLibraryDir, "libpodroid-bridge.so")
             if (!bridgeExe.exists()) return@post
 
-            val sess = TerminalSession(
-                bridgeExe.absolutePath,
-                vmPaths.qemuWorkingDirectory.absolutePath,
-                arrayOf(bridgeExe.absolutePath, terminalSockPath, ctrlSockPath),
-                null,
-                2000,
-                proxySessionClient,
-            )
-            // Cell pixel dims default to 0 — TerminalView.updateSize() pushes real values once measured.
-        sess.updateSize(80, 24, 0, 0)
-            _terminalSession = sess
-            Log.d(TAG, "Bridge auto-started on terminal.sock")
+            // Construction starts the subprocess and therefore stays outside the
+            // engine monitor. Registration below revalidates the exact launch;
+            // cleanup winning this window causes immediate session termination.
+            val sess = newTerminalSession(bridgeExe)
+            val selected = registerTerminalBridge(generation, sess)
+            if (selected === sess) Log.d(TAG, "Bridge auto-started on terminal.sock")
         }
     }
 
     override fun createTerminalSession(client: TerminalSessionClient): TerminalSession {
         sessionClientDelegate = client
-
-        // Reuse the boot-time session ONLY if it's still alive. A finished
-        // session (bridge died while the VM kept running) must not be handed
-        // back — re-entering the terminal screen would otherwise show the dead
-        // "[Process completed]" buffer forever. Drop it and fall through to
-        // spawn a fresh bridge against the still-running VM.
-        val cached = _terminalSession
-        if (cached != null && cached.isRunning) {
-            Log.d(TAG, "Returning pre-started terminal session")
-            return cached
-        }
-        if (cached != null) {
-            Log.d(TAG, "Cached terminal session is dead — recreating against the running VM")
-            _terminalSession = null
+        val generation = synchronized(this) {
+            val currentGeneration = activeLaunchGeneration
+                ?: throw IllegalStateException("QEMU terminal requires an active VM generation")
+            terminalSlot.current()?.takeIf { it.isRunning }?.let {
+                Log.d(TAG, "Returning pre-started terminal session")
+                return it
+            }
+            terminalSlot.clearDead(currentGeneration) { it.isRunning }?.finishIfRunning()
+            currentGeneration
         }
 
-        // Fallback: create session now
         val bridgeExe = File(context.applicationInfo.nativeLibraryDir, "libpodroid-bridge.so")
         if (!bridgeExe.exists()) {
             throw IllegalStateException("podroid-bridge not found at ${bridgeExe.absolutePath}")
         }
+        val candidate = newTerminalSession(bridgeExe)
+        return registerTerminalBridge(generation, candidate)
+            ?: throw IllegalStateException("QEMU VM generation ended while creating terminal session")
+    }
 
-        val sess = TerminalSession(
-            bridgeExe.absolutePath,
-            vmPaths.qemuWorkingDirectory.absolutePath,
-            arrayOf(bridgeExe.absolutePath, terminalSockPath, ctrlSockPath),
-            null,
-            2000,
-            proxySessionClient,
-        )
-
+    private fun newTerminalSession(bridgeExe: File): TerminalSession = TerminalSession(
+        bridgeExe.absolutePath,
+        vmPaths.qemuWorkingDirectory.absolutePath,
+        arrayOf(bridgeExe.absolutePath, terminalSockPath, ctrlSockPath),
+        null,
+        2000,
+        proxySessionClient,
+    ).also {
         // Cell pixel dims default to 0 — TerminalView.updateSize() pushes real values once measured.
-        sess.updateSize(80, 24, 0, 0)
+        it.updateSize(80, 24, 0, 0)
+    }
 
-        _terminalSession = sess
-        Log.d(TAG, "Terminal session created in Qemu singleton")
-        return sess
+    @Synchronized
+    private fun hasLiveTerminalBridge(generation: Long): Boolean =
+        generation == activeLaunchGeneration && terminalSlot.current()?.isRunning == true
+
+    @Synchronized
+    private fun registerTerminalBridge(generation: Long, candidate: TerminalSession): TerminalSession? {
+        terminalSlot.clearDead(generation) { it.isRunning }?.finishIfRunning()
+        val registration = terminalSlot.register(
+            candidate = candidate,
+            candidateGeneration = generation,
+            currentGeneration = activeLaunchGeneration,
+            active = _state.value is VmState.Running || _state.value is VmState.Starting,
+            nonQuiescent = !_quiescent.value && !cleanedUp.get(),
+        )
+        registration.rejected?.finishIfRunning()
+        return registration.selected
+    }
+
+    @Synchronized
+    private fun retireTerminalBridge() {
+        terminalSlot.clear()?.finishIfRunning()
     }
 
     override suspend fun start(portForwards: List<PortForwardRule>, config: VmConfig) {
@@ -303,6 +308,9 @@ class QemuEngine @Inject constructor(
                 return
             }
             val claimedGeneration = launchGate.begin()
+            // Defensive generation boundary: cleanup normally emptied the slot,
+            // but a stale reference must never suppress this run's bridge.
+            retireTerminalBridge()
             activeLaunchGeneration = claimedGeneration
             bootStageGate.arm(claimedGeneration)
             cleanedUp.set(false)
@@ -504,7 +512,7 @@ class QemuEngine @Inject constructor(
                         if (promoted) {
                             Log.w(TAG, "Ready! not detected within ${BOOT_READY_SAFETY_MS / 1000}s - " +
                                 "promoting to Running (boot detection may have missed the marker)")
-                            autoStartBridge()
+                            autoStartBridge(generation)
                         }
                     }
                 }
@@ -643,8 +651,7 @@ class QemuEngine @Inject constructor(
         qemuDispatcher?.close()
         qemuDispatcher = null
         process = null
-        _terminalSession?.finishIfRunning()
-        _terminalSession = null
+        terminalSlot.clear()?.finishIfRunning()
         sessionClientDelegate = null
         _consoleText.value = ""
         _runningSinceMs = null

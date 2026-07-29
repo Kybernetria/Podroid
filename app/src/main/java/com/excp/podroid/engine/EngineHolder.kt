@@ -324,9 +324,16 @@ class EngineHolder @Inject constructor(
         .flatMapLatest { eng -> eng.state.map { st -> normalizeCycleState(eng, st) } }
         .stateIn(scope, SharingStarted.Eagerly, VmState.Idle)
 
-    override val quiescent: StateFlow<Boolean> = currentFlow
+    private val quiescentUpdates: StateFlow<Boolean> = currentFlow
         .flatMapLatest { it.quiescent }
         .stateIn(scope, SharingStarted.Eagerly, current.quiescent.value)
+
+    // Collection follows the routed backend normally, but manager guards read
+    // value imperatively. Do not expose stateIn's asynchronously propagated
+    // cache there: the routed/claimed concrete engine is authoritative.
+    override val quiescent: StateFlow<Boolean> = ExactValueStateFlow(quiescentUpdates) {
+        current.quiescent.value
+    }
 
     override val bootStage: StateFlow<String> = currentFlow
         .flatMapLatest { it.bootStage }

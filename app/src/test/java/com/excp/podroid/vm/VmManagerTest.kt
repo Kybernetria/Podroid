@@ -1,5 +1,6 @@
 package com.excp.podroid.vm
 
+import com.excp.podroid.engine.ExactValueStateFlow
 import com.excp.podroid.engine.VmConfig
 import com.excp.podroid.engine.VmState
 import java.io.IOException
@@ -386,6 +387,44 @@ class VmManagerTest {
     }
 
     @Test
+    fun `stale routed true cannot release stop install or remove guards`() = runBlocking {
+        val runtime = DelayedQuiescenceRuntime().apply {
+            delegate.state.value = VmState.Running
+            exactQuiescent.value = false
+            collectedQuiescent.value = true
+            delegate.onStop = { }
+            delegate.onForceStop = { }
+        }
+        val files = FakeFiles()
+        var installs = 0
+        val manager = manager(
+            runtime = runtime,
+            files = files,
+            installer = object : TestInstaller() {
+                override suspend fun install(vmId: VmId) { installs++ }
+            },
+        )
+
+        val stop = async(Dispatchers.Default) { manager.stop(VmId.DEFAULT) }
+        while (runtime.delegate.stopCalls == 0) delay(5)
+        delay(20)
+        assertFalse("stale collected true must not complete stop", stop.isCompleted)
+
+        runtime.exactQuiescent.value = true
+        stop.await()
+        assertEquals(1, runtime.delegate.stopCalls)
+        assertEquals(0, runtime.delegate.forceStopCalls)
+
+        runtime.exactQuiescent.value = false
+        assertTrue(runCatching { manager.ensureInstalled(VmId.DEFAULT) }.exceptionOrNull() is IllegalStateException)
+        assertTrue(runCatching {
+            manager.remove(VmId.DEFAULT, VmRemovePolicy.PRESERVE_DATA)
+        }.exceptionOrNull() is IllegalStateException)
+        assertEquals(0, installs)
+        assertTrue(files.removePolicies.isEmpty())
+    }
+
+    @Test
     fun `error is not safe and destructive operations reject until cleanup completes`() = runBlocking {
         val runtime = FakeRuntime().apply {
             state.value = VmState.Error("stop rejected")
@@ -563,7 +602,7 @@ class VmManagerTest {
     }
 
     private fun manager(
-        runtime: FakeRuntime = FakeRuntime(),
+        runtime: ManagedVmRuntime = FakeRuntime(),
         files: FakeFiles = FakeFiles(),
         installer: VmInstaller = object : TestInstaller() {
             override suspend fun install(vmId: VmId) { files.installed = true }
@@ -638,6 +677,16 @@ class VmManagerTest {
                 VmQmpOperation.QueryStatus -> VmQmpResult.Status("running")
                 VmQmpOperation.QueryVersion -> VmQmpResult.Version(9, 2, 1)
             })
+        }
+    }
+
+    private class DelayedQuiescenceRuntime(
+        val delegate: FakeRuntime = FakeRuntime(),
+    ) : ManagedVmRuntime by delegate {
+        val exactQuiescent = MutableStateFlow(true)
+        val collectedQuiescent = MutableStateFlow(true)
+        override val quiescent: StateFlow<Boolean> = ExactValueStateFlow(collectedQuiescent) {
+            exactQuiescent.value
         }
     }
 

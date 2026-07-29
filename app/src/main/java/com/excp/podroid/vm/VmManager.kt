@@ -29,7 +29,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -434,7 +433,10 @@ class DefaultVmManager internal constructor(
         if (task?.isActive == true) task.cancel()
         return withTimeoutOrNull(timeoutMs) {
             task?.join()
-            if (!runtime.quiescent.value) runtime.quiescent.first { it }
+            // Collection can briefly replay a flattened router cache. Poll the
+            // StateFlow's exact imperative value so stale true never completes
+            // a stop while the concrete backend still owns resources.
+            while (!runtime.quiescent.value) delay(STOP_POLL_MS)
             true
         } == true
     }
@@ -448,11 +450,6 @@ class DefaultVmManager internal constructor(
             while (!runtime.quiescent.value && !forceSignal.isCompleted) delay(STOP_POLL_MS)
             if (runtime.quiescent.value) StopWait.QUIESCENT else StopWait.FORCE
         } ?: StopWait.TIMEOUT
-    }
-
-    private suspend fun awaitQuiescence(timeoutMs: Long): Boolean {
-        if (runtime.quiescent.value) return true
-        return withTimeoutOrNull(timeoutMs) { runtime.quiescent.first { it }; true } == true
     }
 
     private suspend fun awaitInitial(vmId: VmId) {
