@@ -80,6 +80,24 @@ class VmFileSafetyTest {
     }
 
     @Test
+    fun `physical validation allows a system symlink ancestor above a real filesDir`() {
+        val realSystemRoot = temporaryFolder.newFolder("real-vm-system")
+        val aliasRoot = temporaryFolder.root.toPath().resolve("vm-system-alias")
+        Files.createSymbolicLink(aliasRoot, realSystemRoot.toPath())
+        val filesDir = aliasRoot.resolve("app/files").toFile().apply { mkdirs() }
+        val paths = VmPaths.default(filesDir)
+        val security = VmPathSecurity(paths)
+
+        security.prepareExtractionLayout()
+        paths.kernel.writeText("kernel")
+        paths.initrd.writeText("initrd")
+        paths.rootfs.writeText("rootfs")
+        security.validateForLaunch()
+
+        assertTrue(paths.instanceDirectory.toPath().toRealPath().startsWith(filesDir.toPath().toRealPath()))
+    }
+
+    @Test
     fun `physical validation rejects symlinked instance ancestor`() {
         val filesDir = temporaryFolder.newFolder("files")
         val outside = temporaryFolder.newFolder("outside")

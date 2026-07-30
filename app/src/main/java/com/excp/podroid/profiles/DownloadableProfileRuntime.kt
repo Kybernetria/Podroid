@@ -95,7 +95,8 @@ internal class DownloadableProfileEnvironment @Inject constructor(
         (configuration as? DownloadableProfileConfigurationResult.Configured)?.value?.approvedOrigins
     private val trustPolicy: ProfileTrustPolicy? =
         (configuration as? DownloadableProfileConfigurationResult.Configured)?.value?.trustPolicy
-    private val repositoryDirectory = context.filesDir.resolve(PROFILE_STORE_DIRECTORY)
+    private val filesDirectory = context.filesDir
+    private val repositoryDirectory = filesDirectory.resolve(PROFILE_STORE_DIRECTORY)
     private val storageFile = vmPaths.storageImage
     private val uefiVarsFile = vmPaths.uefiVars
 
@@ -103,6 +104,7 @@ internal class DownloadableProfileEnvironment @Inject constructor(
         val origins = approvedOrigins ?: return null
         val trust = trustPolicy ?: return null
         return ProfileRepository(
+            filesDirectory = filesDirectory,
             repositoryDirectory = repositoryDirectory,
             storageFile = storageFile,
             approvedOrigins = origins,

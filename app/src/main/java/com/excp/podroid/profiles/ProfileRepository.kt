@@ -1,5 +1,6 @@
 package com.excp.podroid.profiles
 
+import com.excp.podroid.vm.AppPrivatePathSecurity
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
@@ -254,6 +255,7 @@ internal object CanonicalNoCloudSeedPolicy : ProfileNoCloudSeedPolicy {
  * fixed for the repository lifetime; no operation accepts a caller-selected path.
  */
 class ProfileRepository(
+    filesDirectory: File,
     repositoryDirectory: File,
     storageFile: File,
     private val approvedOrigins: ApprovedArtifactOrigins,
@@ -271,6 +273,7 @@ class ProfileRepository(
     private val noCloudSeedPolicy: ProfileNoCloudSeedPolicy = CanonicalNoCloudSeedPolicy,
     uefiVarsFile: File = storageFile.parentFile.resolve("uefi-vars.fd"),
 ) {
+    private val filesRoot = filesDirectory.toPath().toAbsolutePath().normalize()
     private val root = repositoryDirectory.toPath().toAbsolutePath().normalize()
     private val blobs = root.resolve(BLOBS_DIRECTORY)
     private val prepared = root.resolve(PREPARED_DIRECTORY)
@@ -301,6 +304,12 @@ class ProfileRepository(
     private val confirmationOwner = Any()
 
     init {
+        require(root.startsWith(filesRoot) && root != filesRoot) {
+            "repository metadata tree must be below filesDir"
+        }
+        require(fixedStorage.startsWith(filesRoot) && fixedVars.startsWith(filesRoot)) {
+            "fixed mutable files must be below filesDir"
+        }
         require(!fixedStorage.startsWith(root) && !fixedVars.startsWith(root)) {
             "fixed mutable files must be outside the repository metadata tree"
         }
@@ -1171,10 +1180,7 @@ class ProfileRepository(
 
     private fun captureFileIdentity(path: Path, label: String, requireStableKeys: Boolean): StorageIdentity {
         val parent = path.parent ?: throw ProfileActivationException("$label file has no parent")
-        requireDirectory(parent)
-        if (parent.toRealPath() != parent) {
-            throw ProfileActivationException("fixed storage parent contains a symbolic path")
-        }
+        requireAppDirectory(parent, "fixed storage parent")
         val parentAttributes = attributesNoFollow(parent)
         val parentKey = parentAttributes.fileKey()?.toString()
         if (requireStableKeys && parentKey.isNullOrBlank()) {
@@ -1784,8 +1790,7 @@ class ProfileRepository(
     }
 
     private fun validateTreeAndCleanTemps() {
-        requireDirectory(root)
-        if (root.toRealPath() != root) throw ProfileRepositoryCorruptException("repository root is not a physical fixed path")
+        requireAppDirectory(root, "repository root")
         validateDirectoryEntries(root, setOf(LOCK_FILE, BLOBS_DIRECTORY, PREPARED_DIRECTORY, STATE_DIRECTORY, TEMP_DIRECTORY))
         requireRegularFile(lockPath, "repository lock")
         listOf(blobs, prepared, state, temporary).forEach(::requireDirectory)
@@ -2544,9 +2549,14 @@ class ProfileRepository(
 
     @Synchronized
     private fun prepareLayoutForLock() {
+        try {
+            AppPrivatePathSecurity.realDirectoryAnchor(filesRoot, "filesDir")
+        } catch (failure: IOException) {
+            throw ProfileRepositoryCorruptException("filesDir is not a fixed directory", failure)
+        }
         if (!existsNoFollow(root)) {
             val parent = root.parent ?: throw ProfileRepositoryCorruptException("repository root has no parent")
-            requireDirectory(parent)
+            requireAppDirectory(parent, "repository root parent")
             try {
                 Files.createDirectory(root)
                 forceDirectory(parent)
@@ -2554,8 +2564,7 @@ class ProfileRepository(
                 requireDirectory(root)
             }
         }
-        requireDirectory(root)
-        if (root.toRealPath() != root) throw ProfileRepositoryCorruptException("repository root contains a symbolic path")
+        requireAppDirectory(root, "repository root")
         listOf(blobs, prepared, state, temporary).forEach { path ->
             if (!existsNoFollow(path)) createDirectory(path) else requireDirectory(path)
         }
@@ -2580,6 +2589,14 @@ class ProfileRepository(
 
     private fun ensureNoPath(path: Path) {
         if (existsNoFollow(path)) throw ProfileRepositoryCorruptException("exclusive temporary path already exists")
+    }
+
+    private fun requireAppDirectory(path: Path, label: String) {
+        try {
+            AppPrivatePathSecurity.requireDirectoryDescendant(filesRoot, path, label)
+        } catch (failure: IOException) {
+            throw ProfileRepositoryCorruptException("$label is not physically confined to filesDir", failure)
+        }
     }
 
     private fun requireDirectory(path: Path) {

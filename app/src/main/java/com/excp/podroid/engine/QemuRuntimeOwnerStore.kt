@@ -6,6 +6,7 @@ package com.excp.podroid.engine
 
 import android.net.LocalSocket
 import android.os.Process
+import com.excp.podroid.vm.AppPrivatePathSecurity
 import com.excp.podroid.vm.LifecycleErrorCode
 import com.excp.podroid.vm.StaleRuntimeEvidence
 import com.excp.podroid.vm.VmPathSecurity
@@ -155,6 +156,7 @@ internal class QemuRuntimeOwnerStore(
     paths: VmPaths,
     private val processIdentityReader: ProcessIdentityReader = ProcProcessIdentityReader,
 ) {
+    private val filesRoot = paths.filesDirectory.toPath().toAbsolutePath().normalize()
     private val instanceRoot = paths.instanceDirectory.toPath().toAbsolutePath().normalize()
     private val ownerPath = paths.qemuOwnerRecord.toPath().toAbsolutePath().normalize()
     private val endpoints = listOf(
@@ -206,6 +208,7 @@ internal class QemuRuntimeOwnerStore(
     fun inspect(): QemuOwnerInspection {
         if (!existsNoFollow(ownerPath)) return QemuOwnerInspection.Missing
         return try {
+            validateRoot()
             val checked = checkedOwnerFile()
             QemuOwnerInspection.Valid(decode(readCheckedOwner(checked)), checked)
         } catch (_: SecurityException) {
@@ -339,9 +342,10 @@ internal class QemuRuntimeOwnerStore(
     }
 
     private fun validateRoot() {
-        val attributes = attributes(instanceRoot)
-        if (!attributes.isDirectory || attributes.isSymbolicLink || instanceRoot.toRealPath() != instanceRoot) {
-            throw SecurityException("Unsafe QEMU instance directory")
+        try {
+            AppPrivatePathSecurity.requireDirectoryDescendant(filesRoot, instanceRoot, "QEMU instance")
+        } catch (failure: IOException) {
+            throw SecurityException("Unsafe QEMU instance directory", failure)
         }
     }
 

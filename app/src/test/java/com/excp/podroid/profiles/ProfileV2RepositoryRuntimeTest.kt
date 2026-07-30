@@ -474,6 +474,7 @@ class ProfileV2RepositoryRuntimeTest {
         trustPolicy: ProfileTrustPolicy = trust,
         noCloudSeedPolicy: ProfileNoCloudSeedPolicy = ProfileNoCloudSeedPolicy { _, _ -> },
     ) = ProfileRepository(
+        filesDirectory = root,
         repositoryDirectory = File(root, "store"),
         storageFile = storage,
         approvedOrigins = origins,

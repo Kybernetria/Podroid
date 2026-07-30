@@ -38,7 +38,7 @@ class VmPathSecurity(private val paths: VmPaths) {
     /** Validates the hierarchy before cleanup/copy and creates only missing real directories. */
     @Throws(IOException::class)
     fun prepareExtractionLayout() {
-        validateAbsoluteAncestors(filesRoot)
+        AppPrivatePathSecurity.realDirectoryAnchor(filesRoot, "filesDir")
         createDirectoryNoFollow(instancesRoot)
         createDirectoryNoFollow(instanceRoot)
         validateHierarchy()
@@ -101,46 +101,23 @@ class VmPathSecurity(private val paths: VmPaths) {
     }
 
     private fun validateHierarchy() {
-        validateAbsoluteAncestors(filesRoot)
         validateHierarchyTo(instanceRoot)
-        val realFilesRoot = filesRoot.toRealPath()
-        val realInstanceRoot = instanceRoot.toRealPath()
-        val expectedRealInstance = realFilesRoot
-            .resolve(VmPaths.INSTANCES_DIRECTORY)
-            .resolve(paths.vmId.serialized)
-            .normalize()
-        if (realInstanceRoot != expectedRealInstance) {
-            throw IOException("VM instance is not physically confined to filesDir: $realInstanceRoot")
-        }
     }
 
     private fun validateHierarchyTo(path: Path) {
         val normalized = confined(path, allowInstanceRoot = true)
-        var current = filesRoot
-        requireDirectory(current)
-        val relative = filesRoot.relativize(normalized)
-        for (segment in relative) {
-            current = current.resolve(segment)
-            requireDirectory(current)
-        }
-        val realRoot = filesRoot.toRealPath()
-        val realPath = normalized.toRealPath()
-        if (!realPath.startsWith(realRoot)) {
-            throw IOException("VM path escapes filesDir physically: $normalized -> $realPath")
-        }
-    }
-
-    private fun validateAbsoluteAncestors(path: Path) {
-        var current = path.root ?: throw IOException("VM path is not absolute: $path")
-        requireDirectory(current)
-        for (segment in path) {
-            current = current.resolve(segment)
-            requireDirectory(current)
-        }
+        AppPrivatePathSecurity.requireDirectoryDescendant(filesRoot, normalized, "VM path")
     }
 
     private fun createDirectoryNoFollow(path: Path) {
         val normalized = path.toAbsolutePath().normalize()
+        if (!normalized.startsWith(filesRoot)) {
+            throw IOException("VM directory escapes filesDir: $normalized")
+        }
+        if (normalized == filesRoot) {
+            AppPrivatePathSecurity.realDirectoryAnchor(filesRoot, "filesDir")
+            return
+        }
         if (existsNoFollow(normalized)) {
             requireDirectory(normalized)
             return
@@ -155,6 +132,7 @@ class VmPathSecurity(private val paths: VmPaths) {
             requireDirectory(normalized)
         }
         requireDirectory(normalized)
+        AppPrivatePathSecurity.requireDirectoryDescendant(filesRoot, normalized, "VM path")
     }
 
     private fun scanInstanceTree(allowRuntimeEndpoints: Boolean) {

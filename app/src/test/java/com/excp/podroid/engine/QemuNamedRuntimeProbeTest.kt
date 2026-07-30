@@ -19,6 +19,40 @@ import org.junit.rules.TemporaryFolder
 class QemuNamedRuntimeProbeTest {
     @get:Rule val temporary = TemporaryFolder()
 
+    @Test fun `owner store allows a system symlink ancestor above a real filesDir`() {
+        val realSystemRoot = temporary.newFolder("real-qemu-system")
+        val aliasRoot = temporary.root.toPath().resolve("qemu-system-alias")
+        Files.createSymbolicLink(aliasRoot, realSystemRoot.toPath())
+        val filesDir = aliasRoot.resolve("app/files").toFile().apply { mkdirs() }
+        val paths = VmPaths.default(filesDir)
+        assertTrue(paths.instanceDirectory.mkdirs())
+        val reader = MutableReader(ProcessIdentityObservation.Alive(QemuProcessIdentity(PID, START)))
+        val store = QemuRuntimeOwnerStore(paths, reader)
+
+        store.publish(store.capture(PID, GENERATION))
+
+        assertTrue(paths.qemuOwnerRecord.isFile)
+    }
+
+    @Test fun `owner store rejects a symlinked app-controlled instance directory`() {
+        val filesDir = temporary.newFolder("hostile-qemu-files")
+        val paths = VmPaths.default(filesDir)
+        assertTrue(paths.instancesDirectory.mkdir())
+        val outside = temporary.newFolder("outside-qemu-instance")
+        Files.createSymbolicLink(paths.instanceDirectory.toPath(), outside.toPath())
+        outside.resolve(paths.qemuOwnerRecord.name).writeText(
+            "version=1\npid=$PID\nstart_time_ticks=$START\ngeneration=$GENERATION",
+        )
+        val reader = MutableReader(ProcessIdentityObservation.Alive(QemuProcessIdentity(PID, START)))
+        val store = QemuRuntimeOwnerStore(paths, reader)
+
+        assertTrue(store.inspect() is QemuOwnerInspection.Uncertain)
+        val failure = runCatching { store.publish(store.capture(PID, GENERATION)) }.exceptionOrNull()
+
+        assertTrue(failure is SecurityException)
+        assertEquals(1, outside.listFiles()!!.size)
+    }
+
     @Test fun `live owner without a working QMP endpoint is uncertain`() = runBlocking {
         val fixture = fixture()
         fixture.publishOwner()

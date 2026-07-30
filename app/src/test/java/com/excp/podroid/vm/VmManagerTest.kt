@@ -1797,6 +1797,21 @@ class VmManagerTest {
     }
 
     @Test
+    fun `removal allows a system symlink ancestor above a real filesDir`() {
+        val realSystemRoot = temporaryFolder.newFolder("real-remove-system")
+        val aliasRoot = temporaryFolder.root.toPath().resolve("remove-system-alias")
+        Files.createSymbolicLink(aliasRoot, realSystemRoot.toPath())
+        val filesDir = aliasRoot.resolve("app/files").toFile().apply { mkdirs() }
+        val paths = createInstalledPaths(filesDir)
+        paths.storageImage.writeText("persistent")
+
+        VmPathFiles(paths).remove(VmId.DEFAULT, VmRemovePolicy.PRESERVE_DATA)
+
+        assertEquals("persistent", paths.storageImage.readText())
+        assertFalse(paths.kernel.exists())
+    }
+
+    @Test
     fun `remove preserves storage unless delete data is explicit and never follows symlinks`() {
         val filesDir = temporaryFolder.newFolder("remove-files")
         val paths = createInstalledPaths(filesDir)

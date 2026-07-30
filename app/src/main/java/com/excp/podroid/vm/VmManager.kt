@@ -1521,23 +1521,14 @@ internal class VmPathFiles(private val paths: VmPaths) : VmFiles {
 
     private fun requireFilesRootHierarchy() {
         val filesRoot = paths.filesDirectory.toPath().toAbsolutePath().normalize()
-        var current = filesRoot.root ?: throw IOException("filesDir is not absolute")
-        for (segment in filesRoot) {
-            current = current.resolve(segment)
-            if (!directory(current)) throw IOException("Unsafe filesDir hierarchy: $current")
-        }
+        AppPrivatePathSecurity.realDirectoryAnchor(filesRoot, "filesDir")
     }
 
     private fun requireSafeHierarchy() {
-        requireFilesRootHierarchy()
         val filesRoot = paths.filesDirectory.toPath().toAbsolutePath().normalize()
         val instances = paths.instancesDirectory.toPath().toAbsolutePath().normalize()
-        if (!directory(instances) || !directory(instanceRoot)) {
-            throw IOException("VM instance hierarchy is not made of real directories")
-        }
-        val expected = filesRoot.toRealPath().resolve(VmPaths.INSTANCES_DIRECTORY)
-            .resolve(paths.vmId.serialized).normalize()
-        if (instanceRoot.toRealPath() != expected) throw IOException("VM instance escaped filesDir")
+        AppPrivatePathSecurity.requireDirectoryDescendant(filesRoot, instances, "VM instances")
+        AppPrivatePathSecurity.requireDirectoryDescendant(filesRoot, instanceRoot, "VM instance")
     }
 
     private fun requireVm(vmId: VmId) {

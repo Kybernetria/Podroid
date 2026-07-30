@@ -14,6 +14,21 @@ class LegacyVmFilesMigrationTest {
     @get:Rule val temporaryFolder = TemporaryFolder()
 
     @Test
+    fun `allows a system symlink ancestor above a real filesDir`() {
+        val realSystemRoot = temporaryFolder.newFolder("real-system")
+        val aliasRoot = temporaryFolder.root.toPath().resolve("system-alias")
+        Files.createSymbolicLink(aliasRoot, realSystemRoot.toPath())
+        val filesDir = aliasRoot.resolve("app/files").toFile().apply { mkdirs() }
+        val paths = VmPaths.default(filesDir)
+        filesDir.resolve("storage.img").writeText("persistent")
+
+        LegacyVmFilesMigration(filesDir, paths).migrate()
+
+        assertEquals("persistent", paths.storageImage.readText())
+        assertFalse(filesDir.resolve("storage.img").exists())
+    }
+
+    @Test
     fun `moves legacy persistent assets logs sockets and qemu data without loss`() {
         val filesDir = temporaryFolder.newFolder("files")
         val paths = VmPaths.default(filesDir)
@@ -104,6 +119,20 @@ class LegacyVmFilesMigrationTest {
 
         assertEquals("legacy", filesDir.resolve("storage.img").readText())
         assertEquals("racing destination", paths.storageImage.readText())
+    }
+
+    @Test
+    fun `rejects a symlink filesDir leaf`() {
+        val realFilesDir = temporaryFolder.newFolder("real-files-leaf")
+        val filesDir = temporaryFolder.root.resolve("files-link")
+        Files.createSymbolicLink(filesDir.toPath(), realFilesDir.toPath())
+        val paths = VmPaths.default(filesDir)
+        realFilesDir.resolve("storage.img").writeText("persistent")
+
+        expectIOException { LegacyVmFilesMigration(filesDir, paths).migrate() }
+
+        assertEquals("persistent", realFilesDir.resolve("storage.img").readText())
+        assertFalse(paths.instanceDirectory.exists())
     }
 
     @Test

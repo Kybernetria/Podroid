@@ -44,7 +44,7 @@ class LegacyVmFilesMigration internal constructor(
         }
 
         synchronized(PROCESS_LOCK) {
-            verifyAbsoluteDirectoryAncestors(filesRoot)
+            AppPrivatePathSecurity.realDirectoryAnchor(filesRoot, "filesDir")
             val options = setOf<OpenOption>(
                 StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE,
@@ -60,7 +60,7 @@ class LegacyVmFilesMigration internal constructor(
     }
 
     private fun migrateLocked() {
-        verifyExistingPath(filesRoot, expectedDirectory = true)
+        AppPrivatePathSecurity.realDirectoryAnchor(filesRoot, "filesDir")
         verifyDestinationAncestors()
 
         val plans = LEGACY_ENTRIES.map { entry ->
@@ -74,6 +74,7 @@ class LegacyVmFilesMigration internal constructor(
 
         createDirectorySafely(instancesRoot)
         createDirectorySafely(instanceRoot)
+        AppPrivatePathSecurity.requireDirectoryDescendant(filesRoot, instanceRoot, "VM instance")
 
         for (plan in plans) {
             if (!existsNoFollow(plan.source)) continue
@@ -182,15 +183,6 @@ class LegacyVmFilesMigration internal constructor(
             verifyExistingPath(path, expectedDirectory = true)
         }
         verifyExistingPath(path, expectedDirectory = true)
-    }
-
-    private fun verifyAbsoluteDirectoryAncestors(path: Path) {
-        var current = path.root ?: throw IOException("VM files path is not absolute: $path")
-        verifyExistingPath(current, expectedDirectory = true)
-        for (segment in path) {
-            current = current.resolve(segment)
-            verifyExistingPath(current, expectedDirectory = true)
-        }
     }
 
     private fun verifyExistingPath(path: Path, expectedDirectory: Boolean) {

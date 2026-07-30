@@ -858,6 +858,57 @@ class ProfileRepositoryTest {
     }
 
     @Test
+    fun `repository allows a system symlink ancestor above a real filesDir`() {
+        val realSystemRoot = temporaryFolder.newFolder("real-profile-system")
+        val aliasRoot = temporaryFolder.root.toPath().resolve("profile-system-alias")
+        Files.createSymbolicLink(aliasRoot, realSystemRoot.toPath())
+        val filesDir = aliasRoot.resolve("app/files").toFile().apply { mkdirs() }
+        val root = filesDir.resolve("profile-store")
+        val storage = filesDir.resolve("instances/default/storage.img").apply {
+            parentFile.mkdirs()
+            writeText("storage")
+        }
+
+        repository(root, RecordingFetcher(artifactBytes("alias")), storage = storage).recover()
+
+        assertTrue(root.isDirectory)
+        assertTrue(root.toPath().toRealPath().startsWith(filesDir.toPath().toRealPath()))
+    }
+
+    @Test
+    fun `repository rejects a symlink root leaf`() {
+        val filesDir = temporaryFolder.newFolder("hostile-profile-files")
+        val outside = temporaryFolder.newFolder("outside-profile-root")
+        val root = filesDir.resolve("profile-store")
+        Files.createSymbolicLink(root.toPath(), outside.toPath())
+
+        assertFailure<ProfileRepositoryCorruptException> {
+            repository(root, RecordingFetcher(artifactBytes("root-link"))).recover()
+        }
+
+        assertTrue(outside.listFiles().isNullOrEmpty())
+    }
+
+    @Test
+    fun `fixed storage rejects a symlinked app-controlled parent`() {
+        val filesDir = temporaryFolder.newFolder("hostile-storage-files")
+        val root = filesDir.resolve("profile-store")
+        val outside = temporaryFolder.newFolder("outside-storage-parent")
+        val storageParent = filesDir.resolve("instance-link")
+        Files.createSymbolicLink(storageParent.toPath(), outside.toPath())
+        val storage = storageParent.resolve("storage.img").apply { writeText("storage") }
+        val artifacts = artifactBytes("storage-link")
+        val repository = repository(root, RecordingFetcher(artifacts), storage = storage)
+        val candidate = repository.prepare(envelope(1, artifacts = artifacts)).candidate
+
+        assertFailure<ProfileRepositoryCorruptException> {
+            repository.issueDataDeletionConfirmation(candidate)
+        }
+
+        assertEquals("storage", outside.resolve("storage.img").readText())
+    }
+
+    @Test
     fun `symlink and corrupt immutable state fail closed`() {
         val root = temporaryFolder.newFolder("hostile")
         val artifacts = artifactBytes("hostile")
@@ -981,6 +1032,7 @@ class ProfileRepositoryTest {
         limits: ProfileStoreLimits = ProfileStoreLimits(reservedFreeBytes = 0),
         faultInjector: ProfileRepositoryFaultInjector = ProfileRepositoryFaultInjector { },
     ): ProfileRepository = ProfileRepository(
+        filesDirectory = root.parentFile,
         repositoryDirectory = root,
         storageFile = storage,
         approvedOrigins = origins,
