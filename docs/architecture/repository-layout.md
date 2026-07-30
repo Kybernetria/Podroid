@@ -1,13 +1,10 @@
 # Repository Layout
 
-Milestone 1 began with tracked ownership markers only. Tickets #6–#8 implement
-the first VM identity, storage, manager, and local Binder slices incrementally inside
-the existing `app/` Gradle module. Ticket #9 adds an external controller prototype;
-no inherited Android source is moved.
+Milestone 1 began with tracked ownership markers only. Tickets #6–#15 add VM identity, storage, management, local Binder, controller, persistence, reconciliation, guest networking, controller SSH, and disabled Host-transport slices incrementally. Android runtime slices remain inside the existing `app/` Gradle module; no inherited Android source is moved.
 
 | Area | Intended ownership | Milestone 1 state |
 |---|---|---|
-| `app/` | Existing logical Android application and current runtime | Authoritative through ticket #8; no Slint or ticket #9 controller code |
+| `app/` | Existing logical Android application and current runtime | Authoritative Android runtime; transport contracts/hooks compile here while remaining uncomposed |
 | `android-app/platform/` | Android APIs, permissions, networking hooks | README skeleton |
 | `android-app/ui/` | Android presentation and user interaction | README skeleton |
 | `android-app/vm-service/` | Foreground service and one-active-VM coordination | README skeleton |
@@ -16,12 +13,12 @@ no inherited Android source is moved.
 | `vm-core/qmp/` | Bounded QMP client contract | README skeleton |
 | `vm-core/storage/` | Guest image and attachment lifecycle | Instance paths + legacy migration implemented in `app/.../vm/`; module extraction deferred |
 | `vm-core/lifecycle/` | Serialized VM state machine | README skeleton |
-| `transport/api/` | Transport-neutral authenticated connection interfaces | README skeleton |
-| `transport/tailscale-android/` | Official Tailscale/libtailscale Android adapter | README skeleton |
+| `transport/api/` | Transport-neutral authenticated connection interfaces | Ticket #15 Kotlin contracts in `app/.../transport/api`; extraction deferred |
+| `transport/tailscale-android/` | Official Tailscale/libtailscale Android adapter | Ticket #15 verified debug packaging + unavailable fail-closed provider boundary |
 | `management/protocol/` | Versioned restricted management messages | README skeleton |
 | `management/ssh-server/` | Restricted SSH endpoint; never a host shell | README skeleton |
-| `controller/core/` | Shared controller client logic | Ticket #9 validated DTO/action/service boundary plus non-live in-memory preview; live protocol deferred to #16 |
-| `controller/phonectl/` | CLI adapter | README skeleton |
+| `controller/core/` | Shared controller client logic | Preview boundary plus ticket #13 strict direct guest-SSH status/exec/enrollment |
+| `controller/phonectl/` | CLI adapter | Ticket #13 strict guest-SSH CLI; Host-management protocol deferred to #16 |
 | `controller/desktop-ui/` | Slint desktop adapter | Ticket #9 external preview UI; no phone transport or Android packaging |
 | `profiles/schemas/` | Versioned profile schemas | README skeleton |
 | `profiles/alpine-direct/` | Initial known-good Alpine profile | README skeleton |

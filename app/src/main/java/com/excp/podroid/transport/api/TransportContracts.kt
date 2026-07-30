@@ -21,8 +21,11 @@ data class GuestWorkloadIdentity(val stableName: String) {
 data class TransportDeadline(val monotonicDeadlineNanos: Long) {
     init { require(monotonicDeadlineNanos > 0) }
 
-    fun remainingNanos(monotonicNowNanos: Long): Long =
-        (monotonicDeadlineNanos - monotonicNowNanos).coerceAtLeast(0)
+    fun remainingNanos(monotonicNowNanos: Long): Long {
+        require(monotonicNowNanos >= 0) { "monotonic time must be non-negative" }
+        if (monotonicNowNanos >= monotonicDeadlineNanos) return 0
+        return monotonicDeadlineNanos - monotonicNowNanos
+    }
 }
 
 fun interface TransportCancellation {
@@ -39,9 +42,11 @@ data class TransportEndpoint(
     val protocol: TransportProtocol = TransportProtocol.TCP,
 ) {
     init {
-        require(host.length in 1..MAX_HOST_CHARS && host.none { it.isWhitespace() || it == '\u0000' }) {
-            "invalid transport host"
-        }
+        require(
+            host.length in 1..MAX_HOST_CHARS &&
+                host.matches(Regex("[A-Za-z0-9][A-Za-z0-9.:-]*")) &&
+                !host.contains("..") && !host.endsWith('.') && !host.endsWith('-')
+        ) { "invalid transport host" }
         require(port in 1..65_535) { "invalid transport port" }
     }
 
@@ -120,10 +125,18 @@ data class HostTransportConfiguration(
     val controlUrl: URI,
 ) {
     init {
+        require(controlUrl.toASCIIString().length in 1..MAX_CONTROL_URL_CHARS)
         require(controlUrl.scheme == "https") { "coordination URL must use HTTPS" }
-        require(controlUrl.host != null && controlUrl.rawUserInfo == null && controlUrl.rawFragment == null) {
-            "coordination URL must be an absolute authority without credentials or fragments"
-        }
+        require(
+            controlUrl.host != null && controlUrl.rawUserInfo == null &&
+                controlUrl.rawFragment == null && controlUrl.rawQuery == null &&
+                (controlUrl.rawPath.isNullOrEmpty() || controlUrl.rawPath == "/") &&
+                controlUrl.port != 0
+        ) { "coordination URL must be an HTTPS authority without credentials, query, or fragment" }
+    }
+
+    companion object {
+        const val MAX_CONTROL_URL_CHARS = 2_048
     }
 }
 

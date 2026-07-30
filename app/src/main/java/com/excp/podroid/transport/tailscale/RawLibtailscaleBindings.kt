@@ -16,7 +16,12 @@ class OneUseAuthKey private constructor(private val utf8: ByteArray) : AutoClose
 
     fun <T> useBytes(block: (ByteArray) -> T): T {
         check(!closed) { "auth key is closed" }
-        return block(utf8)
+        val operationCopy = utf8.copyOf()
+        return try {
+            block(operationCopy)
+        } finally {
+            Arrays.fill(operationCopy, 0)
+        }
     }
 
     override fun close() {
@@ -29,7 +34,7 @@ class OneUseAuthKey private constructor(private val utf8: ByteArray) : AutoClose
     companion object {
         const val MAX_KEY_BYTES = 512
         fun copyOf(utf8: ByteArray): OneUseAuthKey {
-            require(utf8.size in 1..MAX_KEY_BYTES && utf8.none { it == 0.toByte() })
+            require(utf8.size in 8..MAX_KEY_BYTES && utf8.none { it == 0.toByte() })
             return OneUseAuthKey(utf8.copyOf())
         }
     }
@@ -48,17 +53,53 @@ data class RawServerConfiguration(
     }
 }
 
-data class RawLoopbackCredentials(
+class RawLoopbackCredentials private constructor(
     val address: TransportEndpoint,
-    val proxyCredential: ByteArray,
-    val localApiCredential: ByteArray,
-) {
-    init {
-        require(proxyCredential.size == CREDENTIAL_BYTES)
-        require(localApiCredential.size == CREDENTIAL_BYTES)
+    private val proxyCredential: ByteArray,
+    private val localApiCredential: ByteArray,
+) : AutoCloseable {
+    private var closed = false
+
+    fun <T> useProxyCredential(block: (ByteArray) -> T): T = useCredential(proxyCredential, block)
+
+    fun <T> useLocalApiCredential(block: (ByteArray) -> T): T =
+        useCredential(localApiCredential, block)
+
+    private fun <T> useCredential(credential: ByteArray, block: (ByteArray) -> T): T {
+        check(!closed) { "loopback credentials are closed" }
+        val operationCopy = credential.copyOf()
+        return try {
+            block(operationCopy)
+        } finally {
+            Arrays.fill(operationCopy, 0)
+        }
     }
 
-    companion object { const val CREDENTIAL_BYTES = 32 }
+    override fun close() {
+        if (!closed) {
+            Arrays.fill(proxyCredential, 0)
+            Arrays.fill(localApiCredential, 0)
+            closed = true
+        }
+    }
+
+    companion object {
+        const val CREDENTIAL_BYTES = 32
+
+        fun copyOf(
+            address: TransportEndpoint,
+            proxyCredential: ByteArray,
+            localApiCredential: ByteArray,
+        ): RawLoopbackCredentials {
+            require(proxyCredential.size == CREDENTIAL_BYTES)
+            require(localApiCredential.size == CREDENTIAL_BYTES)
+            return RawLoopbackCredentials(
+                address,
+                proxyCredential.copyOf(),
+                localApiCredential.copyOf(),
+            )
+        }
+    }
 }
 
 /**

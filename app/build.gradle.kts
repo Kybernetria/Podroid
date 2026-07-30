@@ -92,6 +92,20 @@ val testLibTailscaleAndroidVerifier by tasks.registering(Exec::class) {
     )
 }
 
+val verifyHostTransportBoundary by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Checks the fail-closed Host transport capability and authority boundary."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", rootProject.file("tests/verify_host_transport_boundary.py"))
+    inputs.files(
+        rootProject.file("tests/verify_host_transport_boundary.py"),
+        rootProject.fileTree("app/src/main/java/com/excp/podroid/transport") { include("**/*.kt") },
+        rootProject.file("app/src/main/res/xml/backup_rules.xml"),
+        rootProject.file("app/src/main/res/xml/data_extraction_rules.xml"),
+        rootProject.file("third_party/libtailscale-pin.json")
+    )
+}
+
 val verifyPackagedDebugLibTailscale by tasks.registering(Exec::class) {
     group = "verification"
     description = "Statically verifies debug APK libtailscale ABI, ELF, provenance, and manifest policy."
@@ -323,7 +337,8 @@ tasks.named("preBuild") {
         verifyMinimalGuestSources,
         verifyMinimalGuestArtifact,
         verifyVmInstancePaths,
-        verifyUiVmBoundary
+        verifyUiVmBoundary,
+        verifyHostTransportBoundary
     )
 }
 
@@ -355,7 +370,8 @@ tasks.named("check") {
         testVmInstancePathVerifier,
         verifyUiVmBoundary,
         testUiVmBoundaryVerifier,
-        testLibTailscaleAndroidVerifier
+        testLibTailscaleAndroidVerifier,
+        verifyHostTransportBoundary
     )
 }
 
@@ -367,7 +383,8 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
         testVmInstancePathVerifier,
         verifyUiVmBoundary,
         testUiVmBoundaryVerifier,
-        testLibTailscaleAndroidVerifier
+        testLibTailscaleAndroidVerifier,
+        verifyHostTransportBoundary
     )
 }
 

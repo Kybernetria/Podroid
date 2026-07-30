@@ -17,6 +17,7 @@ class LibtailscaleContractsTest {
     fun `current official pin reports required blockers and cannot open`() {
         val report = LibtailscaleSpikeProvider.capabilities()
         assertEquals(ProviderAvailability.UNAVAILABLE, report.availability)
+        assertTrue(TransportCapability.ANDROID_ABI_ARTIFACT in report.supported)
         assertTrue(TransportCapability.TAILNET_LISTEN in report.supported)
         assertTrue(TransportCapability.TAILNET_DIAL in report.supported)
         assertTrue(TransportCapability.PER_NETWORK_SOCKET_BINDING in report.blockers)
@@ -41,16 +42,20 @@ class LibtailscaleContractsTest {
 
     @Test
     fun `one-use auth key copies input zeros owned bytes and rejects reuse`() {
-        val caller = "tskey-example".toByteArray()
+        val caller = "synthetic-one-use-value".toByteArray()
         val key = OneUseAuthKey.copyOf(caller)
         caller.fill('x'.code.toByte())
-        lateinit var observed: ByteArray
-        key.useBytes { observed = it }
-        assertEquals("tskey-example", observed.toString(Charsets.UTF_8))
+        lateinit var operationBytes: ByteArray
+        var observed = ""
+        key.useBytes {
+            operationBytes = it
+            observed = it.toString(Charsets.UTF_8)
+        }
+        assertEquals("synthetic-one-use-value", observed)
+        assertTrue(operationBytes.all { it == 0.toByte() })
 
         key.close()
 
-        assertTrue(observed.all { it == 0.toByte() })
         assertTrue(runCatching { key.useBytes { } }.isFailure)
         key.close()
     }
@@ -58,10 +63,14 @@ class LibtailscaleContractsTest {
     @Test
     fun `raw loopback credentials enforce exact reviewed size`() {
         val address = com.excp.podroid.transport.api.TransportEndpoint("127.0.0.1", 41112)
-        val credentials = RawLoopbackCredentials(address, ByteArray(32), ByteArray(32))
-        assertEquals(32, credentials.proxyCredential.size)
+        val credentials = RawLoopbackCredentials.copyOf(address, ByteArray(32), ByteArray(32))
+        lateinit var operationBytes: ByteArray
+        credentials.useLocalApiCredential { operationBytes = it }
+        assertTrue(operationBytes.all { it == 0.toByte() })
+        credentials.close()
+        assertTrue(runCatching { credentials.useProxyCredential { } }.isFailure)
         assertTrue(runCatching {
-            RawLoopbackCredentials(address, ByteArray(31), ByteArray(32))
+            RawLoopbackCredentials.copyOf(address, ByteArray(31), ByteArray(32))
         }.isFailure)
     }
 }

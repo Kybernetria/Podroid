@@ -205,6 +205,9 @@ internal class AtomicFileHostTransportStateStore(
                 StandardCopyOption.ATOMIC_MOVE,
                 StandardCopyOption.REPLACE_EXISTING,
             )
+            FileChannel.open(parent, StandardOpenOption.READ).use { directory ->
+                directory.force(true)
+            }
             readExistingLocked().also {
                 if (it != updated) throw IOException("Host transport state changed during atomic publication")
             }

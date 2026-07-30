@@ -88,7 +88,7 @@ def main() -> None:
             fail(f"Host identity backup exclusion missing from {relative}")
 
     pin = json.loads((ROOT / "third_party/libtailscale-pin.json").read_text(encoding="utf-8"))
-    if pin.get("integrationStatus") != "contract-spike-provider-unavailable":
+    if pin.get("integrationStatus") != "debug-packaged-provider-unavailable":
         fail("official source pin does not record unavailable provider status")
 
     print(f"verified disabled Host transport boundary across {len(sources)} Kotlin sources")

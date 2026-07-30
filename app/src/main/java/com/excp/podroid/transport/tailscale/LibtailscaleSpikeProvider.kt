@@ -22,21 +22,21 @@ object LibtailscaleSpikeProvider : HostTransportProvider {
         providerId = "official-libtailscale-spike",
         availability = ProviderAvailability.UNAVAILABLE,
         supported = setOf(
+            TransportCapability.ANDROID_ABI_ARTIFACT,
             TransportCapability.PERSISTENT_HOST_IDENTITY,
             TransportCapability.TAILNET_LISTEN,
             TransportCapability.TAILNET_DIAL,
         ),
         blockers = setOf(
-            TransportCapability.ANDROID_ABI_ARTIFACT,
             TransportCapability.PER_NETWORK_SOCKET_BINDING,
             TransportCapability.PER_NETWORK_DNS,
             TransportCapability.DEFAULT_NETWORK_REBINDING,
             TransportCapability.DETERMINISTIC_CANCELLATION,
             TransportCapability.AUTHENTICATED_PEER_IDENTITY,
         ),
-        detail = "The official source pin exposes tsnet lifecycle/listen/dial state APIs, " +
-            "but no Android artifact or socket/DNS injection, deterministic cancellation, " +
-            "or per-connection authenticated peer identity.",
+        detail = "The official pin is reproducibly packaged as a debug arm64-v8a artifact and " +
+            "exposes tsnet lifecycle/listen/dial state APIs, but has no Android socket/DNS " +
+            "injection, deterministic cancellation, or per-connection authenticated peer identity.",
     )
 
     override fun capabilities(): ProviderCapabilityReport = report

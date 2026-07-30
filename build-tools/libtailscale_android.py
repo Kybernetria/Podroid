@@ -510,6 +510,11 @@ def build_android(repo_root: Path, output_root: Path) -> None:
                 "CGO_LDFLAGS": "-Wl,-z,max-page-size=16384",
                 "GOTOOLCHAIN": "local",
                 "GOFLAGS": "-mod=readonly",
+                "GOPRIVATE": "",
+                "GONOPROXY": "",
+                "GONOSUMDB": "",
+                "GOPROXY": "https://proxy.golang.org,direct",
+                "GOSUMDB": "sum.golang.org",
             }
         )
         run_command(
