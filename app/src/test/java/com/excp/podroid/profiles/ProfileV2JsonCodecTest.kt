@@ -161,6 +161,30 @@ class ProfileV2JsonCodecTest {
     }
 
     @Test
+    fun `capability topology admits every dependency prefix and rejects every non-prefix set`() {
+        val integrations = ProfileV2GuestIntegration.entries
+        for (count in 0..integrations.size) {
+            val json = integrations.take(count).joinToString(",") { "\"${it.wireName}\"" }
+            val decoded = ProfilePayloadV2JsonCodec.decode(
+                validPayload().replace("\"guest_integrations\":[]", "\"guest_integrations\":[$json]").toByteArray(),
+                origins,
+            )
+            assertEquals(integrations.take(count).toSet(), decoded.capabilities.guestIntegrations)
+        }
+        for (mask in 0 until (1 shl integrations.size)) {
+            val selected = integrations.filterIndexed { index, _ -> mask and (1 shl index) != 0 }
+            if (selected == integrations.take(selected.size)) continue
+            val json = selected.joinToString(",") { "\"${it.wireName}\"" }
+            assertFailure<ProfileCodecException>("mask=$mask") {
+                ProfilePayloadV2JsonCodec.decode(
+                    validPayload().replace("\"guest_integrations\":[]", "\"guest_integrations\":[$json]").toByteArray(),
+                    origins,
+                )
+            }
+        }
+    }
+
+    @Test
     fun `v2 rejects duplicate unknown malformed and oversized boundary data`() {
         listOf(
             validPayload().replaceFirst("\"version\":2,", "\"version\":2,\"version\":2,"),

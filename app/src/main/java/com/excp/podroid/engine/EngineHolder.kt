@@ -30,6 +30,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.SharingStarted
@@ -42,9 +43,14 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Provider
 import javax.inject.Singleton
+
+internal interface BackendSelectionClaimer {
+    suspend fun <T> withBackendSelectionClaim(action: suspend (backendId: String) -> T): T
+}
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @Singleton
@@ -54,7 +60,7 @@ class EngineHolder @Inject constructor(
     private val portForwards: PortForwardRepository,
     private val qemuProvider: Provider<QemuEngine>,
     private val avfProvider: Provider<AvfEngine>,
-) : VmEngine {
+) : VmEngine, BackendSelectionClaimer {
 
     // Single-threaded dispatcher: confines every appliedRules read-modify-write
     // (swap-reset + diff loop) to one thread so the @Volatile field can't be
@@ -355,6 +361,32 @@ class EngineHolder @Inject constructor(
         get() = current.sessionClientDelegate
         set(v) { current.sessionClientDelegate = v }
 
+    private suspend fun resolveColdSelection() {
+        // Guarantee claims use the correctly-picked engine even when they beat the init publisher.
+        val picked = try {
+            firstPick.await()
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "first pick failed; recovering selection", e)
+            runCatching { pick(settings.getEngineSelectionSnapshot()) }
+                .getOrElse { currentFlow.value }
+        }
+        publishFirstPick(picked)
+    }
+
+    override suspend fun <T> withBackendSelectionClaim(
+        action: suspend (backendId: String) -> T,
+    ): T {
+        resolveColdSelection()
+        val claim = engineRouter.claimSelected { it.quiescent.value }
+        return try {
+            action(claim.engine.backendId)
+        } finally {
+            withContext(NonCancellable) { engineRouter.releaseClaim(claim) }
+        }
+    }
+
     override suspend fun start(portForwards: List<PortForwardRule>, config: VmConfig) {
         require(config.vmId == vmId) { "Engine holder ${vmId.serialized} cannot start ${config.vmId.serialized}" }
         // Guarantee the first Start runs on the correctly-picked engine even on a
@@ -368,16 +400,7 @@ class EngineHolder @Inject constructor(
         // rethrow forever and wedge every later Start. On failure, recompute the
         // pick here; if that also fails, fall back to the QEMU seed already in
         // _currentFlow so the VM stays startable rather than permanently broken.
-        val picked = try {
-            firstPick.await()
-        } catch (c: CancellationException) {
-            throw c
-        } catch (e: Exception) {
-            android.util.Log.w(TAG, "first pick failed; recovering for start()", e)
-            runCatching { pick(settings.getEngineSelectionSnapshot()) }
-                .getOrElse { currentFlow.value }
-        }
-        publishFirstPick(picked)
+        resolveColdSelection()
         // The claim and a concurrent swap publish are one atomic decision. The
         // gate is released immediately; only the engine identity remains bound
         // until its authoritative cleanup-complete signal.

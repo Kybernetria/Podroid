@@ -12,6 +12,6 @@ Version 1 remains byte-for-byte unchanged and supports only:
 
 The bundled Alpine storage lineage is `podroid-alpine-overlay-v1`. A first downloaded activation may preserve an existing bundled `storage.img` only when its signed `data_compatibility` is exactly that value.
 
-`profile-payload-v2.schema.json` is a strict, separate release-preparation contract for QEMU-only ARM64 UEFI/NoCloud guests. It fixes four role/format pairs (`cloud-disk`/raw, UEFI code and vars/raw-pflash, CIDATA seed/ISO9660), role-specific limits, cloud readiness, data lineage, and a closed typed guest-integration set whose empty value denies every integration. It is signed under the distinct v2 domain separator.
+`profile-payload-v2.schema.json` is a strict, separate QEMU-only ARM64 UEFI/NoCloud contract. It fixes four role/format pairs (`cloud-disk`/raw, UEFI code and vars/raw-pflash, CIDATA seed/ISO9660), role-specific limits, cloud readiness, data lineage, and a closed dependency-prefix guest-integration set whose empty value denies every integration. It is signed under the distinct v2 domain separator.
 
-The current engine, `VmManager`, and `ProfileRepository` intentionally accept only v1. Adding a v2 schema and verifier does not activate cloud profiles or widen the v1 contract.
+`ProfileRepository`, `VmManager`, and QEMU implement this closed v2 path without widening or changing v1. Release-artifact provenance and physical boot remain separate evidence requirements; the schema/runtime path alone is not such a claim.

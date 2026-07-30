@@ -369,7 +369,7 @@ class ProfileRepositoryTest {
     }
 
     @Test
-    fun `revoked pending activation preserves recreated storage and quarantines matching tombstone`() {
+    fun `revoked pending activation restores original and quarantines recreated storage`() {
         val root = temporaryFolder.newFolder("pending-revoked-recreated")
         val storage = storageFor(root).also { it.writeText("original") }
         val artifacts = artifactBytes("pending-revoked-recreated")
@@ -389,8 +389,8 @@ class ProfileRepositoryTest {
 
         restarted.recover()
 
-        assertEquals("recreated", storage.readText())
-        assertEquals("original", storageQuarantine(storage).readText())
+        assertEquals("original", storage.readText())
+        assertEquals("recreated", storageQuarantine(storage).readText())
         assertFalse(storageTombstone(storage).exists())
         assertFalse(File(root, "state/activation.pending").exists())
     }
@@ -616,7 +616,10 @@ class ProfileRepositoryTest {
 
     @Test
     fun `durable deletion intent recovers crashes before and after deletion`() {
-        ProfileRepositoryFaultPoint.entries.forEach { faultPoint ->
+        listOf(
+            ProfileRepositoryFaultPoint.AFTER_DELETION_INTENT,
+            ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION,
+        ).forEach { faultPoint ->
             val root = temporaryFolder.newFolder("crash-${faultPoint.ordinal}")
             val storage = storageFor(root).also { it.writeText("data") }
             val artifacts = artifactBytes("crash-${faultPoint.ordinal}")

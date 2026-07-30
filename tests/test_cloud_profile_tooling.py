@@ -33,8 +33,13 @@ class NoCloudSeedToolTest(unittest.TestCase):
         self.assertEqual("CIDATA", first[16 * 2048 + 40:16 * 2048 + 72].decode().rstrip())
         inspected = seed_tool.inspect_iso(first)
         self.assertEqual(set(seed_tool.REQUIRED_FILES), set(inspected))
-        self.assertEqual(2, inspected["vendor-data"].decode().count(seed_tool.READINESS_MARKER))
+        self.assertEqual(1, inspected["vendor-data"].decode().count(seed_tool.READINESS_MARKER))
         self.assertLessEqual(len(first), seed_tool.MAX_SEED_BYTES)
+        self.assertEqual(51200, len(first))
+        self.assertEqual(
+            "7c6363a2bba06cf8d248ed54aa38468571bfb09b338d5cb0accf524a637fb656",
+            hashlib.sha256(first).hexdigest(),
+        )
 
     def test_cli_build_and_inspect_are_reproducible(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -78,6 +83,24 @@ class NoCloudSeedToolTest(unittest.TestCase):
                 manifest_path.write_text(json.dumps(manifest) + "\n")
                 with self.assertRaises(seed_tool.SeedError):
                     seed_tool.load_reviewed_sources(copied)
+
+    def test_closed_semantics_reject_duplicate_overrides_and_arbitrary_modules(self):
+        sources = seed_tool.load_reviewed_sources(PROFILE / "nocloud")
+        mutations = {
+            "duplicate users": ("user-data", b"users: []\n"),
+            "override root": ("user-data", b"disable_root: false\n"),
+            "extra user": ("user-data", b"users:\n  - default\n"),
+            "write files": ("user-data", b"write_files: []\n"),
+            "packages": ("user-data", b"packages: [curl]\n"),
+            "arbitrary command": ("vendor-data", b"runcmd:\n  - [\"/bin/true\"]\n"),
+            "comment marker": ("vendor-data", b"# PODROID_CLOUD_READY_V1\n"),
+        }
+        for label, (name, suffix) in mutations.items():
+            with self.subTest(label=label):
+                changed = dict(sources)
+                changed[name] += suffix
+                with self.assertRaises(seed_tool.SeedError):
+                    seed_tool.inspect_iso(seed_tool.build_iso(changed))
 
     def test_source_set_review_hash_and_iso_bytes_fail_closed(self):
         sources = seed_tool.load_reviewed_sources(PROFILE / "nocloud")
@@ -160,6 +183,12 @@ class ProfileV2SchemaTest(unittest.TestCase):
             "uefi-vars-template": "raw-pflash",
             "nocloud-seed": "iso9660-cidata",
         }, role_formats)
+        integrations = schema["properties"]["capabilities"]["properties"]["guest_integrations"]["enum"]
+        ordered = [
+            "podroid-terminal-v1", "podroid-resize-v1",
+            "podroid-host-bridge-v1", "podroid-downloads-v1",
+        ]
+        self.assertEqual([ordered[:length] for length in range(5)], integrations)
 
 
 if __name__ == "__main__":

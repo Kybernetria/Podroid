@@ -161,6 +161,7 @@ class TrustQuarantineState internal constructor(
 
 enum class ActivationFailureReason {
     CANDIDATE_NO_LONGER_USABLE,
+    VM_DATA_REMOVED,
 }
 
 data class ActivationFailureState(
@@ -168,6 +169,7 @@ data class ActivationFailureState(
     val candidate: PreparedProfileCandidate,
     val reason: ActivationFailureReason,
     val storageDeletionIrreversible: Boolean,
+    val uefiVarsDeletionIrreversible: Boolean = false,
 )
 
 /** Opaque destructive authority issued only after this repository validates its fixed storage target. */
@@ -215,12 +217,36 @@ internal data class StorageIdentity(
 
 enum class ProfileRepositoryFaultPoint {
     AFTER_DELETION_INTENT,
+    /** Legacy direct-storage reset checkpoint. */
     AFTER_STORAGE_DELETION,
+    AFTER_CLOUD_STORAGE_PUBLISHED,
+    AFTER_CLOUD_VARS_PUBLISHED,
+    AFTER_CLOUD_LINEAGE_PUBLISHED,
+    AFTER_CLOUD_ACTIVATION_PUBLISHED,
+    AFTER_CLOUD_ORIGINALS_FINALIZED,
 }
 
 fun interface ProfileRepositoryFaultInjector {
     @Throws(IOException::class)
     fun check(point: ProfileRepositoryFaultPoint)
+}
+
+fun interface ProfileUsableSpaceProvider {
+    @Throws(IOException::class)
+    fun usableSpace(path: Path): Long
+}
+
+fun interface ProfileNoCloudSeedPolicy {
+    @Throws(IOException::class)
+    fun requireCanonical(sha256: Sha256Digest, sizeBytes: Long)
+}
+
+internal object CanonicalNoCloudSeedPolicy : ProfileNoCloudSeedPolicy {
+    override fun requireCanonical(sha256: Sha256Digest, sizeBytes: Long) {
+        if (sizeBytes != ProfileV2Limits.CANONICAL_NOCLOUD_SEED_BYTES ||
+            sha256.value != ProfileV2Limits.CANONICAL_NOCLOUD_SEED_SHA256
+        ) throw ProfileDownloadException("NoCloud seed is outside the closed canonical semantics")
+    }
 }
 
 /**
@@ -239,6 +265,10 @@ class ProfileRepository(
     private val fetchTimeoutMillis: Long = DEFAULT_FETCH_TIMEOUT_MILLIS,
     private val lockTimeoutMillis: Long = DEFAULT_LOCK_TIMEOUT_MILLIS,
     private val faultInjector: ProfileRepositoryFaultInjector = ProfileRepositoryFaultInjector { },
+    private val usableSpaceProvider: ProfileUsableSpaceProvider = ProfileUsableSpaceProvider {
+        Files.getFileStore(it).usableSpace
+    },
+    private val noCloudSeedPolicy: ProfileNoCloudSeedPolicy = CanonicalNoCloudSeedPolicy,
     uefiVarsFile: File = storageFile.parentFile.resolve("uefi-vars.fd"),
 ) {
     private val root = repositoryDirectory.toPath().toAbsolutePath().normalize()
@@ -262,6 +292,9 @@ class ProfileRepository(
     ) ?: throw IllegalArgumentException("fixed storage file has no parent")
     private val varsTombstone = fixedVars.parent?.resolve(
         ".podroid-profile-delete-${fixedVars.toString().sha256Hex()}",
+    ) ?: throw IllegalArgumentException("fixed UEFI vars file has no parent")
+    private val varsRecoveryQuarantine = fixedVars.parent?.resolve(
+        ".podroid-profile-preserved-${fixedVars.toString().sha256Hex()}",
     ) ?: throw IllegalArgumentException("fixed UEFI vars file has no parent")
     private val cloudStorageTemporary = fixedStorage.parent.resolve(".podroid-cloud-storage.init")
     private val cloudVarsTemporary = fixedVars.parent.resolve(".podroid-cloud-vars.init")
@@ -366,13 +399,27 @@ class ProfileRepository(
         readTrustQuarantineLocked()
     }
 
-    internal fun preparedBootContract(candidate: PreparedProfileCandidate): PreparedBootContract = withRepositoryLock {
-        recoverLocked()
-        when (requireUsableCandidateLocked(candidate, false, true).planKind) {
-            PreparedPlanKind.DIRECT_KERNEL_OVERLAY_V1 -> PreparedBootContract.DirectKernelOverlayV1
-            PreparedPlanKind.UEFI_NOCLOUD_V1 -> PreparedBootContract.UefiNoCloudV1
+    internal fun candidateSupportedBackends(candidate: PreparedProfileCandidate): Set<ProfileBackend> =
+        withRepositoryLock {
+            recoverLocked()
+            requireUsableCandidateLocked(candidate, false, true).supportedBackends.toSet()
         }
-    }
+
+    internal fun rollbackSupportedBackends(expectedActivationSequence: Long): Set<ProfileBackend> =
+        withRepositoryLock {
+            recoverLocked()
+            if (readPendingActivationLocked() != null) {
+                throw ProfileActivationException("a confirmed data-deletion activation requires recovery")
+            }
+            val current = readActivationStateLocked()
+                ?: throw ProfileActivationException("there is no active profile to roll back")
+            if (current.activationSequence != expectedActivationSequence) {
+                throw ProfileActivationException("rollback confirmation does not match the current activation sequence")
+            }
+            val rollback = current.rollback
+                ?: throw ProfileActivationException("there is no retained local rollback profile")
+            requireUsableCandidateLocked(rollback, false, true).supportedBackends.toSet()
+        }
 
     /** Issues destructive authority for the current sequence, candidate, and fixed file identity. */
     @Throws(IOException::class)
@@ -481,10 +528,15 @@ class ProfileRepository(
         val next = ActivationState(nextActivationSequence(latestActivationSequenceLocked()), candidate, rollback)
         ensureDownloadedLineageMarkerLocked()
         if (dataPolicy == GuestDataPolicy.DELETE_DATA) {
+            if (preparedRecord.planKind == PreparedPlanKind.UEFI_NOCLOUD_V1) {
+                ensureCloudInitializationCapacity(preparedRecord)
+            }
             val pending = PendingActivation(
-                next,
-                deletionConfirmation!!.storageIdentity,
-                deletionConfirmation.varsIdentity,
+                desired = next,
+                storageIdentity = deletionConfirmation!!.storageIdentity,
+                varsIdentity = deletionConfirmation.varsIdentity,
+                previousActivation = current,
+                previousCloudLineage = readCloudLineageLocked(),
             )
             writeImmutableRecord(pendingActivationPath, encodePendingActivation(pending))
             faultInjector.check(ProfileRepositoryFaultPoint.AFTER_DELETION_INTENT)
@@ -540,6 +592,34 @@ class ProfileRepository(
         readActivationStateLocked()?.also {
             if (it != next) throw ProfileRepositoryCorruptException("published rollback record changed unexpectedly")
         } ?: throw ProfileRepositoryCorruptException("published rollback record is missing")
+    }
+
+    /**
+     * Manager-only removal preparation. Clearing activation before VM files are deleted ensures a
+     * crash can never leave old activation metadata booting replacement storage. The irreversible
+     * downloaded-lineage marker and immutable prepared records remain for explicit reactivation.
+     */
+    internal fun clearForVmRemoval() = withRepositoryLock {
+        recoverLocked()
+        recoverPendingActivationLocked()
+        readActivationStateLocked()?.let { active ->
+            writeReplaceRecord(
+                activationFailurePath(),
+                encodeActivationFailure(
+                    ActivationFailureState(
+                        active.activationSequence,
+                        active.active,
+                        ActivationFailureReason.VM_DATA_REMOVED,
+                        storageDeletionIrreversible = false,
+                        uefiVarsDeletionIrreversible = false,
+                    ),
+                ),
+            )
+        }
+        clearActivationLocked()
+        clearCloudLineageLocked()
+        clearMutableInitializationArtifactsLocked()
+        prunePreparedRecordsAndBlobsLocked()
     }
 
     /** Deletes only bounded, unreferenced CAS blobs. Prepared and lifecycle references are preserved. */
@@ -625,6 +705,7 @@ class ProfileRepository(
                 "immutable generation record conflicts with the signed manifest",
             )
             validatePreparedBlobs(existing)
+            validateClosedNoCloudSeed(existing)
             revalidateVerifiedTrust(verified)
             publishFloorIfNeeded(profileKey, existing)
             prunePreparedRecordsAndBlobsLocked()
@@ -638,6 +719,7 @@ class ProfileRepository(
         try {
             incoming.sortedBy { artifactOrder(planKind, it.role) }.forEach { ensureBlob(it, newlyPublished) }
             revalidateVerifiedTrust(verified)
+            validateClosedNoCloudSeed(expectedRecord)
             publishPrepared(profileKey, expectedRecord)
             validatePreparedBlobs(expectedRecord)
             publishFloorIfNeeded(profileKey, expectedRecord)
@@ -647,6 +729,12 @@ class ProfileRepository(
             cleanupNewUnreferencedBlobs(newlyPublished, failure)
             throw failure
         }
+    }
+
+    private fun validateClosedNoCloudSeed(record: PreparedRecord) {
+        if (record.planKind != PreparedPlanKind.UEFI_NOCLOUD_V1) return
+        val seed = record.artifacts.single { it.role == ProfileV2ArtifactRole.NOCLOUD_SEED.wireName }
+        noCloudSeedPolicy.requireCanonical(seed.sha256, seed.sizeBytes)
     }
 
     private fun artifactOrder(kind: PreparedPlanKind, role: String): Int = when (kind) {
@@ -736,7 +824,7 @@ class ProfileRepository(
         }
         val requiredFree = checkedAdd(incomingBytes, storeLimits.reservedFreeBytes, "CAS free-space reservation")
         val usable = try {
-            Files.getFileStore(blobs).usableSpace
+            usableSpaceProvider.usableSpace(blobs)
         } catch (failure: IOException) {
             throw ProfileQuotaExceededException("content-addressed free space cannot be established: ${failure.message}")
         }
@@ -1168,38 +1256,120 @@ class ProfileRepository(
         }
     }
 
-    private fun initializeCloudMutableFiles(record: PreparedRecord, pending: PendingActivation) {
+    private fun ensureCloudInitializationCapacity(record: PreparedRecord) {
+        val diskBytes = record.artifacts.single {
+            it.role == ProfileV2ArtifactRole.CLOUD_DISK.wireName
+        }.sizeBytes
+        val varsBytes = record.artifacts.single {
+            it.role == ProfileV2ArtifactRole.UEFI_VARS_TEMPLATE.wireName
+        }.sizeBytes
+        // Both originals remain as tombstones through activation publication, so none of their
+        // bytes are guaranteed reclaimable at the peak-copy point. Conservatively credit zero.
+        val copies = checkedAdd(diskBytes, varsBytes, "cloud mutable copies")
+        val required = checkedAdd(copies, storeLimits.reservedFreeBytes, "cloud mutable free-space reserve")
+        val usable = try {
+            usableSpaceProvider.usableSpace(fixedStorage.parent)
+        } catch (failure: IOException) {
+            throw ProfileQuotaExceededException("cloud mutable free space cannot be established: ${failure.message}")
+        }
+        if (usable < required) {
+            throw ProfileQuotaExceededException("cloud mutable initialization free-space reserve would be violated")
+        }
+    }
+
+    private fun initializeCloudMutableFiles(record: PreparedRecord, pending: PendingActivation): PendingActivation {
         val varsIdentity = pending.varsIdentity
             ?: throw ProfileRepositoryCorruptException("cloud activation has no fixed UEFI vars identity")
         val diskArtifact = record.artifacts.single { it.role == ProfileV2ArtifactRole.CLOUD_DISK.wireName }
         val varsArtifact = record.artifacts.single { it.role == ProfileV2ArtifactRole.UEFI_VARS_TEMPLATE.wireName }
-        initializeFixedCopy(
+        var current = pending
+
+        val storageReplacement = publishFixedReplacement(
             fixedStorage, storageTombstone, cloudStorageTemporary, pending.storageIdentity,
+            current.replacementStorageIdentity,
+            current.legacyDestructiveJournal || current.phase >= CloudInitializationPhase.ACTIVATION_PUBLISHED,
             diskArtifact, "cloud root disk",
         )
-        faultInjector.check(ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION)
-        initializeFixedCopy(
+        if (current.phase < CloudInitializationPhase.STORAGE_PUBLISHED || current.replacementStorageIdentity == null) {
+            current = current.copy(
+                phase = CloudInitializationPhase.STORAGE_PUBLISHED,
+                replacementStorageIdentity = storageReplacement,
+            )
+            writeReplaceRecord(pendingActivationPath, encodePendingActivation(current))
+            faultInjector.check(ProfileRepositoryFaultPoint.AFTER_CLOUD_STORAGE_PUBLISHED)
+        }
+
+        val varsReplacement = publishFixedReplacement(
             fixedVars, varsTombstone, cloudVarsTemporary, varsIdentity,
+            current.replacementVarsIdentity,
+            current.legacyDestructiveJournal || current.phase >= CloudInitializationPhase.ACTIVATION_PUBLISHED,
             varsArtifact, "writable UEFI vars",
         )
-        faultInjector.check(ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION)
-        writeReplaceRecord(cloudLineagePath, encodeCloudLineage(cloudLineageFor(record)))
-        faultInjector.check(ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION)
+        if (current.phase < CloudInitializationPhase.VARS_PUBLISHED || current.replacementVarsIdentity == null) {
+            current = current.copy(
+                phase = CloudInitializationPhase.VARS_PUBLISHED,
+                replacementVarsIdentity = varsReplacement,
+            )
+            writeReplaceRecord(pendingActivationPath, encodePendingActivation(current))
+            faultInjector.check(ProfileRepositoryFaultPoint.AFTER_CLOUD_VARS_PUBLISHED)
+        }
+
+        if (current.phase < CloudInitializationPhase.LINEAGE_PUBLISHED) {
+            writeReplaceRecord(cloudLineagePath, encodeCloudLineage(cloudLineageFor(record)))
+            current = current.copy(phase = CloudInitializationPhase.LINEAGE_PUBLISHED)
+            writeReplaceRecord(pendingActivationPath, encodePendingActivation(current))
+            faultInjector.check(ProfileRepositoryFaultPoint.AFTER_CLOUD_LINEAGE_PUBLISHED)
+        } else {
+            requireCloudLineageCompatible(record)
+        }
+        return current
     }
 
-    private fun initializeFixedCopy(
+    private fun publishFixedReplacement(
         target: Path,
         tombstone: Path,
         temporaryPath: Path,
         expected: StorageIdentity,
+        recordedReplacement: StorageIdentity?,
+        allowMissingOriginalTombstone: Boolean,
         sourceArtifact: PreparedArtifact,
         label: String,
-    ) {
-        if (existsNoFollow(target) && !attributesNoFollow(target).matches(expected)) {
+    ): StorageIdentity {
+        val actual = captureFileIdentity(target, label, requireStableKeys = true)
+        if (actual.parentFileKey != expected.parentFileKey ||
+            actual.parentCreationTime != expected.parentCreationTime
+        ) throw ProfileActivationException("$label parent was replaced during initialization")
+
+        if (recordedReplacement != null) {
+            if (actual != recordedReplacement) throw ProfileActivationException("$label replacement identity changed")
+            if (expected.existed && !existsNoFollow(tombstone) && !allowMissingOriginalTombstone) {
+                throw ProfileActivationException("$label original tombstone is missing")
+            }
             validateBlob(target, sourceArtifact.sha256, sourceArtifact.sizeBytes)
-            return
+            return actual
         }
-        deleteFixedFile(target, tombstone, expected, label)
+
+        if (actual == expected && expected.existed) {
+            ensureNoPath(tombstone)
+            Files.move(target, tombstone, StandardCopyOption.ATOMIC_MOVE)
+            forceDirectory(target.parent)
+        }
+        if (expected.existed && existsNoFollow(tombstone)) {
+            requireRegularFile(tombstone, "$label original tombstone")
+            if (!attributesNoFollow(tombstone).matches(expected)) {
+                throw ProfileActivationException("$label original tombstone identity changed")
+            }
+        } else if (expected.existed && actual != expected && !allowMissingOriginalTombstone) {
+            throw ProfileActivationException("$label original tombstone is missing")
+        } else if (!expected.existed && existsNoFollow(tombstone)) {
+            throw ProfileActivationException("$label has an unexpected original tombstone")
+        }
+
+        // Recovery may observe a replacement published just before its phase record.
+        if (existsNoFollow(target)) {
+            validateBlob(target, sourceArtifact.sha256, sourceArtifact.sizeBytes)
+            return captureFileIdentity(target, label, requireStableKeys = true)
+        }
         if (existsNoFollow(temporaryPath)) {
             requireRegularFile(temporaryPath, "$label temporary file")
             Files.delete(temporaryPath)
@@ -1232,6 +1402,7 @@ class ProfileRepository(
         Files.move(temporaryPath, target, StandardCopyOption.ATOMIC_MOVE)
         forceDirectory(target.parent)
         validateBlob(target, sourceArtifact.sha256, sourceArtifact.sizeBytes)
+        return captureFileIdentity(target, label, requireStableKeys = true)
     }
 
     private fun BasicFileAttributes.matches(expected: StorageIdentity): Boolean =
@@ -1239,17 +1410,6 @@ class ProfileRepository(
             size() == expected.sizeBytes &&
             creationTime().toString() == expected.creationTime &&
             lastModifiedTime().toString() == expected.lastModifiedTime
-
-    private fun restoreStorageTombstone(primary: Throwable) {
-        try {
-            if (!existsNoFollow(fixedStorage) && existsNoFollow(storageTombstone)) {
-                Files.move(storageTombstone, fixedStorage, StandardCopyOption.ATOMIC_MOVE)
-                forceDirectory(fixedStorage.parent)
-            }
-        } catch (restoreFailure: Throwable) {
-            primary.addSuppressed(restoreFailure)
-        }
-    }
 
     private fun recoverPendingActivationLocked() {
         readPendingActivationLocked()?.let(::completePendingActivationLocked)
@@ -1259,17 +1419,19 @@ class ProfileRepository(
         val activation = readActivationStateLocked()
         validatePendingSequence(pending, activation)
         if (activation == pending.desired) {
-            val activeRecord = requireUsableCandidateLocked(activation.active, false, false)
-            if (activeRecord.planKind == PreparedPlanKind.UEFI_NOCLOUD_V1) {
-                requireCloudLineageCompatible(activeRecord)
-                requireMutableCloudFiles()
+            val committedRecord = try {
+                requireUsableCandidateLocked(activation.active, false, false)
+            } catch (_: ProfileRepositoryException) {
+                abortPendingActivationLocked(pending)
+                return PendingRecoveryResult.ABORTED
             }
-            clearPendingActivation()
-            reconcileActivationTrustLocked()
-            prunePreparedRecordsAndBlobsLocked()
-            return PendingRecoveryResult.COMPLETED
+            if (committedRecord.planKind == PreparedPlanKind.DIRECT_KERNEL_OVERLAY_V1) {
+                clearPendingActivation()
+                reconcileActivationTrustLocked()
+                prunePreparedRecordsAndBlobsLocked()
+                return PendingRecoveryResult.COMPLETED
+            }
         }
-
         val desiredRecord = try {
             requireUsableCandidateLocked(
                 pending.desired.active,
@@ -1286,62 +1448,195 @@ class ProfileRepository(
             return PendingRecoveryResult.ABORTED
         }
 
+        var current = pending
         if (desiredRecord.planKind == PreparedPlanKind.UEFI_NOCLOUD_V1) {
-            initializeCloudMutableFiles(desiredRecord, pending)
+            current = initializeCloudMutableFiles(desiredRecord, current)
+            requireMutableCloudFiles()
+            if (activation != pending.desired) {
+                writeReplaceRecord(activationPath(), encodeActivation(pending.desired))
+            }
+            if (current.phase < CloudInitializationPhase.ACTIVATION_PUBLISHED) {
+                current = current.copy(phase = CloudInitializationPhase.ACTIVATION_PUBLISHED)
+                writeReplaceRecord(pendingActivationPath, encodePendingActivation(current))
+                faultInjector.check(ProfileRepositoryFaultPoint.AFTER_CLOUD_ACTIVATION_PUBLISHED)
+            }
+            finalizeCloudOriginalTombstones(current)
+            faultInjector.check(ProfileRepositoryFaultPoint.AFTER_CLOUD_ORIGINALS_FINALIZED)
         } else {
-            requireStorageIdentity(pending.storageIdentity, allowCompletedDeletion = true)
-            deleteFixedStorage(pending.storageIdentity)
-            pending.varsIdentity?.let { deleteFixedFile(fixedVars, varsTombstone, it, "fixed UEFI vars") }
-            clearCloudLineageLocked()
-            faultInjector.check(ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION)
+            if (activation != pending.desired) {
+                requireStorageIdentity(pending.storageIdentity, allowCompletedDeletion = true)
+                deleteFixedStorage(pending.storageIdentity)
+                pending.varsIdentity?.let { deleteFixedFile(fixedVars, varsTombstone, it, "fixed UEFI vars") }
+                clearCloudLineageLocked()
+                faultInjector.check(ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION)
+                writeReplaceRecord(activationPath(), encodeActivation(pending.desired))
+            }
         }
-        writeReplaceRecord(activationPath(), encodeActivation(pending.desired))
         clearPendingActivation()
         reconcileActivationTrustLocked()
         prunePreparedRecordsAndBlobsLocked()
         return PendingRecoveryResult.COMPLETED
     }
 
-    private fun abortPendingActivationLocked(pending: PendingActivation) {
-        val expected = pending.storageIdentity
-        val actual = captureStorageIdentity(requireStableKeys = true)
-        if (actual.parentFileKey != expected.parentFileKey ||
-            actual.parentCreationTime != expected.parentCreationTime
-        ) {
-            throw ProfileActivationException("fixed storage parent was replaced while aborting activation")
-        }
+    private fun finalizeCloudOriginalTombstones(pending: PendingActivation) {
+        requireReplacementIdentity(fixedStorage, pending.replacementStorageIdentity, "cloud root disk")
+        requireReplacementIdentity(fixedVars, pending.replacementVarsIdentity, "writable UEFI vars")
+        val allowAlreadyFinalized = pending.legacyDestructiveJournal ||
+            pending.phase >= CloudInitializationPhase.ACTIVATION_PUBLISHED
+        deleteOriginalTombstone(
+            storageTombstone, pending.storageIdentity, "fixed storage", allowAlreadyFinalized,
+        )
+        deleteOriginalTombstone(
+            varsTombstone,
+            pending.varsIdentity ?: throw ProfileRepositoryCorruptException("cloud activation has no vars identity"),
+            "fixed UEFI vars",
+            allowAlreadyFinalized,
+        )
+    }
 
-        val irreversible = if (existsNoFollow(storageTombstone)) {
-            if (!expected.existed) {
-                throw ProfileActivationException("unexpected fixed storage tombstone while aborting activation")
+    private fun requireReplacementIdentity(path: Path, expected: StorageIdentity?, label: String) {
+        val identity = expected ?: throw ProfileRepositoryCorruptException("$label replacement identity is missing")
+        if (captureFileIdentity(path, label, requireStableKeys = true) != identity) {
+            throw ProfileActivationException("$label replacement identity changed before commit")
+        }
+    }
+
+    private fun deleteOriginalTombstone(
+        tombstone: Path,
+        expected: StorageIdentity,
+        label: String,
+        allowLegacyMissing: Boolean,
+    ) {
+        if (!expected.existed) {
+            if (existsNoFollow(tombstone)) throw ProfileActivationException("$label has an unexpected tombstone")
+            return
+        }
+        if (!existsNoFollow(tombstone)) {
+            if (allowLegacyMissing) return
+            throw ProfileActivationException("$label original tombstone is missing before commit")
+        }
+        requireRegularFile(tombstone, "$label original tombstone")
+        if (!attributesNoFollow(tombstone).matches(expected)) {
+            throw ProfileActivationException("$label original tombstone identity changed")
+        }
+        Files.delete(tombstone)
+        forceDirectory(tombstone.parent)
+    }
+
+    private data class OriginalRestoreOutcome(val restoredAtFixedPath: Boolean, val irreversibleLoss: Boolean)
+
+    private fun abortPendingActivationLocked(pending: PendingActivation) {
+        val storageOutcome = restoreOriginalAfterAbort(
+            fixedStorage, storageTombstone, storageRecoveryQuarantine, cloudStorageTemporary,
+            pending.storageIdentity, pending.replacementStorageIdentity, "fixed storage",
+        )
+        val varsOutcome = pending.varsIdentity?.let { varsExpected ->
+            restoreOriginalAfterAbort(
+                fixedVars, varsTombstone, varsRecoveryQuarantine, cloudVarsTemporary,
+                varsExpected, pending.replacementVarsIdentity, "fixed UEFI vars",
+            )
+        } ?: OriginalRestoreOutcome(restoredAtFixedPath = true, irreversibleLoss = false)
+        val originalsRestored = storageOutcome.restoredAtFixedPath && varsOutcome.restoredAtFixedPath
+        if (originalsRestored) {
+            pending.previousCloudLineage?.let {
+                writeReplaceRecord(cloudLineagePath, encodeCloudLineage(it))
+            } ?: clearCloudLineageLocked()
+            if (readActivationStateLocked() == pending.desired) {
+                pending.previousActivation?.let {
+                    writeReplaceRecord(activationPath(), encodeActivation(it))
+                } ?: clearActivationLocked()
             }
-            requireRegularFile(storageTombstone, "fixed storage deletion tombstone")
-            if (!attributesNoFollow(storageTombstone).matches(expected)) {
-                throw ProfileActivationException("fixed storage deletion tombstone was replaced")
-            }
-            val restoreDestination = if (actual.existed) {
-                ensureNoPath(storageRecoveryQuarantine)
-                storageRecoveryQuarantine
-            } else {
-                fixedStorage
-            }
-            Files.move(storageTombstone, restoreDestination, StandardCopyOption.ATOMIC_MOVE)
-            forceDirectory(fixedStorage.parent)
-            false
         } else {
-            expected.existed && !actual.existed
+            // Never leave old boot authority able to consume partial or replacement mutable files.
+            clearCloudLineageLocked()
+            clearActivationLocked()
         }
 
         val failure = ActivationFailureState(
             pending.desired.activationSequence,
             pending.desired.active,
             ActivationFailureReason.CANDIDATE_NO_LONGER_USABLE,
-            irreversible,
+            storageOutcome.irreversibleLoss,
+            varsOutcome.irreversibleLoss,
         )
         writeReplaceRecord(activationFailurePath(), encodeActivationFailure(failure))
         clearPendingActivation()
-        reconcileActivationTrustLocked()
         prunePreparedRecordsAndBlobsLocked()
+    }
+
+    private fun restoreOriginalAfterAbort(
+        target: Path,
+        tombstone: Path,
+        quarantine: Path,
+        temporaryPath: Path,
+        expected: StorageIdentity,
+        replacement: StorageIdentity?,
+        label: String,
+    ): OriginalRestoreOutcome {
+        runCatching {
+            if (existsNoFollow(temporaryPath)) {
+                requireRegularFile(temporaryPath, "$label temporary replacement")
+                Files.delete(temporaryPath)
+                forceDirectory(temporaryPath.parent)
+            }
+        }
+        val actual = runCatching { captureFileIdentity(target, label, requireStableKeys = true) }
+            .getOrElse { return OriginalRestoreOutcome(false, expected.existed) }
+        if (actual.parentFileKey != expected.parentFileKey ||
+            actual.parentCreationTime != expected.parentCreationTime
+        ) return OriginalRestoreOutcome(false, expected.existed)
+
+        if (existsNoFollow(tombstone)) {
+            val validTombstone = runCatching {
+                requireRegularFile(tombstone, "$label original tombstone")
+                attributesNoFollow(tombstone).matches(expected)
+            }.getOrDefault(false)
+            if (!expected.existed || !validTombstone) {
+                return OriginalRestoreOutcome(false, expected.existed)
+            }
+            if (actual.existed) {
+                if (replacement != null && actual == replacement) {
+                    runCatching { Files.delete(target); forceDirectory(target.parent) }
+                        .getOrElse { return OriginalRestoreOutcome(false, false) }
+                } else {
+                    // A crash may publish a replacement just before recording its identity. Move
+                    // any unexpected target aside without deleting it, then restore the proven
+                    // original to the authoritative fixed path.
+                    if (existsNoFollow(quarantine)) return OriginalRestoreOutcome(false, false)
+                    runCatching {
+                        Files.move(target, quarantine, StandardCopyOption.ATOMIC_MOVE)
+                        forceDirectory(target.parent)
+                    }.getOrElse { return OriginalRestoreOutcome(false, false) }
+                }
+            }
+            return runCatching {
+                Files.move(tombstone, target, StandardCopyOption.ATOMIC_MOVE)
+                forceDirectory(target.parent)
+                OriginalRestoreOutcome(true, false)
+            }.getOrElse { OriginalRestoreOutcome(false, false) }
+        }
+
+        if (expected.existed) {
+            if (actual == expected) return OriginalRestoreOutcome(true, false)
+            if (actual.existed) runCatching {
+                if (!existsNoFollow(quarantine)) {
+                    Files.move(target, quarantine, StandardCopyOption.ATOMIC_MOVE)
+                    forceDirectory(target.parent)
+                }
+            }
+            return OriginalRestoreOutcome(false, true)
+        }
+        if (!actual.existed) return OriginalRestoreOutcome(true, false)
+        return runCatching {
+            if (replacement != null && actual == replacement) {
+                Files.delete(target)
+            } else {
+                ensureNoPath(quarantine)
+                Files.move(target, quarantine, StandardCopyOption.ATOMIC_MOVE)
+            }
+            forceDirectory(target.parent)
+            OriginalRestoreOutcome(true, false)
+        }.getOrElse { OriginalRestoreOutcome(false, false) }
     }
 
     private fun validatePendingSequence(pending: PendingActivation, activation: ActivationState?) {
@@ -1844,17 +2139,23 @@ class ProfileRepository(
     }
 
     private fun encodeCloudLineage(lineage: CloudLineage): ByteArray = encodeRecord(CLOUD_LINEAGE_MAGIC) { output ->
+        writeCloudLineage(output, lineage)
+    }
+
+    private fun writeCloudLineage(output: DataOutputStream, lineage: CloudLineage) {
         output.writeUTF(lineage.dataCompatibility.value)
         output.writeUTF(lineage.cloudDiskSha256.value)
         output.writeUTF(lineage.varsTemplateSha256.value)
     }
 
+    private fun readCloudLineage(input: DataInputStream): CloudLineage = CloudLineage(
+        checkedRecordValue { DataCompatibilityId(input.readUTF()) },
+        checkedRecordValue { Sha256Digest(input.readUTF()) },
+        checkedRecordValue { Sha256Digest(input.readUTF()) },
+    )
+
     private fun decodeCloudLineage(bytes: ByteArray): CloudLineage = decodeRecord(bytes, CLOUD_LINEAGE_MAGIC) { input ->
-        CloudLineage(
-            checkedRecordValue { DataCompatibilityId(input.readUTF()) },
-            checkedRecordValue { Sha256Digest(input.readUTF()) },
-            checkedRecordValue { Sha256Digest(input.readUTF()) },
-        )
+        readCloudLineage(input)
     }
 
     private fun readCloudLineageLocked(): CloudLineage? =
@@ -1865,6 +2166,28 @@ class ProfileRepository(
             requireRegularFile(cloudLineagePath, "cloud lineage record")
             Files.delete(cloudLineagePath)
             forceDirectory(state)
+        }
+    }
+
+    private fun clearActivationLocked() {
+        val path = activationPath()
+        if (existsNoFollow(path)) {
+            requireRegularFile(path, "activation record")
+            Files.delete(path)
+            forceDirectory(state)
+        }
+    }
+
+    private fun clearMutableInitializationArtifactsLocked() {
+        listOf(cloudStorageTemporary, cloudVarsTemporary).forEach { path ->
+            if (existsNoFollow(path)) {
+                requireRegularFile(path, "cloud initialization temporary")
+                Files.delete(path)
+                forceDirectory(path.parent)
+            }
+        }
+        if (existsNoFollow(storageTombstone) || existsNoFollow(varsTombstone)) {
+            throw ProfileRepositoryCorruptException("orphan mutable initialization tombstone remains")
         }
     }
 
@@ -1888,10 +2211,20 @@ class ProfileRepository(
     private fun decodeActivation(bytes: ByteArray): ActivationState = decodeRecord(bytes, ACTIVATION_MAGIC, ::readActivation)
 
     private fun encodePendingActivation(record: PendingActivation): ByteArray =
-        encodeRecord(PENDING_ACTIVATION_V2_MAGIC) { output ->
+        encodeRecord(PENDING_ACTIVATION_V3_MAGIC) { output ->
             writeActivation(output, record.desired)
             writeStorageIdentity(output, record.storageIdentity)
-            writeStorageIdentity(output, record.varsIdentity!!)
+            output.writeBoolean(record.varsIdentity != null)
+            record.varsIdentity?.let { writeStorageIdentity(output, it) }
+            output.writeUTF(record.phase.name)
+            output.writeBoolean(record.replacementStorageIdentity != null)
+            record.replacementStorageIdentity?.let { writeStorageIdentity(output, it) }
+            output.writeBoolean(record.replacementVarsIdentity != null)
+            record.replacementVarsIdentity?.let { writeStorageIdentity(output, it) }
+            output.writeBoolean(record.previousActivation != null)
+            record.previousActivation?.let { writeActivation(output, it) }
+            output.writeBoolean(record.previousCloudLineage != null)
+            record.previousCloudLineage?.let { writeCloudLineage(output, it) }
         }
 
     private fun writeStorageIdentity(output: DataOutputStream, identity: StorageIdentity) {
@@ -1907,11 +2240,12 @@ class ProfileRepository(
     }
 
     private fun encodeActivationFailure(record: ActivationFailureState): ByteArray =
-        encodeRecord(ACTIVATION_FAILURE_MAGIC) { output ->
+        encodeRecord(ACTIVATION_FAILURE_V2_MAGIC) { output ->
             output.writeLong(record.attemptedActivationSequence)
             writeCandidate(output, record.candidate)
             output.writeUTF(record.reason.name)
             output.writeBoolean(record.storageDeletionIrreversible)
+            output.writeBoolean(record.uefiVarsDeletionIrreversible)
         }
 
     private fun encodeTrustQuarantine(record: TrustQuarantineState): ByteArray =
@@ -1925,8 +2259,10 @@ class ProfileRepository(
             }
         }
 
-    private fun decodeActivationFailure(bytes: ByteArray): ActivationFailureState =
-        decodeRecord(bytes, ACTIVATION_FAILURE_MAGIC) { input ->
+    private fun decodeActivationFailure(bytes: ByteArray): ActivationFailureState {
+        if (bytes.size < 4) throw ProfileRepositoryCorruptException("activation failure is truncated")
+        val magic = ByteBuffer.wrap(bytes, 0, 4).int
+        return decodeRecord(bytes, magic) { input ->
             val sequence = input.readLong()
             if (sequence <= 0) throw ProfileRepositoryCorruptException("failure activation sequence is invalid")
             val candidate = readCandidate(input)
@@ -1935,8 +2271,15 @@ class ProfileRepository(
             } catch (failure: IllegalArgumentException) {
                 throw ProfileRepositoryCorruptException("activation failure reason is invalid", failure)
             }
-            ActivationFailureState(sequence, candidate, reason, input.readBoolean())
+            val storageLoss = input.readBoolean()
+            val varsLoss = when (magic) {
+                ACTIVATION_FAILURE_MAGIC -> false
+                ACTIVATION_FAILURE_V2_MAGIC -> input.readBoolean()
+                else -> throw ProfileRepositoryCorruptException("activation failure type is invalid")
+            }
+            ActivationFailureState(sequence, candidate, reason, storageLoss, varsLoss)
         }
+    }
 
     private fun decodeTrustQuarantine(bytes: ByteArray): TrustQuarantineState =
         decodeRecord(bytes, TRUST_QUARANTINE_MAGIC) { input ->
@@ -1968,12 +2311,53 @@ class ProfileRepository(
         if (bytes.size < 4) throw ProfileRepositoryCorruptException("pending activation is truncated")
         return when (ByteBuffer.wrap(bytes, 0, 4).int) {
             PENDING_ACTIVATION_MAGIC -> decodeRecord(bytes, PENDING_ACTIVATION_MAGIC) { input ->
-                PendingActivation(readActivation(input), readStorageIdentity(input), null)
+                PendingActivation(
+                    readActivation(input), readStorageIdentity(input), null,
+                    legacyDestructiveJournal = true,
+                )
             }
             PENDING_ACTIVATION_V2_MAGIC -> decodeRecord(bytes, PENDING_ACTIVATION_V2_MAGIC) { input ->
-                PendingActivation(readActivation(input), readStorageIdentity(input), readStorageIdentity(input))
+                PendingActivation(
+                    readActivation(input), readStorageIdentity(input), readStorageIdentity(input),
+                    legacyDestructiveJournal = true,
+                )
+            }
+            PENDING_ACTIVATION_V3_MAGIC -> decodeRecord(bytes, PENDING_ACTIVATION_V3_MAGIC) { input ->
+                val desired = readActivation(input)
+                val storage = readStorageIdentity(input)
+                val vars = if (input.readBoolean()) readStorageIdentity(input) else null
+                val phase = try {
+                    CloudInitializationPhase.valueOf(input.readUTF())
+                } catch (failure: IllegalArgumentException) {
+                    throw ProfileRepositoryCorruptException("cloud initialization phase is invalid", failure)
+                }
+                val replacementStorage = if (input.readBoolean()) readStorageIdentity(input) else null
+                val replacementVars = if (input.readBoolean()) readStorageIdentity(input) else null
+                val previousActivation = if (input.readBoolean()) readActivation(input) else null
+                val previousLineage = if (input.readBoolean()) readCloudLineage(input) else null
+                PendingActivation(
+                    desired, storage, vars, phase, replacementStorage, replacementVars,
+                    previousActivation, previousLineage,
+                )
             }
             else -> throw ProfileRepositoryCorruptException("pending activation type is invalid")
+        }.also(::validatePendingJournal)
+    }
+
+    private fun validatePendingJournal(pending: PendingActivation) {
+        if (pending.phase >= CloudInitializationPhase.STORAGE_PUBLISHED &&
+            pending.replacementStorageIdentity == null
+        ) throw ProfileRepositoryCorruptException("pending storage phase has no replacement identity")
+        if (pending.phase >= CloudInitializationPhase.VARS_PUBLISHED &&
+            pending.replacementVarsIdentity == null
+        ) throw ProfileRepositoryCorruptException("pending vars phase has no replacement identity")
+        if (pending.replacementVarsIdentity != null && pending.replacementStorageIdentity == null) {
+            throw ProfileRepositoryCorruptException("pending vars identity precedes storage identity")
+        }
+        pending.previousActivation?.let {
+            if (it.activationSequence >= pending.desired.activationSequence) {
+                throw ProfileRepositoryCorruptException("pending predecessor activation is not older")
+            }
         }
     }
 
@@ -2291,7 +2675,21 @@ class ProfileRepository(
         val desired: ActivationState,
         val storageIdentity: StorageIdentity,
         val varsIdentity: StorageIdentity?,
+        val phase: CloudInitializationPhase = CloudInitializationPhase.INTENT,
+        val replacementStorageIdentity: StorageIdentity? = null,
+        val replacementVarsIdentity: StorageIdentity? = null,
+        val previousActivation: ActivationState? = null,
+        val previousCloudLineage: CloudLineage? = null,
+        val legacyDestructiveJournal: Boolean = false,
     )
+
+    private enum class CloudInitializationPhase {
+        INTENT,
+        STORAGE_PUBLISHED,
+        VARS_PUBLISHED,
+        LINEAGE_PUBLISHED,
+        ACTIVATION_PUBLISHED,
+    }
 
     private data class CloudLineage(
         val dataCompatibility: DataCompatibilityId,
@@ -2331,7 +2729,9 @@ class ProfileRepository(
         const val ACTIVATION_MAGIC = 0x50524143
         const val PENDING_ACTIVATION_MAGIC = 0x5052504e
         const val PENDING_ACTIVATION_V2_MAGIC = 0x50524e32
+        const val PENDING_ACTIVATION_V3_MAGIC = 0x50524e33
         const val ACTIVATION_FAILURE_MAGIC = 0x50524641
+        const val ACTIVATION_FAILURE_V2_MAGIC = 0x50524632
         const val TRUST_QUARANTINE_MAGIC = 0x50525154
         const val MAX_RECORD_BYTES = 16 * 1024
         const val RECORD_BUFFER_BYTES = 4 * 1024

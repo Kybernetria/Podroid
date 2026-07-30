@@ -21,6 +21,23 @@ REQUIRED_FILES = ("meta-data", "user-data", "vendor-data", "network-config")
 REVIEW_MANIFEST = "reviewed-files.json"
 MAX_SOURCE_BYTES = 64 * 1024
 FIXED_RECORDING_TIME = (125, 1, 1, 0, 0, 0, 0)  # 2025-01-01 UTC, ISO year offset from 1900.
+# Closed semantic policy: these canonical decoded documents are the complete allowlist.
+# Exact bytes deliberately reject duplicate YAML keys, aliases, alternate paths, overriding
+# directives, and arbitrary cloud-init modules without depending on a permissive YAML parser.
+CANONICAL_SOURCES = {
+    "meta-data": b"instance-id: podroid-debian-12-cloud-v1\nlocal-hostname: podroid\n",
+    "user-data": (
+        b"#cloud-config\nusers: []\ndisable_root: true\nssh_pwauth: false\n"
+        b"preserve_hostname: false\n"
+    ),
+    "vendor-data": (
+        b"#cloud-config\nruncmd:\n"
+        b"  - [\"/bin/sh\", \"-c\", \"printf 'PODROID_CLOUD_READY_V1\\\\n' >/dev/ttyAMA0\"]\n"
+    ),
+    "network-config": (
+        b"version: 2\nethernets:\n  podroid:\n    match:\n      name: \"e*\"\n    dhcp4: true\n"
+    ),
+}
 FORBIDDEN = (
     (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE), "SSH/private key"),
     (re.compile(r"(?i)\b(?:ssh_)?authorized[_ -]?keys?\b|\b(?:ssh-(?:rsa|dss|ed25519)|ecdsa-sha2-[^ ]+)\s+[A-Za-z0-9+/=]{16,}"), "authorized key"),
@@ -83,12 +100,11 @@ def _validate_text(name: str, data: bytes) -> str:
 def _validate_seed_policy(sources: dict[str, bytes]) -> None:
     if set(sources) != set(REQUIRED_FILES):
         raise SeedError("NoCloud policy requires the complete reviewed file set")
-    user_data = sources["user-data"].decode()
-    vendor_data = sources["vendor-data"].decode()
-    if "users: []\n" not in user_data or "ssh_pwauth: false\n" not in user_data:
-        raise SeedError("user-data must retain explicit credential-free defaults")
-    if vendor_data.count(READINESS_MARKER) != 2:
-        raise SeedError("vendor-data must contain the reviewed readiness marker exactly twice")
+    for name in REQUIRED_FILES:
+        if sources[name] != CANONICAL_SOURCES[name]:
+            raise SeedError(f"{name} is outside the closed canonical NoCloud semantics")
+    if sources["vendor-data"].decode().count(READINESS_MARKER) != 1:
+        raise SeedError("vendor-data must contain exactly one fixed readiness command")
 
 
 def load_reviewed_sources(source_dir: Path) -> dict[str, bytes]:

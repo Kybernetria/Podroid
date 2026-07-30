@@ -33,16 +33,13 @@
       "properties": {
         "guest_integrations": {
           "type": "array",
-          "maxItems": 4,
-          "uniqueItems": true,
-          "items": {
-            "enum": [
-              "podroid-terminal-v1",
-              "podroid-resize-v1",
-              "podroid-host-bridge-v1",
-              "podroid-downloads-v1"
-            ]
-          }
+          "enum": [
+            [],
+            ["podroid-terminal-v1"],
+            ["podroid-terminal-v1", "podroid-resize-v1"],
+            ["podroid-terminal-v1", "podroid-resize-v1", "podroid-host-bridge-v1"],
+            ["podroid-terminal-v1", "podroid-resize-v1", "podroid-host-bridge-v1", "podroid-downloads-v1"]
+          ]
         }
       }
     },

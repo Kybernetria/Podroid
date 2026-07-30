@@ -5,6 +5,7 @@
 package com.excp.podroid.vm
 
 import com.excp.podroid.data.repository.PortForwardRule
+import com.excp.podroid.engine.BackendSelectionClaimer
 import com.excp.podroid.engine.QmpController
 import com.excp.podroid.engine.VmConfig
 import com.excp.podroid.engine.VmEngine
@@ -12,7 +13,7 @@ import com.excp.podroid.engine.VmState
 import com.excp.podroid.profiles.ActivationState
 import com.excp.podroid.profiles.DataDeletionConfirmation
 import com.excp.podroid.profiles.GuestDataPolicy
-import com.excp.podroid.profiles.PreparedBootContract
+import com.excp.podroid.profiles.ProfileBackend
 import com.excp.podroid.profiles.PreparedProfileCandidate
 import com.excp.podroid.profiles.ProfileActivationException
 import com.excp.podroid.profiles.ProfileLifecycleOperations
@@ -247,6 +248,7 @@ internal interface ManagedVmRuntime {
     fun forceStop()
     suspend fun systemPowerdown(): Result<Unit>
     suspend fun executeQmp(operation: VmQmpOperation): Result<VmQmpResult>
+    suspend fun <T> withBackendSelectionClaim(action: suspend (backendId: String) -> T): T = action(backendId)
 }
 
 internal interface VmAssetTreeLease {
@@ -675,6 +677,11 @@ class DefaultVmManager internal constructor(
                     // so prove both fixed backend identities absent first while
                     // the lifecycle, asset tree, and durable command are fenced.
                     runtimePreflight.ensureAllFixedRuntimesStopped()
+                    if (policy == VmRemovePolicy.DELETE_DATA) {
+                        // Clear boot authority first. A crash before file deletion is inert and
+                        // explicit profile reactivation remains possible from immutable state.
+                        profileLifecycleStore.clearForVmRemoval(GuestDataPolicy.DELETE_DATA)
+                    }
                     files.remove(vmId, policy)
                     installationEnsured = false
                 }
@@ -686,8 +693,13 @@ class DefaultVmManager internal constructor(
     override suspend fun issueDataDeletionConfirmation(
         candidate: PreparedProfileCandidate,
     ): DataDeletionConfirmation = withStoppedProfileLifecycle {
-        requireSelectedBackendSupports(profileLifecycleStore.preparedBootContract(candidate))
-        profileLifecycleStore.issueDataDeletionConfirmation(candidate)
+        runtime.withBackendSelectionClaim { backendId ->
+            requireSelectedBackendSupports(
+                backendId,
+                profileLifecycleStore.candidateSupportedBackends(candidate),
+            )
+            profileLifecycleStore.issueDataDeletionConfirmation(candidate)
+        }
     }
 
     override suspend fun activateProfile(
@@ -695,16 +707,27 @@ class DefaultVmManager internal constructor(
         dataPolicy: GuestDataPolicy,
         deletionConfirmation: DataDeletionConfirmation?,
     ): ActivationState = withStoppedProfileLifecycle {
-        // Rechecked after confirmation and immediately before repository effects.
-        requireSelectedBackendSupports(profileLifecycleStore.preparedBootContract(candidate))
-        profileLifecycleStore.install(candidate, dataPolicy, deletionConfirmation)
+        runtime.withBackendSelectionClaim { backendId ->
+            // Rechecked after confirmation and held through the repository effect.
+            requireSelectedBackendSupports(
+                backendId,
+                profileLifecycleStore.candidateSupportedBackends(candidate),
+            )
+            profileLifecycleStore.install(candidate, dataPolicy, deletionConfirmation)
+        }
     }
 
     override suspend fun rollbackProfile(
         expectedActivationSequence: Long,
         dataPolicy: GuestDataPolicy,
     ): ActivationState = withStoppedProfileLifecycle {
-        profileLifecycleStore.rollback(expectedActivationSequence, dataPolicy)
+        runtime.withBackendSelectionClaim { backendId ->
+            requireSelectedBackendSupports(
+                backendId,
+                profileLifecycleStore.rollbackSupportedBackends(expectedActivationSequence),
+            )
+            profileLifecycleStore.rollback(expectedActivationSequence, dataPolicy)
+        }
     }
 
     override suspend fun readConsoleLog(vmId: VmId, request: ConsoleLogRequest): ConsoleLog =
@@ -1172,13 +1195,13 @@ class DefaultVmManager internal constructor(
         installer.awaitInitial(vmId)
     }
 
-    /** Profile activation shares the exact lifecycle mutex and application asset-tree lease. */
-    private fun requireSelectedBackendSupports(contract: PreparedBootContract) {
-        when (contract) {
-            PreparedBootContract.DirectKernelOverlayV1 -> Unit
-            PreparedBootContract.UefiNoCloudV1 -> if (runtime.backendId != "qemu") {
-                throw ProfileActivationException("selected backend does not support the prepared boot contract")
-            }
+    /** Profile lifecycle effects are bound to one atomically claimed router selection. */
+    private fun requireSelectedBackendSupports(
+        backendId: String,
+        supportedBackends: Set<ProfileBackend>,
+    ) {
+        if (supportedBackends.none { it.wireName == backendId }) {
+            throw ProfileActivationException("selected backend does not support the prepared profile")
         }
     }
 
@@ -1273,6 +1296,14 @@ internal class EngineManagedVmRuntime(private val engine: VmEngine) : ManagedVmR
     override fun forceStop() = engine.forceStop()
     override suspend fun systemPowerdown(): Result<Unit> =
         engine.qmpController?.systemPowerdown() ?: Result.failure(UnsupportedOperationException("QMP unavailable"))
+
+    override suspend fun <T> withBackendSelectionClaim(
+        action: suspend (backendId: String) -> T,
+    ): T = if (engine is BackendSelectionClaimer) {
+        engine.withBackendSelectionClaim(action)
+    } else {
+        action(engine.backendId)
+    }
 
     override suspend fun executeQmp(operation: VmQmpOperation): Result<VmQmpResult> {
         val qmp: QmpController = engine.qmpController

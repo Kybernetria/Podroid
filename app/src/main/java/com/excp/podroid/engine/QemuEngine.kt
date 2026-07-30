@@ -56,6 +56,12 @@ import javax.inject.Singleton
 
 internal fun qemuBootFiles(config: VmConfig, paths: VmPaths): VmBootFiles = config.bootFiles(paths)
 
+internal fun persistedConsoleCaptureAllowed(config: VmConfig): Boolean =
+    config.bootArtifacts !is UefiNoCloudVmBootPlan && SensitiveConsolePolicy.persistedCaptureAllowed(
+        config.qemuExtraArgs,
+        config.kernelExtraCmdline,
+    )
+
 internal fun buildClosedCloudQemuBootArgs(plan: UefiNoCloudVmBootPlan, cpus: Int): List<String> {
     require(cpus > 0)
     return listOf(
@@ -364,10 +370,9 @@ class QemuEngine @Inject constructor(
             bootStageGate.arm(claimedGeneration)
             cleanedUp.set(false)
             activeBootPlan = config.bootArtifacts
-            persistedConsoleCaptureEnabled = SensitiveConsolePolicy.persistedCaptureAllowed(
-                config.qemuExtraArgs,
-                config.kernelExtraCmdline,
-            )
+            // Cloud serial output can contain provisioned guest data. Keep it only in the
+            // bounded in-memory tail; persistent export is intentionally omitted.
+            persistedConsoleCaptureEnabled = persistedConsoleCaptureAllowed(config)
             // Delete any prior capture before this run can expose advanced
             // values. Boot detection and the bounded in-memory tail stay active.
             if (!persistedConsoleCaptureEnabled) vmPaths.consoleLog.delete()

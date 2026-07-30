@@ -22,7 +22,7 @@ Milestone 1 began with tracked ownership markers only. Tickets #6–#15 add VM i
 | `controller/desktop-ui/` | Slint desktop adapter | Ticket #9 external preview UI; no phone transport or Android packaging |
 | `profiles/schemas/` | Versioned profile schemas | README skeleton |
 | `profiles/alpine-direct/` | Initial known-good Alpine profile | README skeleton |
-| `profiles/debian-cloud/` | Deferred profile placeholder, not support | README skeleton |
+| `profiles/debian-cloud/` | Reproducible v2 UEFI/NoCloud release inputs | Closed runtime plumbing implemented; release artifacts still lack physical-boot evidence |
 | `termux-integration/` | Optional Termux companion backend | README skeleton |
 | `build-tools/` | Tracked QEMU/libslirp/libusb build inputs | Existing area, documented |
 | `build/` | Generated output only | Ignored; never source |

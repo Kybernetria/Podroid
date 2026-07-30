@@ -8,6 +8,7 @@ import com.excp.podroid.vm.VmBootGeneration
 import com.excp.podroid.vm.VmGuestCapabilities
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -68,6 +69,17 @@ class QemuProfileCommandPolicyTest {
             ),
             buildClosedCloudQemuBootArgs(plan, 2),
         )
+    }
+
+    @Test fun `cloud serial persistence is omitted while bundled safe capture remains enabled`() {
+        val digest = VmBootDigest("c".repeat(64))
+        val cloud = UefiNoCloudVmBootPlan(
+            VmBootGeneration(3), digest, File("/fixed/storage.img"),
+            VmBootArtifact(File("/cas/uefi-code"), digest), File("/fixed/uefi-vars.fd"),
+            VmBootArtifact(File("/cas/cidata"), digest), "PODROID_CLOUD_READY_V1", VmGuestCapabilities(),
+        )
+        assertFalse(persistedConsoleCaptureAllowed(VmConfig(bootArtifacts = cloud)))
+        assertTrue(persistedConsoleCaptureAllowed(VmConfig()))
     }
 
     @Test fun `downloaded profile command accepts blank extras without changing command`() {

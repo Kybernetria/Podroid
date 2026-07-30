@@ -37,15 +37,11 @@ interface ProfileLifecycleOperations {
     ): ActivationState
 }
 
-internal sealed interface PreparedBootContract {
-    data object DirectKernelOverlayV1 : PreparedBootContract
-    data object UefiNoCloudV1 : PreparedBootContract
-}
-
 internal interface ProfileLifecycleStore {
-    /** Read-only contract inspection used for backend fencing before lifecycle effects. */
-    suspend fun preparedBootContract(candidate: PreparedProfileCandidate): PreparedBootContract =
-        PreparedBootContract.DirectKernelOverlayV1
+    /** Signed, prepared backend support inspected while the router selection is claimed. */
+    suspend fun candidateSupportedBackends(candidate: PreparedProfileCandidate): Set<ProfileBackend>
+    /** Backend support for the sequence-bound rollback target. */
+    suspend fun rollbackSupportedBackends(expectedActivationSequence: Long): Set<ProfileBackend>
     suspend fun issueDataDeletionConfirmation(candidate: PreparedProfileCandidate): DataDeletionConfirmation
 
     suspend fun install(
@@ -55,6 +51,9 @@ internal interface ProfileLifecycleStore {
     ): ActivationState
 
     suspend fun rollback(expectedActivationSequence: Long, dataPolicy: GuestDataPolicy): ActivationState
+
+    /** Clears mutable activation/rollback/lineage before manager-owned VM data removal. */
+    suspend fun clearForVmRemoval(dataPolicy: GuestDataPolicy)
 }
 
 internal interface ActiveProfileRuntime {
@@ -134,8 +133,11 @@ internal class ManagerProfileLifecycleStore @Inject constructor(
     private val repository = environment.openConfiguredRepository(HttpUrlConnectionProfileArtifactFetcher())
     private val availability = environment.availability
 
-    override suspend fun preparedBootContract(candidate: PreparedProfileCandidate): PreparedBootContract =
-        withContext(Dispatchers.IO) { requireConfigured().preparedBootContract(candidate) }
+    override suspend fun candidateSupportedBackends(candidate: PreparedProfileCandidate): Set<ProfileBackend> =
+        withContext(Dispatchers.IO) { requireConfigured().candidateSupportedBackends(candidate) }
+
+    override suspend fun rollbackSupportedBackends(expectedActivationSequence: Long): Set<ProfileBackend> =
+        withContext(Dispatchers.IO) { requireConfigured().rollbackSupportedBackends(expectedActivationSequence) }
 
     override suspend fun issueDataDeletionConfirmation(
         candidate: PreparedProfileCandidate,
@@ -156,6 +158,10 @@ internal class ManagerProfileLifecycleStore @Inject constructor(
         dataPolicy: GuestDataPolicy,
     ): ActivationState = withContext(Dispatchers.IO) {
         requireConfigured().rollback(expectedActivationSequence, dataPolicy)
+    }
+
+    override suspend fun clearForVmRemoval(dataPolicy: GuestDataPolicy) = withContext(Dispatchers.IO) {
+        if (dataPolicy == GuestDataPolicy.DELETE_DATA) repository?.clearForVmRemoval()
     }
 
     private fun requireConfigured(): ProfileRepository = repository ?: run {

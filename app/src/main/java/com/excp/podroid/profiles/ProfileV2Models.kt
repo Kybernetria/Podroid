@@ -12,6 +12,9 @@ object ProfileV2Limits {
     const val MAX_TOTAL_ARTIFACT_BYTES = MAX_CLOUD_DISK_BYTES + MAX_UEFI_CODE_BYTES +
         MAX_UEFI_VARS_TEMPLATE_BYTES + MAX_NOCLOUD_SEED_BYTES
     const val READINESS_MARKER = "PODROID_CLOUD_READY_V1"
+    const val CANONICAL_NOCLOUD_SEED_BYTES = 51_200L
+    const val CANONICAL_NOCLOUD_SEED_SHA256 =
+        "7c6363a2bba06cf8d248ed54aa38468571bfb09b338d5cb0accf524a637fb656"
 }
 
 enum class ProfileV2ArtifactFormat(val wireName: String) {
@@ -61,6 +64,13 @@ enum class ProfileV2GuestIntegration(val wireName: String) {
 class ProfileV2Capabilities(guestIntegrations: Set<ProfileV2GuestIntegration> = emptySet()) {
     val guestIntegrations: Set<ProfileV2GuestIntegration> =
         Collections.unmodifiableSet(guestIntegrations.toSet())
+
+    init {
+        val admittedPrefix = ProfileV2GuestIntegration.entries.take(this.guestIntegrations.size).toSet()
+        require(this.guestIntegrations == admittedPrefix) {
+            "profile v2 guest integrations must form the closed dependency prefix"
+        }
+    }
 
     fun allows(integration: ProfileV2GuestIntegration): Boolean = integration in guestIntegrations
 

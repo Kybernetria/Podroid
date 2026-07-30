@@ -94,12 +94,28 @@ class BootStageDetectorTest {
             legacyStagesEnabled = false,
         ) { stages += it }
 
-        detector.feed("Ready! Almost ready Starting SSH")
+        detector.feed("Ready! Almost ready Starting SSH\n")
         assertTrue(stages.isEmpty())
         detector.feed("PODROID_CLOUD_")
         assertTrue(stages.isEmpty())
         detector.feed("READY_V1\n")
         assertEquals(listOf("Ready"), stages)
+
+        listOf(
+            "xPODROID_CLOUD_READY_V1\n",
+            "PODROID_CLOUD_READY_V1x\n",
+            "prefix PODROID_CLOUD_READY_V1 suffix\r\n",
+            "PODROID_CLOUD_READY_V1",
+        ).forEach { input ->
+            val rejected = mutableListOf<String>()
+            BootStageDetector("PODROID_CLOUD_READY_V1", false) { rejected += it }
+                .feed(input)
+            assertTrue("must reject '$input'", rejected.isEmpty())
+        }
+        val crDelimited = mutableListOf<String>()
+        BootStageDetector("PODROID_CLOUD_READY_V1", false) { crDelimited += it }
+            .feed("PODROID_CLOUD_READY_V1\r")
+        assertEquals(listOf("Ready"), crDelimited)
     }
 
     @Test

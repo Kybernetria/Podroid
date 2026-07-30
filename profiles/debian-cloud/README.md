@@ -11,13 +11,13 @@ The signed v2 payload is QEMU-only and fixes:
 - role-specific and aggregate byte ceilings;
 - `podroid-cloud-disk-v1` storage and `podroid-debian-12-genericcloud-v1` data lineage;
 - the `PODROID_CLOUD_READY_V1` serial readiness marker; and
-- a typed guest-integration capability set. The committed Debian seed declares no integration capability, so terminal, resize, Host bridge, and Downloads behavior is denied rather than inferred.
+- a typed guest-integration dependency prefix. The committed Debian seed declares the empty prefix, so terminal, resize, Host bridge, and Downloads behavior is denied rather than inferred.
 
 V2 signatures cover `com.excp.podroid.vm-profile.v2\0 || exact_payload_bytes`. The v1 domain and deterministic bytes are unchanged. V2 uses explicit envelope version 2 plus `signing_domain=com.excp.podroid.vm-profile.v2`; the closed envelope discriminator selects the verifier before payload parsing, so payload bytes cannot choose or confuse their signing domain.
 
 ## Deterministic credential-free CIDATA
 
-`nocloud/` contains the complete reviewed NoCloud source set. It creates no user, password, password hash, authorized key, private key, token, or remote seed. DHCP is selected locally. `vendor-data` emits the fixed readiness marker to the ARM64 serial console after cloud-init finalization.
+`nocloud/` contains the complete reviewed NoCloud source set. It creates no user, password, password hash, authorized key, private key, token, or remote seed. DHCP is selected locally. The closed `vendor-data` command emits one exact CR/LF-delimited readiness line to the ARM64 serial console from cloud-init's final module; no prefix, suffix, embedded marker, or alternate command is accepted.
 
 Build and inspect with only Python's standard library:
 
@@ -28,7 +28,7 @@ python3 profiles/debian-cloud/build_nocloud_seed.py inspect \
   --source profiles/debian-cloud/nocloud
 ```
 
-The builder uses a fixed ISO layout and timestamps, the exact `CIDATA` volume label, a closed filename set, bounded regular-file reads, and reviewed SHA-256 source hashes. Inspection rejects noncanonical ISO bytes, unexpected files, credential material, token fields, and arbitrary HTTP(S)/NoCloud seed references. Identical reviewed sources produce identical ISO bytes.
+The builder uses a fixed ISO layout and timestamps, the exact `CIDATA` volume label, normalized root filenames, bounded regular-file reads, reviewed SHA-256 hashes, and an exact decoded-document allowlist. Inspection rejects noncanonical ISO bytes, duplicate/unknown paths, YAML overrides, arbitrary modules or commands, credential material, token fields, and HTTP(S)/NoCloud seed references. Identical reviewed sources produce identical ISO bytes. Cloud serial output is retained only in the app's bounded in-memory boot tail and is omitted from persistent console capture.
 
 The same NoCloud source/tool format is usable by Debian and Ubuntu cloud-init images, but only the Debian image below is pinned and reviewed in this slice. An Ubuntu release requires its own immutable official provenance lock and boot evidence.
 

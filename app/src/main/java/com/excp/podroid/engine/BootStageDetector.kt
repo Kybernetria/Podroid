@@ -23,7 +23,11 @@ class BootStageDetector(
         require(readinessMarker.isNotEmpty() && readinessMarker.length <= 128)
     }
     private val buf = StringBuilder()
+    private val readinessLine = StringBuilder()
+    private var readinessLineOverflow = false
     private val maxKeep = 4096
+
+    val isReady: Boolean get() = ready
 
     /**
      * Overlap carried across feeds so a marker split between two reads is still
@@ -39,6 +43,10 @@ class BootStageDetector(
 
     fun feed(bytes: ByteArray, len: Int) {
         if (ready) return
+        if (!legacyStagesEnabled) {
+            feedExactReadinessLines(bytes, len)
+            return
+        }
         // Latin-1 decode is byte-safe (1 byte → 1 char) and the ASCII subset
         // matches UTF-8 exactly, so our pure-ASCII markers still match.
         buf.append(String(bytes, 0, len, Charsets.ISO_8859_1))
@@ -56,7 +64,6 @@ class BootStageDetector(
         scannedLen = buf.length
         when {
             tail.contains(readinessMarker)          -> { ready = true; onStage("Ready") }
-            !legacyStagesEnabled                    -> Unit
             tail.contains("Almost ready")           -> onStage("Almost ready...")
             tail.contains("Starting SSH")           -> onStage("Starting SSH...")
             tail.contains("Configuring containers") -> onStage("Configuring containers...")
@@ -64,6 +71,29 @@ class BootStageDetector(
             tail.contains("Loading kernel modules") -> onStage("Loading kernel modules...")
             tail.contains("Mounting storage")       -> onStage("Mounting storage...")
             tail.contains("Booting kernel")         -> onStage("Booting kernel...")
+        }
+    }
+
+    /** Cloud contracts are admitted only as one complete CR/LF-delimited ASCII line. */
+    private fun feedExactReadinessLines(bytes: ByteArray, len: Int) {
+        for (index in 0 until len) {
+            val value = bytes[index].toInt() and 0xff
+            if (value == '\r'.code || value == '\n'.code) {
+                if (!readinessLineOverflow && readinessLine.toString() == readinessMarker) {
+                    ready = true
+                    onStage("Ready")
+                    return
+                }
+                readinessLine.setLength(0)
+                readinessLineOverflow = false
+            } else if (!readinessLineOverflow) {
+                if (readinessLine.length == readinessMarker.length) {
+                    readinessLine.setLength(0)
+                    readinessLineOverflow = true
+                } else {
+                    readinessLine.append(value.toChar())
+                }
+            }
         }
     }
 

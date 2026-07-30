@@ -3,6 +3,7 @@ package com.excp.podroid.profiles
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
@@ -12,6 +13,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertNull
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -55,6 +57,20 @@ class ProfileV2RepositoryRuntimeTest {
             "com.excp.podroid.vm-profile.v1",
         ).toByteArray()
         assertFailure<ProfileCodecException> { repository.prepare(wrongDomain) }
+    }
+
+    @Test
+    fun `runtime canonical NoCloud policy rejects arbitrary signed seed bytes`() {
+        val fixture = fixture("arbitrary-seed")
+        val root = temporaryFolder.newFolder("arbitrary-seed-root")
+        val storage = File(root, "instance/storage.img").also { it.parentFile.mkdirs() }
+        val repository = repository(
+            root, storage, MapFetcher(fixture.bytes),
+            noCloudSeedPolicy = CanonicalNoCloudSeedPolicy,
+        )
+
+        assertFailure<ProfileDownloadException> { repository.prepare(envelope(fixture.profile)) }
+        assertTrue(File(root, "store/prepared").walkTopDown().none { it.isFile })
     }
 
     @Test
@@ -105,7 +121,7 @@ class ProfileV2RepositoryRuntimeTest {
         val crashing = repository(
             root, storage, MapFetcher(fixture.bytes), vars,
             ProfileRepositoryFaultInjector { point ->
-                if (point == ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION && armed.compareAndSet(true, false)) {
+                if (point == ProfileRepositoryFaultPoint.AFTER_CLOUD_STORAGE_PUBLISHED && armed.compareAndSet(true, false)) {
                     throw IOException("crash after fixed cloud disk publication")
                 }
             },
@@ -140,20 +156,259 @@ class ProfileV2RepositoryRuntimeTest {
         }
     }
 
+    @Test
+    fun `every cloud phase crash has trusted recovery to one coherent generation`() {
+        val faultPoints = listOf(
+            ProfileRepositoryFaultPoint.AFTER_DELETION_INTENT,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_STORAGE_PUBLISHED,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_VARS_PUBLISHED,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_LINEAGE_PUBLISHED,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_ACTIVATION_PUBLISHED,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_ORIGINALS_FINALIZED,
+        )
+        faultPoints.forEach { faultPoint ->
+            val fixture = fixture("phase-${faultPoint.ordinal}")
+            val root = temporaryFolder.newFolder("phase-${faultPoint.ordinal}")
+            val storage = File(root, "instance/storage.img").also { it.parentFile.mkdirs(); it.writeText("old-disk") }
+            val vars = File(storage.parentFile, "uefi-vars.fd").also { it.writeText("old-vars") }
+            val armed = AtomicBoolean(true)
+            val crashing = repository(
+                root, storage, MapFetcher(fixture.bytes), vars,
+                ProfileRepositoryFaultInjector { point ->
+                    if (point == faultPoint && armed.compareAndSet(true, false)) throw IOException("crash at $point")
+                },
+            )
+            val prepared = crashing.prepare(envelope(fixture.profile))
+            assertFailure<IOException> {
+                crashing.activate(
+                    prepared.candidate,
+                    GuestDataPolicy.DELETE_DATA,
+                    crashing.issueDataDeletionConfirmation(prepared.candidate),
+                )
+            }
+
+            val restarted = repository(root, storage, MapFetcher(fixture.bytes), varsFile = vars)
+            restarted.recover()
+            assertEquals(prepared.candidate, restarted.activationState()!!.active)
+            assertArrayEquals(fixture.bytes.getValue(ProfileV2ArtifactRole.CLOUD_DISK), storage.readBytes())
+            assertArrayEquals(fixture.bytes.getValue(ProfileV2ArtifactRole.UEFI_VARS_TEMPLATE), vars.readBytes())
+            assertTrue(storage.parentFile.listFiles()!!.none { it.name.startsWith(".podroid-profile-delete-") })
+        }
+    }
+
+    @Test
+    fun `trust revocation at every cloud phase restores originals when retained and disables new storage`() {
+        val revokedTrust = ProfileTrustPolicy(trust.trustEpoch, emptyMap())
+        val faultPoints = listOf(
+            ProfileRepositoryFaultPoint.AFTER_DELETION_INTENT,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_STORAGE_PUBLISHED,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_VARS_PUBLISHED,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_LINEAGE_PUBLISHED,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_ACTIVATION_PUBLISHED,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_ORIGINALS_FINALIZED,
+        )
+        faultPoints.forEach { faultPoint ->
+            val fixture = fixture("revoke-${faultPoint.ordinal}")
+            val root = temporaryFolder.newFolder("revoke-${faultPoint.ordinal}")
+            val storage = File(root, "instance/storage.img").also { it.parentFile.mkdirs(); it.writeText("old-disk") }
+            val vars = File(storage.parentFile, "uefi-vars.fd").also { it.writeText("old-vars") }
+            val armed = AtomicBoolean(true)
+            val crashing = repository(
+                root, storage, MapFetcher(fixture.bytes), vars,
+                ProfileRepositoryFaultInjector { point ->
+                    if (point == faultPoint && armed.compareAndSet(true, false)) throw IOException("crash at $point")
+                },
+            )
+            val prepared = crashing.prepare(envelope(fixture.profile))
+            assertFailure<IOException> {
+                crashing.activate(
+                    prepared.candidate,
+                    GuestDataPolicy.DELETE_DATA,
+                    crashing.issueDataDeletionConfirmation(prepared.candidate),
+                )
+            }
+
+            val revoked = repository(
+                root, storage, MapFetcher(fixture.bytes), varsFile = vars, trustPolicy = revokedTrust,
+            )
+            revoked.recover()
+            val originalsAlreadyFinalized =
+                faultPoint == ProfileRepositoryFaultPoint.AFTER_CLOUD_ORIGINALS_FINALIZED
+            if (originalsAlreadyFinalized) {
+                assertFalse(storage.exists())
+                assertFalse(vars.exists())
+            } else {
+                assertEquals("old-disk", storage.readText())
+                assertEquals("old-vars", vars.readText())
+            }
+            assertNull(revoked.activationState())
+            val failure = revoked.lastActivationFailure()!!
+            assertEquals(originalsAlreadyFinalized, failure.storageDeletionIrreversible)
+            assertEquals(originalsAlreadyFinalized, failure.uefiVarsDeletionIrreversible)
+            assertFailure<ProfileActivationException> { revoked.resolveActiveProfile() }
+        }
+    }
+
+    @Test
+    fun `candidate corruption at every cloud phase restores retained originals and clears boot authority`() {
+        val faultPoints = listOf(
+            ProfileRepositoryFaultPoint.AFTER_DELETION_INTENT,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_STORAGE_PUBLISHED,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_VARS_PUBLISHED,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_LINEAGE_PUBLISHED,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_ACTIVATION_PUBLISHED,
+            ProfileRepositoryFaultPoint.AFTER_CLOUD_ORIGINALS_FINALIZED,
+        )
+        faultPoints.forEach { faultPoint ->
+            val fixture = fixture("corrupt-${faultPoint.ordinal}")
+            val root = temporaryFolder.newFolder("corrupt-${faultPoint.ordinal}")
+            val storage = File(root, "instance/storage.img").also { it.parentFile.mkdirs(); it.writeText("old-disk") }
+            val vars = File(storage.parentFile, "uefi-vars.fd").also { it.writeText("old-vars") }
+            val armed = AtomicBoolean(true)
+            val crashing = repository(
+                root, storage, MapFetcher(fixture.bytes), vars,
+                ProfileRepositoryFaultInjector { point ->
+                    if (point == faultPoint && armed.compareAndSet(true, false)) throw IOException("crash at $point")
+                },
+            )
+            val prepared = crashing.prepare(envelope(fixture.profile))
+            assertFailure<IOException> {
+                crashing.activate(
+                    prepared.candidate,
+                    GuestDataPolicy.DELETE_DATA,
+                    crashing.issueDataDeletionConfirmation(prepared.candidate),
+                )
+            }
+            val diskArtifact = fixture.profile.artifact(ProfileV2ArtifactRole.CLOUD_DISK)
+            File(root, "store/blobs/${diskArtifact.sha256.value}.blob")
+                .writeBytes(ByteArray(diskArtifact.sizeBytes.toInt()) { 0x5a })
+
+            val restarted = repository(root, storage, MapFetcher(fixture.bytes), varsFile = vars)
+            restarted.recover()
+            if (faultPoint == ProfileRepositoryFaultPoint.AFTER_CLOUD_ORIGINALS_FINALIZED) {
+                assertFalse(storage.exists())
+                assertFalse(vars.exists())
+                assertTrue(restarted.lastActivationFailure()!!.storageDeletionIrreversible)
+                assertTrue(restarted.lastActivationFailure()!!.uefiVarsDeletionIrreversible)
+            } else {
+                assertEquals("old-disk", storage.readText())
+                assertEquals("old-vars", vars.readText())
+            }
+            assertNull(restarted.activationState())
+        }
+    }
+
+    @Test
+    fun `missing original tombstone records exact irreversible disk loss and disables activation`() {
+        val fixture = fixture("irreversible")
+        val root = temporaryFolder.newFolder("irreversible-root")
+        val storage = File(root, "instance/storage.img").also { it.parentFile.mkdirs(); it.writeText("old-disk") }
+        val vars = File(storage.parentFile, "uefi-vars.fd").also { it.writeText("old-vars") }
+        val armed = AtomicBoolean(true)
+        val crashing = repository(
+            root, storage, MapFetcher(fixture.bytes), vars,
+            ProfileRepositoryFaultInjector { point ->
+                if (point == ProfileRepositoryFaultPoint.AFTER_CLOUD_STORAGE_PUBLISHED &&
+                    armed.compareAndSet(true, false)
+                ) throw IOException("crash")
+            },
+        )
+        val prepared = crashing.prepare(envelope(fixture.profile))
+        assertFailure<IOException> {
+            crashing.activate(
+                prepared.candidate,
+                GuestDataPolicy.DELETE_DATA,
+                crashing.issueDataDeletionConfirmation(prepared.candidate),
+            )
+        }
+        storage.parentFile.listFiles()!!.single { it.name.startsWith(".podroid-profile-delete-") }.delete()
+
+        val revoked = repository(
+            root, storage, MapFetcher(fixture.bytes), varsFile = vars,
+            trustPolicy = ProfileTrustPolicy(trust.trustEpoch, emptyMap()),
+        )
+        revoked.recover()
+        assertNull(revoked.activationState())
+        assertFalse(storage.exists())
+        assertEquals("old-vars", vars.readText())
+        assertTrue(revoked.lastActivationFailure()!!.storageDeletionIrreversible)
+        assertFalse(revoked.lastActivationFailure()!!.uefiVarsDeletionIrreversible)
+    }
+
+    @Test
+    fun `cloud space failure occurs before durable intent or original mutation`() {
+        val fixture = fixture("space")
+        val root = temporaryFolder.newFolder("space-root")
+        val storage = File(root, "instance/storage.img").also { it.parentFile.mkdirs(); it.writeText("old-disk") }
+        val vars = File(storage.parentFile, "uefi-vars.fd").also { it.writeText("old-vars") }
+        val repository = repository(
+            root, storage, MapFetcher(fixture.bytes), varsFile = vars,
+            usableSpaceProvider = ProfileUsableSpaceProvider { path ->
+                if (path.fileName.toString() == "blobs") Long.MAX_VALUE else 0L
+            },
+        )
+        val prepared = repository.prepare(envelope(fixture.profile))
+
+        assertFailure<ProfileQuotaExceededException> {
+            repository.activate(
+                prepared.candidate,
+                GuestDataPolicy.DELETE_DATA,
+                repository.issueDataDeletionConfirmation(prepared.candidate),
+            )
+        }
+        assertEquals("old-disk", storage.readText())
+        assertEquals("old-vars", vars.readText())
+        assertFalse(File(root, "store/state/activation.pending").exists())
+    }
+
+    @Test
+    fun `manager data removal clears cloud boot authority but preserves explicit reactivation`() {
+        val fixture = fixture("remove")
+        val root = temporaryFolder.newFolder("remove-root")
+        val storage = File(root, "instance/storage.img").also { it.parentFile.mkdirs(); it.writeText("bundled") }
+        val vars = File(storage.parentFile, "uefi-vars.fd")
+        val repository = repository(root, storage, MapFetcher(fixture.bytes), varsFile = vars)
+        val prepared = repository.prepare(envelope(fixture.profile))
+        val initial = repository.activate(
+            prepared.candidate,
+            GuestDataPolicy.DELETE_DATA,
+            repository.issueDataDeletionConfirmation(prepared.candidate),
+        )
+
+        repository.clearForVmRemoval()
+        assertNull(repository.activationState())
+        assertEquals(ActivationFailureReason.VM_DATA_REMOVED, repository.lastActivationFailure()!!.reason)
+        assertFailure<ProfileActivationException> { repository.resolveActiveProfile() }
+        storage.delete()
+        vars.delete()
+        val reactivated = repository.activate(
+            prepared.candidate,
+            GuestDataPolicy.DELETE_DATA,
+            repository.issueDataDeletionConfirmation(prepared.candidate),
+        )
+        assertEquals(prepared.candidate, reactivated.active)
+        assertEquals(initial.activationSequence + 1L, reactivated.activationSequence)
+    }
+
     private fun repository(
         root: File,
         storage: File,
         fetcher: ProfileArtifactFetcher,
         varsFile: File = File(storage.parentFile, "uefi-vars.fd"),
         faultInjector: ProfileRepositoryFaultInjector = ProfileRepositoryFaultInjector { },
+        usableSpaceProvider: ProfileUsableSpaceProvider = ProfileUsableSpaceProvider { Files.getFileStore(it).usableSpace },
+        trustPolicy: ProfileTrustPolicy = trust,
+        noCloudSeedPolicy: ProfileNoCloudSeedPolicy = ProfileNoCloudSeedPolicy { _, _ -> },
     ) = ProfileRepository(
         repositoryDirectory = File(root, "store"),
         storageFile = storage,
         approvedOrigins = origins,
-        trustPolicy = trust,
+        trustPolicy = trustPolicy,
         artifactFetcher = fetcher,
         directoryDurability = FileChannelDirectoryDurability,
         faultInjector = faultInjector,
+        usableSpaceProvider = usableSpaceProvider,
+        noCloudSeedPolicy = noCloudSeedPolicy,
         uefiVarsFile = varsFile,
     )
 

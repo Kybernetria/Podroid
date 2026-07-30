@@ -11,7 +11,7 @@ import com.excp.podroid.profiles.GuestDataPolicy
 import com.excp.podroid.profiles.PreparedProfileCandidate
 import com.excp.podroid.profiles.ProfileGeneration
 import com.excp.podroid.profiles.ProfileId
-import com.excp.podroid.profiles.PreparedBootContract
+import com.excp.podroid.profiles.ProfileBackend
 import com.excp.podroid.profiles.ProfileLifecycleStore
 import com.excp.podroid.profiles.Sha256Digest
 import com.excp.podroid.profiles.SigningKeyId
@@ -112,8 +112,8 @@ class VmManagerTest {
     }
 
     @Test
-    fun `UEFI cloud activation is rejected on AVF before lifecycle store effects`() = runBlocking {
-        val store = FakeProfileLifecycleStore(bootContract = PreparedBootContract.UefiNoCloudV1)
+    fun `any QEMU-only prepared profile is rejected on AVF before lifecycle store effects`() = runBlocking {
+        val store = FakeProfileLifecycleStore(supportedBackends = setOf(ProfileBackend.QEMU))
         val manager = manager(runtime = FakeRuntime("avf"), profileLifecycleStore = store)
 
         try {
@@ -124,6 +124,48 @@ class VmManagerTest {
         }
 
         assertEquals(0, store.installCalls)
+    }
+
+    @Test
+    fun `backend selection claim awaits cold resolution before contract inspection`() = runBlocking {
+        val runtime = FakeRuntime("qemu").apply {
+            coldResolvedBackendId = "avf"
+        }
+        val store = FakeProfileLifecycleStore(supportedBackends = setOf(ProfileBackend.AVF))
+        val manager = manager(runtime = runtime, profileLifecycleStore = store)
+
+        val result = manager.activateProfile(profileCandidate(), GuestDataPolicy.PRESERVE_DATA)
+
+        assertEquals(profileCandidate(), result.active)
+        assertEquals("avf", runtime.backendId)
+        assertEquals(1, store.installCalls)
+    }
+
+    @Test
+    fun `QEMU to AVF swap waits until profile activation releases backend selection claim`() = runBlocking {
+        val runtime = FakeRuntime("qemu")
+        val effectEntered = CompletableDeferred<Unit>()
+        val releaseEffect = CompletableDeferred<Unit>()
+        val store = FakeProfileLifecycleStore(
+            supportedBackends = setOf(ProfileBackend.QEMU),
+            onInstall = {
+                effectEntered.complete(Unit)
+                releaseEffect.await()
+            },
+        )
+        val manager = manager(runtime = runtime, profileLifecycleStore = store)
+
+        val activation = async { manager.activateProfile(profileCandidate(), GuestDataPolicy.PRESERVE_DATA) }
+        effectEntered.await()
+        val swap = async { runtime.swapBackend("avf") }
+        delay(30)
+        assertFalse(swap.isCompleted)
+        assertEquals("qemu", runtime.backendId)
+
+        releaseEffect.complete(Unit)
+        activation.await()
+        swap.await()
+        assertEquals("avf", runtime.backendId)
     }
 
     @Test
@@ -1391,7 +1433,8 @@ class VmManagerTest {
             quiescent.value = false
         }
         val files = FakeFiles()
-        val manager = manager(runtime = runtime, files = files)
+        val profileStore = FakeProfileLifecycleStore()
+        val manager = manager(runtime = runtime, files = files, profileLifecycleStore = profileStore)
 
         expectFailure<IllegalStateException> {
             runBlocking { manager.remove(VmId.DEFAULT, VmRemovePolicy.PRESERVE_DATA) }
@@ -1406,6 +1449,23 @@ class VmManagerTest {
             listOf(VmRemovePolicy.PRESERVE_DATA, VmRemovePolicy.DELETE_DATA),
             files.removePolicies,
         )
+        assertEquals(1, profileStore.clearForRemovalCalls)
+    }
+
+    @Test
+    fun `delete data removal clears profile boot authority before file deletion`() = runBlocking {
+        val events = mutableListOf<String>()
+        val profileStore = FakeProfileLifecycleStore(onClearForRemoval = { events += "profile-clear" })
+        val files = FakeFiles(onRemove = {
+            assertEquals(listOf("profile-clear"), events)
+            events += "files-delete"
+        })
+        val manager = manager(files = files, profileLifecycleStore = profileStore)
+
+        manager.remove(VmId.DEFAULT, VmRemovePolicy.DELETE_DATA)
+
+        assertEquals(listOf("profile-clear", "files-delete"), events)
+        assertEquals(1, profileStore.clearForRemovalCalls)
     }
 
     @Test
@@ -2048,12 +2108,19 @@ class VmManagerTest {
     private class FakeProfileLifecycleStore(
         private val onInstall: suspend () -> Unit = {},
         private val onRollback: suspend () -> Unit = {},
+        private val onClearForRemoval: suspend () -> Unit = {},
         private val rollbackResult: ActivationState? = null,
-        private val bootContract: PreparedBootContract = PreparedBootContract.DirectKernelOverlayV1,
+        private val supportedBackends: Set<ProfileBackend> = ProfileBackend.entries.toSet(),
     ) : ProfileLifecycleStore {
         var installCalls = 0
         var rollbackCalls = 0
-        override suspend fun preparedBootContract(candidate: PreparedProfileCandidate): PreparedBootContract = bootContract
+        var clearForRemovalCalls = 0
+        override suspend fun candidateSupportedBackends(
+            candidate: PreparedProfileCandidate,
+        ): Set<ProfileBackend> = supportedBackends
+        override suspend fun rollbackSupportedBackends(
+            expectedActivationSequence: Long,
+        ): Set<ProfileBackend> = supportedBackends
         override suspend fun issueDataDeletionConfirmation(
             candidate: PreparedProfileCandidate,
         ): DataDeletionConfirmation = throw UnsupportedOperationException()
@@ -2076,6 +2143,13 @@ class VmManagerTest {
             onRollback()
             return rollbackResult ?: throw UnsupportedOperationException()
         }
+
+        override suspend fun clearForVmRemoval(dataPolicy: GuestDataPolicy) {
+            if (dataPolicy == GuestDataPolicy.DELETE_DATA) {
+                clearForRemovalCalls++
+                onClearForRemoval()
+            }
+        }
     }
 
     private class CountingProbe(
@@ -2094,7 +2168,22 @@ class VmManagerTest {
         override suspend fun awaitStopped(): Boolean = true
     }
 
-    private class FakeRuntime(override val backendId: String = "qemu") : ManagedVmRuntime {
+    private class FakeRuntime(initialBackendId: String = "qemu") : ManagedVmRuntime {
+        @Volatile private var selectedBackendId = initialBackendId
+        private val backendSelectionMutex = kotlinx.coroutines.sync.Mutex()
+        var beforeBackendClaim: suspend () -> Unit = {}
+        var coldResolvedBackendId: String? = null
+        override val backendId: String get() = selectedBackendId
+        suspend fun swapBackend(next: String) = backendSelectionMutex.withLock {
+            selectedBackendId = next
+        }
+        override suspend fun <T> withBackendSelectionClaim(
+            action: suspend (backendId: String) -> T,
+        ): T = backendSelectionMutex.withLock {
+            beforeBackendClaim()
+            coldResolvedBackendId?.let { selectedBackendId = it; coldResolvedBackendId = null }
+            action(selectedBackendId)
+        }
         override val vmId = VmId.DEFAULT
         override val state = MutableStateFlow<VmState>(VmState.Idle)
         override val quiescent = MutableStateFlow(true)
