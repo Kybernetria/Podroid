@@ -1,3 +1,6 @@
+import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.tasks.OutputDirectory
+
 /*
  * Podroid — direct-kernel Alpine VM for Android
  *
@@ -11,11 +14,101 @@ plugins {
     alias(libs.plugins.hilt.android)
 }
 
+abstract class BuildDebugLibTailscaleTask : Exec() {
+    @get:OutputDirectory
+    abstract val generatedJniDirectory: DirectoryProperty
+
+    @get:OutputDirectory
+    abstract val generatedAssetsDirectory: DirectoryProperty
+}
+
 val podroidQemuVersion = providers.gradleProperty("podroidQemuVersion").get()
 
 val guestRootfs = rootProject.file("app/src/main/assets/alpine-rootfs.squashfs")
 val debugApk = layout.buildDirectory.file("outputs/apk/debug/app-debug.apk")
 val releaseApk = layout.buildDirectory.file("outputs/apk/release/app-release.apk")
+val libTailscaleTool = rootProject.file("build-tools/libtailscale_android.py")
+val generatedDebugLibTailscale = layout.buildDirectory.dir("generated/libtailscale/debug")
+
+val verifyLibTailscalePin by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Fail-closed verification of the libtailscale source pin and Android toolchains."
+    workingDir(rootProject.projectDir)
+    commandLine(
+        "python3", libTailscaleTool,
+        "verify-pin", "--repo", rootProject.projectDir, "--require-toolchains"
+    )
+    inputs.files(
+        libTailscaleTool,
+        rootProject.file("third_party/libtailscale-pin.json"),
+        rootProject.file("third_party/libtailscale/LICENSE"),
+        rootProject.file("third_party/libtailscale/go.mod"),
+        rootProject.file("app/src/main/AndroidManifest.xml")
+    )
+    outputs.upToDateWhen { false }
+}
+
+val buildDebugLibTailscale by tasks.registering(BuildDebugLibTailscaleTask::class) {
+    group = "build"
+    description = "Builds the pinned official libtailscale and project JNI shim for debug arm64-v8a."
+    dependsOn(verifyLibTailscalePin)
+    workingDir(rootProject.projectDir)
+    commandLine(
+        "python3", libTailscaleTool,
+        "build", "--repo", rootProject.projectDir,
+        "--output", generatedDebugLibTailscale.get().asFile
+    )
+    inputs.files(
+        libTailscaleTool,
+        rootProject.file("third_party/libtailscale-pin.json"),
+        rootProject.fileTree("third_party/libtailscale") { exclude(".git") },
+        rootProject.file("transport/tailscale-android/jni/podroid_tailscale_jni.c"),
+        rootProject.file("app/src/main/AndroidManifest.xml")
+    )
+    inputs.property("goExecutable", providers.environmentVariable("PODROID_GO").orElse("go"))
+    inputs.property(
+        "androidNdkHome",
+        providers.environmentVariable("PODROID_ANDROID_NDK_HOME")
+            .orElse(providers.environmentVariable("ANDROID_NDK_HOME"))
+            .orElse("sdk-ndk-28.2.13676358")
+    )
+    generatedJniDirectory.set(generatedDebugLibTailscale.map { it.dir("jni") })
+    generatedAssetsDirectory.set(generatedDebugLibTailscale.map { it.dir("assets") })
+}
+
+val testLibTailscaleAndroidVerifier by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Runs libtailscale pin, ELF, manifest, and packaging regression tests."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", "-m", "unittest", "-v", "tests/test_libtailscale_android.py")
+    inputs.files(
+        libTailscaleTool,
+        rootProject.file("tests/test_libtailscale_android.py"),
+        rootProject.file("third_party/libtailscale-pin.json"),
+        rootProject.file("third_party/libtailscale/LICENSE"),
+        rootProject.file("third_party/libtailscale/go.mod"),
+        rootProject.file("app/build.gradle.kts"),
+        rootProject.file("app/src/main/AndroidManifest.xml")
+    )
+}
+
+val verifyPackagedDebugLibTailscale by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Statically verifies debug APK libtailscale ABI, ELF, provenance, and manifest policy."
+    workingDir(rootProject.projectDir)
+    commandLine(
+        "python3", libTailscaleTool,
+        "verify-apk", "--repo", rootProject.projectDir, "--apk", debugApk.get().asFile
+    )
+    inputs.files(
+        debugApk,
+        libTailscaleTool,
+        rootProject.file("third_party/libtailscale-pin.json"),
+        rootProject.file("third_party/libtailscale/LICENSE"),
+        rootProject.file("third_party/libtailscale/go.mod")
+    )
+    outputs.upToDateWhen { false }
+}
 
 val verifyGuestCredentialSources by tasks.registering(Exec::class) {
     group = "verification"
@@ -239,7 +332,11 @@ tasks.matching { it.name == "preReleaseBuild" }.configureEach {
 }
 
 tasks.matching { it.name == "assembleDebug" }.configureEach {
-    finalizedBy(verifyPackagedDebugGuestCredentials, verifyPackagedDebugMinimalGuest)
+    finalizedBy(
+        verifyPackagedDebugGuestCredentials,
+        verifyPackagedDebugMinimalGuest,
+        verifyPackagedDebugLibTailscale
+    )
 }
 
 tasks.matching { it.name == "assembleRelease" }.configureEach {
@@ -257,7 +354,8 @@ tasks.named("check") {
         verifyVmInstancePaths,
         testVmInstancePathVerifier,
         verifyUiVmBoundary,
-        testUiVmBoundaryVerifier
+        testUiVmBoundaryVerifier,
+        testLibTailscaleAndroidVerifier
     )
 }
 
@@ -268,12 +366,14 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
         verifyVmInstancePaths,
         testVmInstancePathVerifier,
         verifyUiVmBoundary,
-        testUiVmBoundaryVerifier
+        testUiVmBoundaryVerifier,
+        testLibTailscaleAndroidVerifier
     )
 }
 
 android {
     namespace = "com.excp.podroid"
+    ndkVersion = "28.2.13676358"
     compileSdk {
         version = release(36) {
             minorApiLevel = 1
@@ -355,6 +455,23 @@ android {
         // It must be extracted to disk so ProcessBuilder can execute it.
         jniLibs {
             useLegacyPackaging = true
+            // Preserve the exact generated bytes covered by packaged provenance hashes.
+            keepDebugSymbols += setOf(
+                "**/libtailscale.so",
+                "**/libpodroid-tailscale-jni.so"
+            )
+        }
+    }
+}
+
+androidComponents {
+    onVariants(selector().withBuildType("debug")) { variant ->
+        // The generated native libraries and provenance are intentionally absent from release variants.
+        variant.sources.jniLibs?.addGeneratedSourceDirectory(buildDebugLibTailscale) {
+            it.generatedJniDirectory
+        }
+        variant.sources.assets?.addGeneratedSourceDirectory(buildDebugLibTailscale) {
+            it.generatedAssetsDirectory
         }
     }
 }

@@ -7,8 +7,28 @@
   "licenseSha256": "d6e14a92f27cd6c82f8914041c1bb43819fcf3167b827b9198c2c803d4dff5d3",
   "goVersion": "1.25.5",
   "tailscaleModule": "tailscale.com@v1.94.1",
-  "integrationStatus": "source-only-spike-pin",
-  "androidArtifact": null,
-  "supportedAbi": null,
+  "integrationStatus": "debug-build-and-packaging-scaffold",
+  "androidArtifact": "app/build/generated/libtailscale/debug/jni/arm64-v8a/libtailscale.so",
+  "jniShimArtifact": "app/build/generated/libtailscale/debug/jni/arm64-v8a/libpodroid-tailscale-jni.so",
+  "provenanceArtifact": "app/build/generated/libtailscale/debug/assets/libtailscale-provenance.json",
+  "supportedAbi": [
+    "arm64-v8a"
+  ],
+  "goBuildMode": "c-shared",
+  "androidNdkVersion": "28.2.13676358",
+  "androidApi": 26,
+  "ptLoadAlignmentBytes": 16384,
+  "clangVersion": "Android (13624864, +pgo, +bolt, +lto, +mlgo, based on r530567e) clang version 19.0.1 (https://android.googlesource.com/toolchain/llvm-project 97a699bf4812a18fb657c2779f5296a4ab2694d2)",
+  "officialDtNeeded": [
+    "liblog.so",
+    "libdl.so",
+    "libc.so"
+  ],
+  "shimDtNeeded": [
+    "libtailscale.so",
+    "libc.so"
+  ],
+  "debugPackaging": true,
+  "releasePackaging": false,
   "trackingIssue": "https://github.com/Kybernetria/Podroid/issues/15"
 }
