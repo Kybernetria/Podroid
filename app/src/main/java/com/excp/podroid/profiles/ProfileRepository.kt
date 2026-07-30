@@ -75,13 +75,16 @@ data class PreparedProfileCandidate(
 class PreparedProfile internal constructor(
     val candidate: PreparedProfileCandidate,
     val dataCompatibility: DataCompatibilityId,
+    supportedBackends: Set<ProfileBackend>,
     artifactFiles: Map<ArtifactRole, File>,
     artifactDigests: Map<ArtifactRole, Sha256Digest>,
 ) {
+    val supportedBackends: Set<ProfileBackend> = Collections.unmodifiableSet(supportedBackends.toSet())
     val artifactFiles: Map<ArtifactRole, File> = Collections.unmodifiableMap(artifactFiles.toMap())
     val artifactDigests: Map<ArtifactRole, Sha256Digest> = Collections.unmodifiableMap(artifactDigests.toMap())
 
     init {
+        require(this.supportedBackends.isNotEmpty()) { "prepared profile backend contract is empty" }
         require(this.artifactFiles.keys == ArtifactRole.entries.toSet()) { "prepared profile files are incomplete" }
         require(this.artifactDigests.keys == ArtifactRole.entries.toSet()) { "prepared profile digests are incomplete" }
     }
@@ -267,9 +270,15 @@ class ProfileRepository(
     fun resolveActiveProfile(): PreparedProfile? = withRepositoryLock {
         recoverLocked()
         recoverPendingActivationLocked()
-        readActivationStateLocked()?.let { activation ->
+        val activation = readActivationStateLocked()
+        if (activation == null && downloadedLineageClaimedLocked()) {
+            throw ProfileActivationException(
+                "bundled fallback is blocked because downloaded profile lineage was previously claimed",
+            )
+        }
+        activation?.let {
             requireUsableCandidateLocked(
-                activation.active,
+                it.active,
                 requireCurrentFloor = false,
                 requireCurrentTrust = true,
             ).toPublic()
@@ -359,6 +368,13 @@ class ProfileRepository(
                 }
                 captureStorageIdentity(requireStableKeys = false)
                 if (sameActive) return@withRepositoryLock current
+                if (current == null && Files.exists(fixedStorage, LinkOption.NOFOLLOW_LINKS) &&
+                    preparedRecord.dataCompatibility != ProfileDataLineage.BUNDLED_ALPINE
+                ) {
+                    throw ProfileActivationException(
+                        "first PRESERVE_DATA activation must match bundled Alpine storage lineage",
+                    )
+                }
                 current?.let { activation ->
                     val activeRecord = requireUsableCandidateLocked(
                         activation.active,
@@ -386,6 +402,7 @@ class ProfileRepository(
 
         val rollback = if (sameActive) current?.rollback else current?.active
         val next = ActivationState(nextActivationSequence(latestActivationSequenceLocked()), candidate, rollback)
+        ensureDownloadedLineageMarkerLocked()
         if (dataPolicy == GuestDataPolicy.DELETE_DATA) {
             val pending = PendingActivation(next, deletionConfirmation!!.storageIdentity)
             writeImmutableRecord(pendingActivationPath, encodePendingActivation(pending))
@@ -498,6 +515,7 @@ class ProfileRepository(
         val expectedRecord = PreparedRecord(
             candidate,
             profile.dataCompatibility,
+            profile.supportedBackends,
             profile.artifacts.sortedBy { it.role.ordinal }.map {
                 PreparedArtifact(it.role, it.sha256, it.sizeBytes)
             },
@@ -1169,6 +1187,7 @@ class ProfileRepository(
 
     private fun recoverLocked() {
         validateTreeAndCleanTemps()
+        downloadedLineageClaimedLocked()
         val preparedByKey = readAllPreparedRecords()
         val floorsByKey = readAllFloors()
         val currentEpoch = trustPolicy.trustEpoch
@@ -1201,6 +1220,9 @@ class ProfileRepository(
         val activation = readActivationStateLocked()
         val pendingActivation = readPendingActivationLocked()
         val trustQuarantine = readTrustQuarantineLocked()
+        if (activation != null || pendingActivation != null || trustQuarantine != null) {
+            ensureDownloadedLineageMarkerLocked()
+        }
         if (activation != null && trustQuarantine != null &&
             trustQuarantine.activationSequence > activation.activationSequence
         ) {
@@ -1286,7 +1308,7 @@ class ProfileRepository(
                 val name = entry.fileName.toString()
                 if (name != ACTIVATION_FILE && name != PENDING_ACTIVATION_FILE &&
                     name != ACTIVATION_FAILURE_FILE && name != TRUST_QUARANTINE_FILE &&
-                    !FLOOR_NAME.matches(name)
+                    name != DOWNLOADED_LINEAGE_FILE && !FLOOR_NAME.matches(name)
                 ) {
                     throw ProfileRepositoryCorruptException("unknown repository state entry")
                 }
@@ -1465,6 +1487,8 @@ class ProfileRepository(
     private fun encodePrepared(record: PreparedRecord): ByteArray = encodeRecord(PREPARED_MAGIC) { output ->
         writeCandidate(output, record.candidate)
         output.writeUTF(record.dataCompatibility.value)
+        output.writeInt(record.supportedBackends.size)
+        record.supportedBackends.sortedBy { it.ordinal }.forEach { output.writeUTF(it.wireName) }
         output.writeInt(record.artifacts.size)
         record.artifacts.sortedBy { it.role.ordinal }.forEach { artifact ->
             output.writeUTF(artifact.role.wireName)
@@ -1481,6 +1505,17 @@ class ProfileRepository(
         decodeRecord(bytes, PREPARED_MAGIC) { input ->
             val candidate = readCandidate(input)
             val compatibility = checkedRecordValue { DataCompatibilityId(input.readUTF()) }
+            val backendCount = input.readInt()
+            if (backendCount !in 1..ProfileBackend.entries.size) {
+                throw ProfileRepositoryCorruptException("prepared backend count is invalid")
+            }
+            val supportedBackends = (0 until backendCount).map {
+                ProfileBackend.fromWireName(input.readUTF())
+                    ?: throw ProfileRepositoryCorruptException("prepared backend is invalid")
+            }.toSet()
+            if (supportedBackends.size != backendCount) {
+                throw ProfileRepositoryCorruptException("prepared backends are duplicated")
+            }
             val count = input.readInt()
             if (count != ArtifactRole.entries.size) throw ProfileRepositoryCorruptException("prepared artifact count is invalid")
             val artifacts = (0 until count).map {
@@ -1500,7 +1535,7 @@ class ProfileRepository(
             ) {
                 throw ProfileRepositoryCorruptException("prepared record is in the wrong fixed candidate path")
             }
-            PreparedRecord(candidate, compatibility, artifacts)
+            PreparedRecord(candidate, compatibility, supportedBackends, artifacts)
         }
 
     private fun encodeFloor(record: FloorRecord): ByteArray = encodeRecord(FLOOR_MAGIC) { output ->
@@ -1712,6 +1747,7 @@ class ProfileRepository(
     private fun PreparedRecord.toPublic(): PreparedProfile = PreparedProfile(
         candidate,
         dataCompatibility,
+        supportedBackends,
         artifacts.associate { it.role to blobPath(it.sha256).toFile() },
         artifacts.associate { it.role to it.sha256 },
     )
@@ -1725,6 +1761,22 @@ class ProfileRepository(
     private fun floorPath(profileKey: String): Path = state.resolve("$profileKey$FLOOR_SUFFIX")
     private fun activationPath(): Path = state.resolve(ACTIVATION_FILE)
     private fun activationFailurePath(): Path = state.resolve(ACTIVATION_FAILURE_FILE)
+    private fun downloadedLineagePath(): Path = state.resolve(DOWNLOADED_LINEAGE_FILE)
+
+    private fun downloadedLineageClaimedLocked(): Boolean {
+        val marker = downloadedLineagePath()
+        if (!existsNoFollow(marker)) return false
+        requireRegularFile(marker, "downloaded profile lineage marker")
+        if (!readBoundedRecord(marker).contentEquals(DOWNLOADED_LINEAGE_BYTES)) {
+            throw ProfileRepositoryCorruptException("downloaded profile lineage marker is invalid")
+        }
+        return true
+    }
+
+    private fun ensureDownloadedLineageMarkerLocked() {
+        if (downloadedLineageClaimedLocked()) return
+        writeImmutableRecord(downloadedLineagePath(), DOWNLOADED_LINEAGE_BYTES)
+    }
 
     private fun <T> withRepositoryLock(block: () -> T): T {
         prepareLayoutForLock()
@@ -1868,6 +1920,7 @@ class ProfileRepository(
     private data class PreparedRecord(
         val candidate: PreparedProfileCandidate,
         val dataCompatibility: DataCompatibilityId,
+        val supportedBackends: Set<ProfileBackend>,
         val artifacts: List<PreparedArtifact>,
     )
 
@@ -1895,10 +1948,12 @@ class ProfileRepository(
         const val PENDING_ACTIVATION_FILE = "activation.pending"
         const val ACTIVATION_FAILURE_FILE = "activation.failure"
         const val TRUST_QUARANTINE_FILE = "trust.quarantine"
+        const val DOWNLOADED_LINEAGE_FILE = "downloaded-lineage.claimed"
+        val DOWNLOADED_LINEAGE_BYTES = "podroid-downloaded-profile-lineage-v1\n".toByteArray(Charsets.US_ASCII)
         const val BLOB_SUFFIX = ".blob"
         const val PREPARED_SUFFIX = ".prepared"
         const val FLOOR_SUFFIX = ".floor"
-        const val RECORD_VERSION = 2
+        const val RECORD_VERSION = 3
         const val RECORD_CHECKSUM_BYTES = 32
         const val PREPARED_MAGIC = 0x50525044
         const val FLOOR_MAGIC = 0x5052464c
@@ -1912,7 +1967,7 @@ class ProfileRepository(
         const val MAX_ZERO_READS = 16
         const val MAX_PROFILES = 32
         const val MAX_GENERATIONS_PER_PROFILE = 64
-        const val MAX_STATE_RECORDS = MAX_PROFILES + 4
+        const val MAX_STATE_RECORDS = MAX_PROFILES + 5
         const val MAX_FILE_KEY_CHARS = 512
         const val MAX_FILE_TIMESTAMP_CHARS = 64
         const val DEFAULT_FETCH_TIMEOUT_MILLIS = 5L * 60 * 1000

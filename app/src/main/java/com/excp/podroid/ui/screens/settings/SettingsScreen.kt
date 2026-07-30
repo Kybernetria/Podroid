@@ -71,6 +71,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.excp.podroid.BuildConfig
 import com.excp.podroid.R
 import com.excp.podroid.data.repository.PortForwardRule
+import com.excp.podroid.profiles.DownloadableProfileAvailability
+import com.excp.podroid.profiles.GuestDataPolicy
 import com.excp.podroid.vm.EngineSelection
 import com.excp.podroid.service.VmUiState
 import kotlinx.coroutines.launch
@@ -115,11 +117,13 @@ fun SettingsScreen(
     val vmState by viewModel.vmState.collectAsStateWithLifecycle()
     val exportError by viewModel.exportError.collectAsStateWithLifecycle()
     val usbPassthrough by viewModel.usbPassthroughEnabled.collectAsStateWithLifecycle()
+    val profileState by viewModel.profileState.collectAsStateWithLifecycle()
 
     var advancedExpanded by remember { mutableStateOf(false) }
     var showAddDialog by remember { mutableStateOf(false) }
     var showResetDialog by remember { mutableStateOf(false) }
     var showLanguageDialog by remember { mutableStateOf(false) }
+    var showProfileDeleteDialog by remember { mutableStateOf(false) }
     var avfReportText by remember { mutableStateOf<String?>(null) }
     var avfRunning by remember { mutableStateOf(false) }
     val avfScope = rememberCoroutineScope()
@@ -307,6 +311,21 @@ fun SettingsScreen(
                     onClick = { showResetDialog = true },
                 )
 
+                ProfileSettingsSection(
+                    state = profileState,
+                    vmStopped = vmNotRunning,
+                    onPrepare = viewModel::prepareProfile,
+                    onActivate = { policy ->
+                        if (policy == GuestDataPolicy.DELETE_DATA) {
+                            showProfileDeleteDialog = true
+                        } else {
+                            viewModel.activatePreparedProfile(policy)
+                        }
+                    },
+                    onRollback = viewModel::rollbackProfile,
+                    onClearError = viewModel::clearProfileError,
+                )
+
                 // ── ADVANCED ──────────────────────────────────────────
                 PodroidSectionLabel(stringResource(R.string.advanced))
                 Spacer(Modifier.height(PodroidTokens.Spacing.SM))
@@ -460,6 +479,27 @@ fun SettingsScreen(
         )
     }
 
+    if (showProfileDeleteDialog) {
+        AlertDialog(
+            onDismissRequest = { showProfileDeleteDialog = false },
+            title = { Text(stringResource(R.string.profile_delete_confirm_title)) },
+            text = { Text(stringResource(R.string.profile_delete_confirm_text)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    showProfileDeleteDialog = false
+                    viewModel.activatePreparedProfile(GuestDataPolicy.DELETE_DATA)
+                }) {
+                    Text(stringResource(R.string.profile_delete_activate), color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showProfileDeleteDialog = false }) {
+                    Text(stringResource(R.string.cancel))
+                }
+            },
+        )
+    }
+
     if (showResetDialog) {
         AlertDialog(
             onDismissRequest = { showResetDialog = false },
@@ -515,6 +555,153 @@ fun SettingsScreen(
                     Text(stringResource(R.string.cancel))
                 }
             },
+        )
+    }
+}
+
+@Composable
+private fun ProfileSettingsSection(
+    state: ProfileWorkflowUiState,
+    vmStopped: Boolean,
+    onPrepare: (String) -> Unit,
+    onActivate: (GuestDataPolicy) -> Unit,
+    onRollback: () -> Unit,
+    onClearError: () -> Unit,
+) {
+    var envelopeUrl by remember { mutableStateOf("") }
+    var selectedPolicy by remember { mutableStateOf<GuestDataPolicy?>(null) }
+    val available = state.availability is DownloadableProfileAvailability.Available
+    val enabled = available && vmStopped && !state.busy
+
+    PodroidSectionLabel(stringResource(R.string.downloadable_profiles))
+    Text(
+        text = when (val availability = state.availability) {
+            DownloadableProfileAvailability.Available -> stringResource(R.string.profile_available)
+            is DownloadableProfileAvailability.Unavailable -> when (availability.reason) {
+                com.excp.podroid.profiles.DownloadableProfileUnavailableReason.NOT_CONFIGURED ->
+                    stringResource(R.string.profile_bundled_only)
+                com.excp.podroid.profiles.DownloadableProfileUnavailableReason.INVALID_CONFIGURATION ->
+                    stringResource(R.string.profile_invalid_configuration)
+            }
+        },
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(horizontal = PodroidTokens.Spacing.MD),
+    )
+    state.activeGeneration?.let { generation ->
+        PodroidListRow(
+            label = stringResource(R.string.profile_active_generation),
+            value = "${state.activeProfileId} / $generation",
+            mono = true,
+        )
+    }
+    OutlinedTextField(
+        value = envelopeUrl,
+        onValueChange = {
+            if (it.length <= 2048) envelopeUrl = it
+            if (state.error != null) onClearError()
+        },
+        enabled = enabled,
+        singleLine = true,
+        label = { Text(stringResource(R.string.profile_envelope_url)) },
+        supportingText = { Text(stringResource(R.string.profile_url_not_saved)) },
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = PodroidTokens.Spacing.MD, vertical = PodroidTokens.Spacing.SM),
+    )
+    PodroidGhostButton(
+        text = if (state.phase == ProfileWorkflowPhase.PREPARING) {
+            stringResource(R.string.profile_preparing)
+        } else {
+            stringResource(R.string.profile_download_prepare)
+        },
+        onClick = { onPrepare(envelopeUrl) },
+        enabled = enabled && envelopeUrl.isNotBlank(),
+        modifier = Modifier.padding(horizontal = PodroidTokens.Spacing.MD),
+    )
+    state.preparedGeneration?.let { generation ->
+        Text(
+            text = stringResource(R.string.profile_prepared_generation, state.preparedProfileId.orEmpty(), generation),
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(horizontal = PodroidTokens.Spacing.MD, vertical = PodroidTokens.Spacing.SM),
+        )
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(horizontal = PodroidTokens.Spacing.MD),
+        ) {
+            GuestDataPolicy.entries.forEach { policy ->
+                FilterChip(
+                    selected = selectedPolicy == policy,
+                    onClick = { selectedPolicy = policy },
+                    enabled = enabled,
+                    label = {
+                        Text(
+                            if (policy == GuestDataPolicy.PRESERVE_DATA) {
+                                stringResource(R.string.profile_preserve_data)
+                            } else {
+                                stringResource(R.string.profile_delete_data)
+                            },
+                        )
+                    },
+                    colors = PodroidChipColors(),
+                )
+            }
+        }
+        Spacer(Modifier.height(PodroidTokens.Spacing.SM))
+        val policy = selectedPolicy
+        val activateText = if (state.phase == ProfileWorkflowPhase.ACTIVATING) {
+            stringResource(R.string.profile_activating)
+        } else {
+            stringResource(R.string.profile_activate)
+        }
+        if (policy == GuestDataPolicy.DELETE_DATA) {
+            PodroidDestructiveButton(
+                text = activateText,
+                onClick = { onActivate(policy) },
+                enabled = enabled,
+                modifier = Modifier.padding(horizontal = PodroidTokens.Spacing.MD),
+            )
+        } else {
+            PodroidGhostButton(
+                text = activateText,
+                onClick = { policy?.let(onActivate) },
+                enabled = enabled && policy != null,
+                modifier = Modifier.padding(horizontal = PodroidTokens.Spacing.MD),
+            )
+        }
+    }
+    if (state.rollbackAvailable) {
+        Spacer(Modifier.height(PodroidTokens.Spacing.SM))
+        PodroidGhostButton(
+            text = if (state.phase == ProfileWorkflowPhase.ROLLING_BACK) {
+                stringResource(R.string.profile_rolling_back)
+            } else {
+                stringResource(R.string.profile_rollback)
+            },
+            onClick = onRollback,
+            enabled = enabled,
+            modifier = Modifier.padding(horizontal = PodroidTokens.Spacing.MD),
+        )
+    }
+    state.error?.let { error ->
+        Text(
+            text = when (error) {
+                ProfileWorkflowError.INVALID_URL -> stringResource(R.string.profile_error_invalid_url)
+                ProfileWorkflowError.UNAVAILABLE -> stringResource(R.string.profile_error_unavailable)
+                ProfileWorkflowError.DOWNLOAD_FAILED -> stringResource(R.string.profile_error_download)
+                ProfileWorkflowError.LIFECYCLE_FAILED -> stringResource(R.string.profile_error_lifecycle)
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+            modifier = Modifier.padding(horizontal = PodroidTokens.Spacing.MD, vertical = PodroidTokens.Spacing.SM),
+        )
+    }
+    if (!vmStopped) {
+        Text(
+            text = stringResource(R.string.stop_vm_to_change),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+            modifier = Modifier.padding(horizontal = PodroidTokens.Spacing.MD, vertical = PodroidTokens.Spacing.SM),
         )
     }
 }

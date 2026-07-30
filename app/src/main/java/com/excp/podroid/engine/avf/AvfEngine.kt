@@ -392,7 +392,10 @@ class AvfEngine @Inject constructor(
         val pathSecurity = VmPathSecurity(vmPaths)
         try {
             pathSecurity.validateForLaunch()
-            config.bootArtifacts?.validateFiles()
+            config.bootArtifacts?.let { artifacts ->
+                artifacts.requireBackend(backendId)
+                artifacts.validateFiles()
+            }
             val mgr = AvfReflect.manager(context)
             val vmConfigObj = buildConfig(mgr, config, pathSecurity)
 
@@ -1069,7 +1072,10 @@ class AvfEngine @Inject constructor(
         // NOT rewrite this launch's topology back up (issue #29).
         if (!useExplicitCpuCount) AvfReflect.disarmExplicitCpuCount()
 
-        config.bootArtifacts?.validateFiles()
+        config.bootArtifacts?.let { artifacts ->
+            artifacts.requireBackend(backendId)
+            artifacts.validateFiles()
+        }
         val bootFiles = avfBootFiles(config, vmPaths)
         val kernelSrc = bootFiles.kernel.also {
             require(it.exists()) { "kernel missing at ${it.absolutePath}" }

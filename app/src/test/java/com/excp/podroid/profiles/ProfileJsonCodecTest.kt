@@ -22,12 +22,24 @@ class ProfileJsonCodecTest {
         assertEquals(ProfileId("alpine-direct"), decoded.id)
         assertEquals(ProfileGeneration(7), decoded.generation)
         assertEquals(DataCompatibilityId("alpine-direct-v1"), decoded.dataCompatibility)
+        assertEquals(ProfileArchitecture.AARCH64, decoded.architecture)
+        assertEquals(ProfileBackend.entries.toSet(), decoded.supportedBackends)
         assertEquals(ArtifactRole.entries.toSet(), decoded.artifacts.map { it.role }.toSet())
         assertEquals("$APPROVED_ORIGIN/kernel", decoded.artifact(ArtifactRole.KERNEL).url.value)
         assertEquals(decoded, ProfilePayloadJsonCodec.decode(ProfilePayloadJsonCodec.encode(decoded), origins))
 
         val mutableArtifacts = decoded.artifacts.toMutableList()
-        val immutableProfile = VmProfile(decoded.id, decoded.generation, decoded.dataCompatibility, mutableArtifacts)
+        val immutableProfile = VmProfile(
+            decoded.id,
+            decoded.generation,
+            decoded.dataCompatibility,
+            decoded.architecture,
+            decoded.bootContract,
+            decoded.storageContract,
+            decoded.healthContract,
+            decoded.supportedBackends,
+            mutableArtifacts,
+        )
         mutableArtifacts.clear()
         assertEquals(ArtifactRole.entries.size, immutableProfile.artifacts.size)
     }
@@ -167,6 +179,22 @@ class ProfileJsonCodecTest {
             runCatching { ProfilePayloadJsonCodec.decode(cases[2].toByteArray(), origins) }
                 .exceptionOrNull() is UnsupportedProfileVersionException,
         )
+    }
+
+    @Test
+    fun `boot and backend contracts are closed signed and nonempty`() {
+        val replacements = listOf(
+            "\"architecture\":\"x86_64\"" to "\"architecture\":\"aarch64\"",
+            "\"boot_contract\":\"unknown\"" to "\"boot_contract\":\"podroid-direct-v1\"",
+            "\"storage_contract\":\"unknown\"" to "\"storage_contract\":\"podroid-overlay-ext4-v1\"",
+            "\"health_contract\":\"unknown\"" to "\"health_contract\":\"podroid-ready-v1\"",
+            "\"supported_backends\":[]" to "\"supported_backends\":[\"qemu\",\"avf\"]",
+            "\"supported_backends\":[\"qemu\",\"qemu\"]" to "\"supported_backends\":[\"qemu\",\"avf\"]",
+            "\"supported_backends\":[\"remote\"]" to "\"supported_backends\":[\"qemu\",\"avf\"]",
+        )
+        replacements.forEach { (invalid, valid) ->
+            assertFails { ProfilePayloadJsonCodec.decode(validPayload().replace(valid, invalid).toByteArray(), origins) }
+        }
     }
 
     @Test
@@ -395,6 +423,11 @@ class ProfileJsonCodecTest {
             "\"profile_id\":\"$profileId\"," +
             "\"generation\":$generation," +
             "\"data_compatibility\":\"alpine-direct-v1\"," +
+            "\"architecture\":\"aarch64\"," +
+            "\"boot_contract\":\"podroid-direct-v1\"," +
+            "\"storage_contract\":\"podroid-overlay-ext4-v1\"," +
+            "\"health_contract\":\"podroid-ready-v1\"," +
+            "\"supported_backends\":[\"qemu\",\"avf\"]," +
             "\"artifacts\":[${actualArtifacts.joinToString(",")}]" +
             "}"
     }

@@ -1,6 +1,5 @@
 package com.excp.podroid.profiles
 
-import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.fail
@@ -11,7 +10,7 @@ import org.junit.rules.TemporaryFolder
 class RuntimeProfileBootArtifactSourceTest {
     @get:Rule val temporaryFolder = TemporaryFolder()
 
-    @Test fun `unavailable runtime selects bundled artifacts without consulting store`() = runBlocking {
+    @Test fun `unavailable runtime selects bundled artifacts only after lineage guard resolution`() {
         var resolutions = 0
         val runtime = object : ActiveProfileRuntime {
             override val availability = DownloadableProfileAvailability.Unavailable(
@@ -19,50 +18,62 @@ class RuntimeProfileBootArtifactSourceTest {
             )
             override fun resolveActiveProfile(): PreparedProfile? {
                 resolutions++
-                error("must not resolve")
+                return null
             }
         }
 
-        assertNull(RuntimeProfileBootArtifactSource(runtime).resolveActiveBootArtifacts())
-        assertEquals(0, resolutions)
+        assertNull(RuntimeProfileBootArtifactSource(runtime).resolveActiveBootArtifacts("qemu"))
+        assertEquals(1, resolutions)
     }
 
-    @Test fun `configured runtime with no activation selects bundled artifacts`() = runBlocking {
-        val runtime = fakeRuntime { null }
-
-        assertNull(RuntimeProfileBootArtifactSource(runtime).resolveActiveBootArtifacts())
+    @Test fun `configured runtime with no activation selects bundled artifacts`() {
+        assertNull(RuntimeProfileBootArtifactSource(fakeRuntime { null }).resolveActiveBootArtifacts("qemu"))
     }
 
-    @Test fun `configured active corruption propagates and blocks bundled fallback`() = runBlocking {
+    @Test fun `configured active corruption propagates and blocks bundled fallback`() {
         val runtime = fakeRuntime { throw ProfileRepositoryCorruptException("corrupt active generation") }
 
         try {
-            RuntimeProfileBootArtifactSource(runtime).resolveActiveBootArtifacts()
+            RuntimeProfileBootArtifactSource(runtime).resolveActiveBootArtifacts("qemu")
             fail("Expected active profile corruption")
         } catch (_: ProfileRepositoryCorruptException) {
             Unit
         }
     }
 
-    @Test fun `configured active generation maps all validated boot artifacts`() = runBlocking {
+    @Test fun `configured active generation maps all validated boot artifacts`() {
+        val prepared = prepared(setOf(ProfileBackend.QEMU))
+
+        val resolved = RuntimeProfileBootArtifactSource(fakeRuntime { prepared })
+            .resolveActiveBootArtifacts("qemu")!!
+
+        assertEquals(7L, resolved.generation.value)
+        assertEquals(prepared.artifactFiles.getValue(ArtifactRole.KERNEL).absoluteFile, resolved.kernel.file)
+        assertEquals(prepared.artifactFiles.getValue(ArtifactRole.INITRD).absoluteFile, resolved.initrd.file)
+        assertEquals(prepared.artifactFiles.getValue(ArtifactRole.ROOTFS).absoluteFile, resolved.rootfs.file)
+    }
+
+    @Test fun `selected backend must be declared by active profile`() {
+        val failure = runCatching {
+            RuntimeProfileBootArtifactSource(fakeRuntime { prepared(setOf(ProfileBackend.QEMU)) })
+                .resolveActiveBootArtifacts("avf")
+        }.exceptionOrNull()
+
+        assertEquals(ProfileActivationException::class.java, failure?.javaClass)
+    }
+
+    private fun prepared(backends: Set<ProfileBackend>): PreparedProfile {
         val files = ArtifactRole.entries.associateWith { role ->
-            temporaryFolder.newFile(role.wireName).apply { writeText(role.wireName) }
+            temporaryFolder.newFile("${backends.first().wireName}-${role.wireName}").apply { writeText(role.wireName) }
         }
         val digest = Sha256Digest("a".repeat(64))
-        val prepared = PreparedProfile(
+        return PreparedProfile(
             candidate = candidate(),
-            dataCompatibility = DataCompatibilityId("stable"),
+            dataCompatibility = ProfileDataLineage.BUNDLED_ALPINE,
+            supportedBackends = backends,
             artifactFiles = files,
             artifactDigests = ArtifactRole.entries.associateWith { digest },
         )
-
-        val resolved = RuntimeProfileBootArtifactSource(fakeRuntime { prepared })
-            .resolveActiveBootArtifacts()!!
-
-        assertEquals(7L, resolved.generation.value)
-        assertEquals(files.getValue(ArtifactRole.KERNEL).absoluteFile, resolved.kernel.file)
-        assertEquals(files.getValue(ArtifactRole.INITRD).absoluteFile, resolved.initrd.file)
-        assertEquals(files.getValue(ArtifactRole.ROOTFS).absoluteFile, resolved.rootfs.file)
     }
 
     private fun fakeRuntime(resolve: () -> PreparedProfile?): ActiveProfileRuntime =

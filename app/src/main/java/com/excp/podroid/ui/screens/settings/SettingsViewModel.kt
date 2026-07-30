@@ -20,6 +20,14 @@ import com.excp.podroid.data.repository.PortForwardRepository
 import com.excp.podroid.data.repository.PortForwardRule
 import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.di.ApplicationScope
+import com.excp.podroid.profiles.DownloadableProfileAvailability
+import com.excp.podroid.profiles.DownloadableProfileUnavailableException
+import com.excp.podroid.profiles.GuestDataPolicy
+import com.excp.podroid.profiles.PreparedProfileCandidate
+import com.excp.podroid.profiles.ProfileActivationDiagnostic
+import com.excp.podroid.profiles.ProfileCodecException
+import com.excp.podroid.profiles.ProfileDownloadException
+import com.excp.podroid.profiles.ProfileSettingsWorkflow
 import com.excp.podroid.vm.EngineSelection
 import com.excp.podroid.vm.SensitiveConsolePolicy
 import com.excp.podroid.service.VmBackendProbe
@@ -55,6 +63,23 @@ import javax.inject.Inject
  * different update cadences or consumers (vmState, portForwardRules, updateInfo,
  * terminal-only theme/font/size) — those stay separate.
  */
+enum class ProfileWorkflowPhase { IDLE, PREPARING, ACTIVATING, ROLLING_BACK }
+enum class ProfileWorkflowError { INVALID_URL, UNAVAILABLE, DOWNLOAD_FAILED, LIFECYCLE_FAILED }
+
+data class ProfileWorkflowUiState(
+    val availability: DownloadableProfileAvailability,
+    val phase: ProfileWorkflowPhase = ProfileWorkflowPhase.IDLE,
+    val preparedProfileId: String? = null,
+    val preparedGeneration: Long? = null,
+    val activeProfileId: String? = null,
+    val activeGeneration: Long? = null,
+    val activationSequence: Long? = null,
+    val rollbackAvailable: Boolean = false,
+    val error: ProfileWorkflowError? = null,
+) {
+    val busy: Boolean get() = phase != ProfileWorkflowPhase.IDLE
+}
+
 data class SettingsUiState(
     val vmRamMb: Int = 512,
     val vmCpus: Int = 1,
@@ -79,8 +104,123 @@ class SettingsViewModel @Inject constructor(
     private val portForwardRepository: PortForwardRepository,
     private val vmServiceClient: VmServiceClient,
     private val languageManager: LanguageManager,
+    private val profileWorkflow: ProfileSettingsWorkflow,
     @ApplicationScope private val externalScope: CoroutineScope,
 ) : ViewModel() {
+    private var preparedProfile: PreparedProfileCandidate? = null
+    private val _profileState = MutableStateFlow(
+        ProfileWorkflowUiState(availability = profileWorkflow.availability),
+    )
+    val profileState: StateFlow<ProfileWorkflowUiState> = _profileState.asStateFlow()
+
+    init {
+        refreshProfileDiagnostics()
+    }
+
+    fun refreshProfileDiagnostics() {
+        if (_profileState.value.busy) return
+        viewModelScope.launch {
+            runCatching { profileWorkflow.diagnostics() }
+                .onSuccess(::applyProfileDiagnostic)
+                .onFailure { _profileState.value = _profileState.value.copy(error = profileError(it)) }
+        }
+    }
+
+    fun prepareProfile(envelopeUrl: String) {
+        if (_profileState.value.busy) return
+        _profileState.value = _profileState.value.copy(
+            phase = ProfileWorkflowPhase.PREPARING,
+            error = null,
+        )
+        viewModelScope.launch {
+            runCatching { profileWorkflow.prepare(envelopeUrl) }
+                .onSuccess { prepared ->
+                    preparedProfile = prepared.candidate
+                    _profileState.value = _profileState.value.copy(
+                        phase = ProfileWorkflowPhase.IDLE,
+                        preparedProfileId = prepared.candidate.profileId.value,
+                        preparedGeneration = prepared.candidate.generation.value,
+                    )
+                }
+                .onFailure { failure ->
+                    _profileState.value = _profileState.value.copy(
+                        phase = ProfileWorkflowPhase.IDLE,
+                        error = profileError(failure),
+                    )
+                }
+        }
+    }
+
+    fun activatePreparedProfile(dataPolicy: GuestDataPolicy) {
+        val candidate = preparedProfile ?: return
+        if (_profileState.value.busy) return
+        _profileState.value = _profileState.value.copy(
+            phase = ProfileWorkflowPhase.ACTIVATING,
+            error = null,
+        )
+        viewModelScope.launch {
+            runCatching { profileWorkflow.activate(candidate, dataPolicy) }
+                .onSuccess {
+                    preparedProfile = null
+                    _profileState.value = _profileState.value.copy(
+                        phase = ProfileWorkflowPhase.IDLE,
+                        preparedProfileId = null,
+                        preparedGeneration = null,
+                    )
+                    refreshProfileDiagnostics()
+                }
+                .onFailure { failure ->
+                    _profileState.value = _profileState.value.copy(
+                        phase = ProfileWorkflowPhase.IDLE,
+                        error = profileError(failure),
+                    )
+                }
+        }
+    }
+
+    fun rollbackProfile() {
+        val sequence = _profileState.value.activationSequence ?: return
+        if (_profileState.value.busy || !_profileState.value.rollbackAvailable) return
+        _profileState.value = _profileState.value.copy(
+            phase = ProfileWorkflowPhase.ROLLING_BACK,
+            error = null,
+        )
+        viewModelScope.launch {
+            runCatching { profileWorkflow.rollbackCurrent(sequence) }
+                .onSuccess {
+                    _profileState.value = _profileState.value.copy(phase = ProfileWorkflowPhase.IDLE)
+                    refreshProfileDiagnostics()
+                }
+                .onFailure { failure ->
+                    _profileState.value = _profileState.value.copy(
+                        phase = ProfileWorkflowPhase.IDLE,
+                        error = profileError(failure),
+                    )
+                }
+        }
+    }
+
+    fun clearProfileError() {
+        _profileState.value = _profileState.value.copy(error = null)
+    }
+
+    private fun applyProfileDiagnostic(diagnostic: ProfileActivationDiagnostic) {
+        _profileState.value = _profileState.value.copy(
+            availability = diagnostic.availability,
+            activeProfileId = diagnostic.activation?.active?.profileId?.value,
+            activeGeneration = diagnostic.activation?.active?.generation?.value,
+            activationSequence = diagnostic.activation?.activationSequence,
+            rollbackAvailable = diagnostic.activation?.rollback != null,
+            error = null,
+        )
+    }
+
+    private fun profileError(failure: Throwable): ProfileWorkflowError = when (failure) {
+        is DownloadableProfileUnavailableException -> ProfileWorkflowError.UNAVAILABLE
+        is ProfileDownloadException, is ProfileCodecException -> ProfileWorkflowError.DOWNLOAD_FAILED
+        is IllegalArgumentException -> ProfileWorkflowError.INVALID_URL
+        else -> ProfileWorkflowError.LIFECYCLE_FAILED
+    }
 
     val vmRamMb: StateFlow<Int> = settingsRepository.vmRamMb
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 512)

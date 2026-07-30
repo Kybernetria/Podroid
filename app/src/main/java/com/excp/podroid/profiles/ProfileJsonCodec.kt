@@ -48,6 +48,14 @@ object ProfilePayloadJsonCodec {
         val profileId = root.requiredString("profile_id", "profile payload")
         val generation = root.requiredLong("generation", "profile payload")
         val dataCompatibility = root.requiredString("data_compatibility", "profile payload")
+        val architecture = root.requiredString("architecture", "profile payload")
+        val bootContract = root.requiredString("boot_contract", "profile payload")
+        val storageContract = root.requiredString("storage_contract", "profile payload")
+        val healthContract = root.requiredString("health_contract", "profile payload")
+        val supportedBackendNames = root.requiredStringArray("supported_backends", "profile payload")
+        if (supportedBackendNames.isEmpty() || supportedBackendNames.distinct().size != supportedBackendNames.size) {
+            throw ProfileCodecException("supported_backends must be a nonempty set")
+        }
         val artifactsValue = root["artifacts"] as? JsonValue.ArrayValue
             ?: throw ProfileCodecException("artifacts must be an array")
         if (artifactsValue.value.size != ArtifactRole.entries.size) {
@@ -70,10 +78,22 @@ object ProfilePayloadJsonCodec {
                 )
             }
             VmProfile(
-                ProfileId(profileId),
-                ProfileGeneration(generation),
-                DataCompatibilityId(dataCompatibility),
-                artifacts,
+                id = ProfileId(profileId),
+                generation = ProfileGeneration(generation),
+                dataCompatibility = DataCompatibilityId(dataCompatibility),
+                architecture = ProfileArchitecture.fromWireName(architecture)
+                    ?: throw ProfileCodecException("architecture is unsupported"),
+                bootContract = ProfileBootContract.fromWireName(bootContract)
+                    ?: throw ProfileCodecException("boot_contract is unsupported"),
+                storageContract = ProfileStorageContract.fromWireName(storageContract)
+                    ?: throw ProfileCodecException("storage_contract is unsupported"),
+                healthContract = ProfileHealthContract.fromWireName(healthContract)
+                    ?: throw ProfileCodecException("health_contract is unsupported"),
+                supportedBackends = supportedBackendNames.map { backend ->
+                    ProfileBackend.fromWireName(backend)
+                        ?: throw ProfileCodecException("supported_backends contains an unknown backend")
+                }.toSet(),
+                artifacts = artifacts,
             )
         }
     }
@@ -92,13 +112,21 @@ object ProfilePayloadJsonCodec {
             "\"profile_id\":${jsonString(profile.id.value)}," +
             "\"generation\":${profile.generation.value}," +
             "\"data_compatibility\":${jsonString(profile.dataCompatibility.value)}," +
+            "\"architecture\":${jsonString(profile.architecture.wireName)}," +
+            "\"boot_contract\":${jsonString(profile.bootContract.wireName)}," +
+            "\"storage_contract\":${jsonString(profile.storageContract.wireName)}," +
+            "\"health_contract\":${jsonString(profile.healthContract.wireName)}," +
+            "\"supported_backends\":[${profile.supportedBackends.sortedBy { it.ordinal }.joinToString(",") { jsonString(it.wireName) }}]," +
             "\"artifacts\":[$artifacts]" +
             "}").toByteArray(Charsets.UTF_8)
         require(encoded.size <= ProfileLimits.MAX_PAYLOAD_BYTES) { "encoded profile payload exceeds the byte bound" }
         return encoded
     }
 
-    private val PAYLOAD_FIELDS = setOf("version", "profile_id", "generation", "data_compatibility", "artifacts")
+    private val PAYLOAD_FIELDS = setOf(
+        "version", "profile_id", "generation", "data_compatibility", "architecture",
+        "boot_contract", "storage_contract", "health_contract", "supported_backends", "artifacts",
+    )
     private val ARTIFACT_FIELDS = setOf("role", "url", "sha256", "size_bytes")
 }
 
@@ -373,6 +401,15 @@ private fun Map<String, JsonValue>.requiredString(name: String, label: String): 
 private fun Map<String, JsonValue>.requiredLong(name: String, label: String): Long =
     (this[name] as? JsonValue.NumberValue)?.value
         ?: throw ProfileCodecException("$label field '$name' must be an integer")
+
+private fun Map<String, JsonValue>.requiredStringArray(name: String, label: String): List<String> {
+    val values = (this[name] as? JsonValue.ArrayValue)?.value
+        ?: throw ProfileCodecException("$label field '$name' must be an array")
+    return values.mapIndexed { index, value ->
+        (value as? JsonValue.StringValue)?.value
+            ?: throw ProfileCodecException("$label field '$name'[$index] must be a string")
+    }
+}
 
 private fun decodeCanonicalBase64(value: String, maxEncodedChars: Int, label: String): ByteArray {
     require(value.length in 1..maxEncodedChars) { "$label base64 is outside the encoded length bound" }

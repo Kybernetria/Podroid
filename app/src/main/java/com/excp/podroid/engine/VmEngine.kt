@@ -127,4 +127,10 @@ data class VmConfig(
     val x11Dpi: Int = 96,
     val usbPassthroughEnabled: Boolean = false,
     val bandwidthMbps: Int = 0,
-)
+) {
+    init {
+        require(bootArtifacts == null || qemuExtraArgs.isBlank()) {
+            "QEMU extra arguments must be blank while a downloaded profile is active"
+        }
+    }
+}

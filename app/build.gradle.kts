@@ -146,6 +146,53 @@ val verifyHostManagementBoundary by tasks.registering(Exec::class) {
     )
 }
 
+val verifyProfileLifecycleBoundary by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Rejects production bypasses of manager-owned profile lifecycle authority."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", rootProject.file("tests/verify_profile_lifecycle_boundary.py"))
+    inputs.files(
+        rootProject.file("tests/verify_profile_lifecycle_boundary.py"),
+        rootProject.fileTree("app/src/main/java/com/excp/podroid") { include("**/*.kt") },
+    )
+}
+
+val testProfileIntegrationVerifiers by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Runs profile boundary and release trust verifier regression tests."
+    workingDir(rootProject.projectDir)
+    commandLine(
+        "python3", "-m", "unittest", "-v",
+        "tests/test_verify_profile_lifecycle_boundary.py",
+        "tests/test_verify_profile_release_configuration.py",
+    )
+    inputs.files(
+        rootProject.file("tests/verify_profile_lifecycle_boundary.py"),
+        rootProject.file("tests/test_verify_profile_lifecycle_boundary.py"),
+        rootProject.file("tests/verify_profile_release_configuration.py"),
+        rootProject.file("tests/test_verify_profile_release_configuration.py"),
+    )
+}
+
+val verifyReleaseProfileConfiguration by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Fails release builds without a complete valid downloadable-profile trust snapshot."
+    workingDir(rootProject.projectDir)
+    commandLine(
+        "python3", rootProject.file("tests/verify_profile_release_configuration.py"),
+        "--key-id", profileSigningKeyId,
+        "--public-key-base64", profileEd25519X509PublicKeyBase64,
+        "--trust-epoch", profileTrustEpoch,
+        "--origins", profileCanonicalOrigins,
+    )
+    inputs.file(rootProject.file("tests/verify_profile_release_configuration.py"))
+    inputs.property("profileSigningKeyId", profileSigningKeyId)
+    inputs.property("profileEd25519PublicKey", profileEd25519X509PublicKeyBase64)
+    inputs.property("profileTrustEpoch", profileTrustEpoch)
+    inputs.property("profileCanonicalOrigins", profileCanonicalOrigins)
+    outputs.upToDateWhen { false }
+}
+
 val verifyPackagedDebugLibTailscale by tasks.registering(Exec::class) {
     group = "verification"
     description = "Statically verifies debug APK libtailscale ABI, ELF, provenance, and manifest policy."
@@ -379,12 +426,13 @@ tasks.named("preBuild") {
         verifyVmInstancePaths,
         verifyUiVmBoundary,
         verifyHostTransportBoundary,
-        verifyHostManagementBoundary
+        verifyHostManagementBoundary,
+        verifyProfileLifecycleBoundary
     )
 }
 
 tasks.matching { it.name == "preReleaseBuild" }.configureEach {
-    dependsOn(requireGuestRootfsForRelease)
+    dependsOn(requireGuestRootfsForRelease, verifyReleaseProfileConfiguration)
 }
 
 tasks.matching { it.name == "assembleDebug" }.configureEach {
@@ -413,7 +461,9 @@ tasks.named("check") {
         testUiVmBoundaryVerifier,
         testLibTailscaleAndroidVerifier,
         verifyHostTransportBoundary,
-        verifyHostManagementBoundary
+        verifyHostManagementBoundary,
+        verifyProfileLifecycleBoundary,
+        testProfileIntegrationVerifiers
     )
 }
 
@@ -427,7 +477,9 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
         testUiVmBoundaryVerifier,
         testLibTailscaleAndroidVerifier,
         verifyHostTransportBoundary,
-        verifyHostManagementBoundary
+        verifyHostManagementBoundary,
+        verifyProfileLifecycleBoundary,
+        testProfileIntegrationVerifiers
     )
 }
 

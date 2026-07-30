@@ -47,13 +47,28 @@ data class VmBootArtifact(
  * Distro-neutral, all-or-nothing boot artifact generation. Null at the [VmConfig] boundary means
  * the bundled legacy paths remain authoritative.
  */
-data class VmBootArtifacts(
+class VmBootArtifacts(
     val generation: VmBootGeneration,
     val manifestSha256: VmBootDigest,
     val kernel: VmBootArtifact,
     val initrd: VmBootArtifact,
     val rootfs: VmBootArtifact,
+    supportedBackendIds: Set<String> = setOf("qemu", "avf"),
 ) {
+    val supportedBackendIds: Set<String> = supportedBackendIds.toSet()
+
+    init {
+        require(supportedBackendIds.isNotEmpty() && supportedBackendIds.all { it == "qemu" || it == "avf" }) {
+            "VM boot artifact backend contract is invalid"
+        }
+    }
+
+    fun requireBackend(backendId: String) {
+        if (backendId !in supportedBackendIds) {
+            throw IOException("active profile does not support selected backend '$backendId'")
+        }
+    }
+
     /** Revalidates every hostile file immediately before a backend consumes this generation. */
     @Throws(IOException::class)
     fun validateFiles() {

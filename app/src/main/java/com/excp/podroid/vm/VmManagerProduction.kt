@@ -46,6 +46,7 @@ internal class RepositoryVmConfigurationSource(
     private val settings: SettingsRepository,
     private val portForwards: PortForwardRepository,
     private val profileBootArtifacts: ProfileBootArtifactSource,
+    private val selectedBackendId: () -> String,
 ) : VmConfigurationSource {
     override suspend fun launchPlan(vmId: VmId): VmLaunchPlan {
         require(vmId == VmId.DEFAULT) { "Only the default VM is supported" }
@@ -55,7 +56,9 @@ internal class RepositoryVmConfigurationSource(
         // DefaultVmManager invokes launchPlan while it owns the application asset-tree lease.
         // Any configured active profile is repository/trust/digest validated here; only a truly
         // absent activation returns null and selects the bundled legacy paths.
-        val bootArtifacts = profileBootArtifacts.resolveActiveBootArtifacts()
+        val bootArtifacts = profileBootArtifacts.resolveActiveBootArtifacts(selectedBackendId())
+        val qemuExtraArgs = settings.getQemuExtraArgsSnapshot()
+        requireSignedProfileQemuArgsAreClosed(bootArtifacts != null, qemuExtraArgs)
 
         return VmLaunchPlan(
             portForwards = rules,
@@ -68,7 +71,7 @@ internal class RepositoryVmConfigurationSource(
                 androidIp = NetworkUtils.localIpv4(context),
                 storageSizeGb = settings.getStorageSizeGbSnapshot(),
                 storageAccessEnabled = settings.getStorageAccessEnabledSnapshot(),
-                qemuExtraArgs = settings.getQemuExtraArgsSnapshot(),
+                qemuExtraArgs = qemuExtraArgs,
                 kernelExtraCmdline = settings.getKernelExtraCmdlineSnapshot(),
                 verboseLogging = settings.getAvfVerboseLoggingSnapshot(),
                 x11Dpi = settings.getX11DpiSnapshot(),
@@ -84,6 +87,17 @@ internal class RepositoryVmConfigurationSource(
     }
 
     companion object {
+        internal fun requireSignedProfileQemuArgsAreClosed(
+            downloadedProfileActive: Boolean,
+            qemuExtraArgs: String,
+        ) {
+            if (downloadedProfileActive && qemuExtraArgs.isNotBlank()) {
+                throw IllegalStateException(
+                    "QEMU extra arguments must be blank while a downloaded profile is active",
+                )
+            }
+        }
+
         internal fun assembleRules(
             persistedRules: List<PortForwardRule>,
             sshEnabled: Boolean,

@@ -184,6 +184,26 @@ class ProfileRepositoryTest {
     }
 
     @Test
+    fun `first preserve with bundled storage requires bundled Alpine lineage`() {
+        val root = temporaryFolder.newFolder("first-preserve-lineage")
+        val storage = storageFor(root).also { it.writeText("bundled-overlay-data") }
+        val artifacts = artifactBytes("foreign-lineage")
+        val repository = repository(root, RecordingFetcher(artifacts), storage = storage)
+        val candidate = repository.prepare(
+            envelope(1, compatibility = "foreign-overlay-v1", artifacts = artifacts),
+        ).candidate
+
+        assertFailure<ProfileActivationException> {
+            repository.activate(candidate, GuestDataPolicy.PRESERVE_DATA)
+        }
+        assertEquals("bundled-overlay-data", storage.readText())
+
+        val confirmation = repository.issueDataDeletionConfirmation(candidate)
+        repository.activate(candidate, GuestDataPolicy.DELETE_DATA, confirmation)
+        assertFalse(storage.exists())
+    }
+
+    @Test
     fun `incompatible preserve is rejected while repository-issued delete token is exact`() {
         val root = temporaryFolder.newFolder("delete")
         val storage = storageFor(root).also { it.writeText("must survive rejection") }
@@ -557,7 +577,7 @@ class ProfileRepositoryTest {
 
         assertNull(restarted.activationState())
         assertFalse(File(root, "state/activation.pending").exists())
-        assertNull(restarted.resolveActiveProfile())
+        assertFailure<ProfileActivationException> { restarted.resolveActiveProfile() }
         assertEquals(candidate, restarted.lastTrustQuarantine()!!.candidates.single().candidate)
     }
 
@@ -642,7 +662,7 @@ class ProfileRepositoryTest {
 
         trustPolicy = policy(TrustEpoch(1))
         val revoked = repository(root, RecordingFetcher(artifacts), storage = storage)
-        assertNull(revoked.resolveActiveProfile())
+        assertFailure<ProfileActivationException> { revoked.resolveActiveProfile() }
         assertFailure<ProfileActivationException> { revoked.resolveCandidate(candidate) }
 
         trustPolicy = policy(TrustEpoch(1), KEY_ID to firstKey)
@@ -661,7 +681,7 @@ class ProfileRepositoryTest {
         firstRepository.activate(prepared.candidate, GuestDataPolicy.PRESERVE_DATA)
 
         val restartedRepository = repository(root, RecordingFetcher(bytes), storage = storage)
-        val resolved = RepositoryProfileBootArtifactSource(restartedRepository).resolveActiveBootArtifacts()!!
+        val resolved = RepositoryProfileBootArtifactSource(restartedRepository).resolveActiveBootArtifacts("qemu")!!
 
         assertEquals(23L, resolved.generation.value)
         assertEquals(prepared.candidate.manifestSha256.value, resolved.manifestSha256.value)
@@ -678,8 +698,31 @@ class ProfileRepositoryTest {
 
         resolved.kernel.file.writeText("invalid-configured-active-profile")
         assertFailure<ProfileRepositoryCorruptException> {
-            RepositoryProfileBootArtifactSource(restartedRepository).resolveActiveBootArtifacts()
+            RepositoryProfileBootArtifactSource(restartedRepository).resolveActiveBootArtifacts("qemu")
         }
+    }
+
+    @Test
+    fun `selected backend contract survives repository restart and blocks unsupported launch`() {
+        val root = temporaryFolder.newFolder("backend-contract-restart")
+        val storage = storageFor(root)
+        val bytes = artifactBytes("qemu-only")
+        val first = repository(root, RecordingFetcher(bytes), storage = storage)
+        val candidate = first.prepare(
+            envelope(1, supportedBackends = setOf(ProfileBackend.QEMU), artifacts = bytes),
+        ).candidate
+        first.activate(candidate, GuestDataPolicy.PRESERVE_DATA)
+
+        val restarted = repository(root, RecordingFetcher(bytes), storage = storage)
+        assertFailure<ProfileActivationException> {
+            RepositoryProfileBootArtifactSource(restarted).resolveActiveBootArtifacts("avf")
+        }
+        assertEquals(
+            candidate,
+            restarted.resolveActiveProfile()!!.also {
+                assertEquals(setOf(ProfileBackend.QEMU), it.supportedBackends)
+            }.candidate,
+        )
     }
 
     @Test
@@ -746,7 +789,7 @@ class ProfileRepositoryTest {
         val restarted = repository(root, fetcher, storage = storage, limits = limits)
         restarted.recover()
 
-        assertNull(restarted.resolveActiveProfile())
+        assertFailure<ProfileActivationException> { restarted.resolveActiveProfile() }
         assertEquals("persistent-user-data", storage.readText())
         val quarantine = restarted.lastTrustQuarantine()!!
         assertEquals(setOf(first.candidate, second.candidate), quarantine.candidates.map { it.candidate }.toSet())
@@ -760,7 +803,7 @@ class ProfileRepositoryTest {
         )
 
         assertEquals(SECOND_KEY_ID, replacement.candidate.signingKeyId)
-        assertNull(restarted.resolveActiveProfile())
+        assertFailure<ProfileActivationException> { restarted.resolveActiveProfile() }
         assertEquals(ArtifactRole.entries.size, File(root, "blobs").listFiles()!!.size)
         replacement.artifactFiles.values.forEach { assertTrue(it.exists()) }
         assertEquals("persistent-user-data", storage.readText())
@@ -955,6 +998,7 @@ class ProfileRepositoryTest {
         generation: Long,
         profileId: String = PROFILE_ID,
         compatibility: String = COMPATIBILITY,
+        supportedBackends: Set<ProfileBackend> = ProfileBackend.entries.toSet(),
         keyId: SigningKeyId = KEY_ID,
         keyPair: KeyPair = firstKey,
         artifacts: Map<ArtifactRole, ByteArray>,
@@ -969,7 +1013,17 @@ class ProfileRepositoryTest {
             )
         }
         val payload = ProfilePayloadJsonCodec.encode(
-            VmProfile(ProfileId(profileId), ProfileGeneration(generation), DataCompatibilityId(compatibility), profileArtifacts),
+            VmProfile(
+                id = ProfileId(profileId),
+                generation = ProfileGeneration(generation),
+                dataCompatibility = DataCompatibilityId(compatibility),
+                architecture = ProfileArchitecture.AARCH64,
+                bootContract = ProfileBootContract.PODROID_DIRECT_V1,
+                storageContract = ProfileStorageContract.PODROID_OVERLAY_EXT4_V1,
+                healthContract = ProfileHealthContract.PODROID_READY_V1,
+                supportedBackends = supportedBackends,
+                artifacts = profileArtifacts,
+            ),
         )
         val signature = Signature.getInstance("Ed25519").run {
             initSign(keyPair.private)
@@ -1042,7 +1096,7 @@ class ProfileRepositoryTest {
     private companion object {
         const val APPROVED_ORIGIN = "https://profiles.example:443"
         const val PROFILE_ID = "alpine-direct"
-        const val COMPATIBILITY = "alpine-direct-v1"
+        const val COMPATIBILITY = "podroid-alpine-overlay-v1"
         val KEY_ID = SigningKeyId("release-1")
         val SECOND_KEY_ID = SigningKeyId("release-2")
     }

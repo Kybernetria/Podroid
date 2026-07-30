@@ -18,7 +18,9 @@ import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.di.ApplicationScope
 import com.excp.podroid.profiles.DownloadableProfileRuntime
 import com.excp.podroid.profiles.ProfileBootArtifactSource
+import com.excp.podroid.profiles.ManagerProfileLifecycleStore
 import com.excp.podroid.profiles.ProfileLifecycleOperations
+import com.excp.podroid.profiles.ProfilePreparationOperations
 import com.excp.podroid.profiles.RuntimeProfileBootArtifactSource
 import com.excp.podroid.vm.ApplicationVmInstaller
 import com.excp.podroid.vm.DefaultVmManager
@@ -46,18 +48,23 @@ object EngineModule {
     ): ProfileBootArtifactSource = RuntimeProfileBootArtifactSource(runtime)
 
     @Provides
+    fun provideProfilePreparationOperations(
+        runtime: DownloadableProfileRuntime,
+    ): ProfilePreparationOperations = runtime
+
+    @Provides
     @Singleton
     fun provideVmEngine(holder: EngineHolder): VmEngine = holder
 
     @Provides
     @Singleton
-    fun provideDefaultVmManager(
+    internal fun provideDefaultVmManager(
         engine: VmEngine,
         @ApplicationContext context: Context,
         settings: SettingsRepository,
         portForwards: PortForwardRepository,
         profileBootArtifacts: ProfileBootArtifactSource,
-        downloadableProfiles: DownloadableProfileRuntime,
+        profileLifecycleStore: ManagerProfileLifecycleStore,
         hostSupervisor: HostSupervisorRepository,
         paths: VmPaths,
         runtimePreflight: ProductionRuntimePreflight,
@@ -65,12 +72,18 @@ object EngineModule {
     ): DefaultVmManager = DefaultVmManager(
         runtime = EngineManagedVmRuntime(engine),
         installer = ApplicationVmInstaller(context),
-        configuration = RepositoryVmConfigurationSource(context, settings, portForwards, profileBootArtifacts),
+        configuration = RepositoryVmConfigurationSource(
+            context,
+            settings,
+            portForwards,
+            profileBootArtifacts,
+            selectedBackendId = { engine.backendId },
+        ),
         files = VmPathFiles(paths),
         supervisor = hostSupervisor,
         scope = scope,
         runtimePreflight = runtimePreflight.coordinator,
-        profileLifecycleStore = downloadableProfiles,
+        profileLifecycleStore = profileLifecycleStore,
     )
 
     @Provides

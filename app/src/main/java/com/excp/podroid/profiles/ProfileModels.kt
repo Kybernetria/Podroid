@@ -109,6 +109,51 @@ enum class ArtifactRole(val wireName: String) {
     }
 }
 
+enum class ProfileArchitecture(val wireName: String) {
+    AARCH64("aarch64");
+
+    companion object {
+        fun fromWireName(value: String): ProfileArchitecture? = entries.singleOrNull { it.wireName == value }
+    }
+}
+
+enum class ProfileBootContract(val wireName: String) {
+    PODROID_DIRECT_V1("podroid-direct-v1");
+
+    companion object {
+        fun fromWireName(value: String): ProfileBootContract? = entries.singleOrNull { it.wireName == value }
+    }
+}
+
+enum class ProfileStorageContract(val wireName: String) {
+    PODROID_OVERLAY_EXT4_V1("podroid-overlay-ext4-v1");
+
+    companion object {
+        fun fromWireName(value: String): ProfileStorageContract? = entries.singleOrNull { it.wireName == value }
+    }
+}
+
+enum class ProfileHealthContract(val wireName: String) {
+    PODROID_READY_V1("podroid-ready-v1");
+
+    companion object {
+        fun fromWireName(value: String): ProfileHealthContract? = entries.singleOrNull { it.wireName == value }
+    }
+}
+
+enum class ProfileBackend(val wireName: String) {
+    QEMU("qemu"),
+    AVF("avf");
+
+    companion object {
+        fun fromWireName(value: String): ProfileBackend? = entries.singleOrNull { it.wireName == value }
+    }
+}
+
+object ProfileDataLineage {
+    val BUNDLED_ALPINE = DataCompatibilityId("podroid-alpine-overlay-v1")
+}
+
 /** A URL admitted against an explicit trusted-origin policy. */
 data class ArtifactDownloadUrl private constructor(val value: String) {
     internal companion object {
@@ -204,11 +249,18 @@ class VmProfile(
     val id: ProfileId,
     val generation: ProfileGeneration,
     val dataCompatibility: DataCompatibilityId,
+    val architecture: ProfileArchitecture,
+    val bootContract: ProfileBootContract,
+    val storageContract: ProfileStorageContract,
+    val healthContract: ProfileHealthContract,
+    supportedBackends: Set<ProfileBackend>,
     artifacts: List<ProfileArtifact>,
 ) {
+    val supportedBackends: Set<ProfileBackend> = Collections.unmodifiableSet(supportedBackends.toSet())
     val artifacts: List<ProfileArtifact> = Collections.unmodifiableList(artifacts.toList())
 
     init {
+        require(this.supportedBackends.isNotEmpty()) { "profile must support at least one known backend" }
         require(this.artifacts.size == ArtifactRole.entries.size) {
             "profile must contain exactly ${ArtifactRole.entries.size} artifacts"
         }
@@ -228,11 +280,18 @@ class VmProfile(
 
     override fun equals(other: Any?): Boolean =
         other is VmProfile && id == other.id && generation == other.generation &&
-            dataCompatibility == other.dataCompatibility && artifacts == other.artifacts
+            dataCompatibility == other.dataCompatibility && architecture == other.architecture &&
+            bootContract == other.bootContract && storageContract == other.storageContract &&
+            healthContract == other.healthContract && supportedBackends == other.supportedBackends &&
+            artifacts == other.artifacts
 
-    override fun hashCode(): Int =
-        31 * (31 * (31 * id.hashCode() + generation.hashCode()) + dataCompatibility.hashCode()) + artifacts.hashCode()
+    override fun hashCode(): Int = listOf(
+        id, generation, dataCompatibility, architecture, bootContract, storageContract,
+        healthContract, supportedBackends, artifacts,
+    ).fold(1) { result, value -> 31 * result + value.hashCode() }
 
     override fun toString(): String =
-        "VmProfile(id=$id, generation=$generation, dataCompatibility=$dataCompatibility, artifacts=$artifacts)"
+        "VmProfile(id=$id, generation=$generation, dataCompatibility=$dataCompatibility, " +
+            "architecture=$architecture, bootContract=$bootContract, storageContract=$storageContract, " +
+            "healthContract=$healthContract, supportedBackends=$supportedBackends, artifacts=$artifacts)"
 }

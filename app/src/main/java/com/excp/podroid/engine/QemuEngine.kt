@@ -54,6 +54,16 @@ import javax.inject.Singleton
 
 internal fun qemuBootFiles(config: VmConfig, paths: VmPaths): VmBootFiles = config.bootFiles(paths)
 
+internal fun appendValidatedQemuExtraArgs(command: MutableList<String>, config: VmConfig) {
+    com.excp.podroid.vm.RepositoryVmConfigurationSource.requireSignedProfileQemuArgsAreClosed(
+        config.bootArtifacts != null,
+        config.qemuExtraArgs,
+    )
+    config.qemuExtraArgs.trim().takeIf(String::isNotEmpty)?.let { extras ->
+        command += extras.split(Regex("\\s+"))
+    }
+}
+
 @SuppressLint("StaticFieldLeak") // ApplicationContext — lives as long as the process, no leak
 @Singleton
 class QemuEngine @Inject constructor(
@@ -352,7 +362,10 @@ class QemuEngine @Inject constructor(
         val pathSecurity = VmPathSecurity(vmPaths)
         try {
             pathSecurity.validateForLaunch()
-            config.bootArtifacts?.validateFiles()
+            config.bootArtifacts?.let { artifacts ->
+                artifacts.requireBackend(backendId)
+                artifacts.validateFiles()
+            }
             ensureStorageImage(config.storageSizeGb)
         } catch (e: java.io.IOException) {
             // Restore the "cleanedUp=false ⟺ VM lifetime in progress" invariant
@@ -414,7 +427,10 @@ class QemuEngine @Inject constructor(
             // Recheck after disk preparation/socket cleanup and directly before
             // the irreversible process launch.
             pathSecurity.validateForLaunch()
-            config.bootArtifacts?.validateFiles()
+            config.bootArtifacts?.let { artifacts ->
+                artifacts.requireBackend(backendId)
+                artifacts.validateFiles()
+            }
             val owner = QemuProcessOwner<Process, Int>(
                 commit = { child ->
                     val pid = HostMetrics.processPid(child)?.toLong()
@@ -708,7 +724,6 @@ class QemuEngine @Inject constructor(
         config: VmConfig,
     ): List<String> {
         val args = mutableListOf<String>()
-        val userQemuExtras = config.qemuExtraArgs.trim()
         val userKernelExtras = config.kernelExtraCmdline.trim()
 
         args += "-M"; args += "virt,gic-version=3"
@@ -839,9 +854,7 @@ class QemuEngine @Inject constructor(
         args += "-qmp";     args += "unix:$qmpSocketPath,server,nowait"
 
         // User extras appended last so later -cpu / -accel overrides earlier ones.
-        if (userQemuExtras.isNotEmpty()) {
-            args += userQemuExtras.split(Regex("\\s+"))
-        }
+        appendValidatedQemuExtraArgs(args, config)
 
         // Wrap QEMU in podroid-launcher when available — it sets PR_SET_PDEATHSIG
         // so QEMU dies with the app on uninstall/OOM/force-stop instead of leaking

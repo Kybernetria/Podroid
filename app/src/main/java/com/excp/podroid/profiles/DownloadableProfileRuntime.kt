@@ -7,6 +7,12 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
+import java.nio.file.StandardOpenOption
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.Dispatchers
@@ -14,6 +20,11 @@ import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 
 interface ProfileLifecycleOperations {
+    /** Fresh, manager-fenced authority required immediately before a destructive activation. */
+    suspend fun issueDataDeletionConfirmation(
+        candidate: PreparedProfileCandidate,
+    ): DataDeletionConfirmation
+
     suspend fun activateProfile(
         candidate: PreparedProfileCandidate,
         dataPolicy: GuestDataPolicy,
@@ -27,6 +38,8 @@ interface ProfileLifecycleOperations {
 }
 
 internal interface ProfileLifecycleStore {
+    suspend fun issueDataDeletionConfirmation(candidate: PreparedProfileCandidate): DataDeletionConfirmation
+
     suspend fun install(
         candidate: PreparedProfileCandidate,
         dataPolicy: GuestDataPolicy,
@@ -52,12 +65,12 @@ class DownloadableProfileUnavailableException(
     val reason: DownloadableProfileUnavailableReason,
 ) : IOException("downloadable profiles are unavailable: ${reason.name}")
 
-/** Application-lifetime owner of the one configured profile repository and its fixed storage target. */
+/** Shared immutable trust/path environment. Opening a repository does not grant lifecycle authority. */
 @Singleton
-class DownloadableProfileRuntime @Inject constructor(
+internal class DownloadableProfileEnvironment @Inject constructor(
     @ApplicationContext context: Context,
     vmPaths: VmPaths,
-) : ProfileLifecycleStore, ActiveProfileRuntime {
+) {
     private val configuration = DownloadableProfileConfigurationParser.parse(
         RawDownloadableProfileConfiguration(
             signingKeyId = BuildConfig.PROFILE_SIGNING_KEY_ID,
@@ -66,48 +79,55 @@ class DownloadableProfileRuntime @Inject constructor(
             canonicalOrigins = BuildConfig.PROFILE_CANONICAL_ORIGINS,
         ),
     )
-    override val availability: DownloadableProfileAvailability = when (configuration) {
+    val availability: DownloadableProfileAvailability = when (configuration) {
         is DownloadableProfileConfigurationResult.Configured -> DownloadableProfileAvailability.Available
         is DownloadableProfileConfigurationResult.Unavailable ->
             DownloadableProfileAvailability.Unavailable(configuration.reason)
     }
-    private val configured: ConfiguredRuntime? =
-        (configuration as? DownloadableProfileConfigurationResult.Configured)?.value?.let { parsed ->
-            val fetcher = HttpUrlConnectionProfileArtifactFetcher()
-            ConfiguredRuntime(
-                approvedOrigins = parsed.approvedOrigins,
-                fetcher = fetcher,
-                repository = ProfileRepository(
-                    repositoryDirectory = context.filesDir.resolve(PROFILE_STORE_DIRECTORY),
-                    storageFile = vmPaths.storageImage,
-                    approvedOrigins = parsed.approvedOrigins,
-                    trustPolicy = parsed.trustPolicy,
-                    artifactFetcher = fetcher,
-                    directoryDurability = AndroidDirectoryDurability,
-                ),
-            )
-        }
+    val approvedOrigins: ApprovedArtifactOrigins? =
+        (configuration as? DownloadableProfileConfigurationResult.Configured)?.value?.approvedOrigins
+    private val trustPolicy: ProfileTrustPolicy? =
+        (configuration as? DownloadableProfileConfigurationResult.Configured)?.value?.trustPolicy
+    private val repositoryDirectory = context.filesDir.resolve(PROFILE_STORE_DIRECTORY)
+    private val storageFile = vmPaths.storageImage
 
-    /** Downloads only signed metadata; preparation never mutates activation state. */
-    suspend fun prepareEnvelopeUrl(url: String): PreparedProfile = runInterruptible(Dispatchers.IO) {
-        val runtime = requireConfigured()
-        val admittedUrl = runtime.approvedOrigins.parseUrl(url)
-        val deadlineNanos = deadlineAfterMillis(ENVELOPE_FETCH_TIMEOUT_MILLIS)
-        val request = ArtifactFetchRequest(
-            url = admittedUrl,
-            maxResponseBytes = ProfileLimits.MAX_ENVELOPE_BYTES.toLong() + 1L,
-            deadlineNanos = deadlineNanos,
+    fun openConfiguredRepository(fetcher: ProfileArtifactFetcher): ProfileRepository? {
+        val origins = approvedOrigins ?: return null
+        val trust = trustPolicy ?: return null
+        return ProfileRepository(
+            repositoryDirectory = repositoryDirectory,
+            storageFile = storageFile,
+            approvedOrigins = origins,
+            trustPolicy = trust,
+            artifactFetcher = fetcher,
+            directoryDurability = AndroidDirectoryDurability,
         )
-        val response = try {
-            runtime.fetcher.fetch(request)
-        } catch (failure: IOException) {
-            throw ProfileDownloadException("profile envelope fetch failed", failure)
-        }
-        val envelope = response.use {
-            validateEnvelopeResponse(request, response)
-            readEnvelopeMaxPlusOne(response.body, deadlineNanos)
-        }
-        runtime.repository.prepare(envelope)
+    }
+
+    fun requireBundledFallbackAllowed() {
+        DownloadedProfileLineageGuard.requireBundledFallbackAllowed(repositoryDirectory.toPath())
+    }
+
+    companion object {
+        const val PROFILE_STORE_DIRECTORY = "profile-store-v1"
+    }
+}
+
+/**
+ * The only production adapter allowed to call raw profile lifecycle mutations. It is injected
+ * directly into DefaultVmManager and is deliberately not exposed as a Hilt interface binding.
+ */
+@Singleton
+internal class ManagerProfileLifecycleStore @Inject constructor(
+    environment: DownloadableProfileEnvironment,
+) : ProfileLifecycleStore {
+    private val repository = environment.openConfiguredRepository(HttpUrlConnectionProfileArtifactFetcher())
+    private val availability = environment.availability
+
+    override suspend fun issueDataDeletionConfirmation(
+        candidate: PreparedProfileCandidate,
+    ): DataDeletionConfirmation = withContext(Dispatchers.IO) {
+        requireConfigured().issueDataDeletionConfirmation(candidate)
     }
 
     override suspend fun install(
@@ -115,44 +135,79 @@ class DownloadableProfileRuntime @Inject constructor(
         dataPolicy: GuestDataPolicy,
         deletionConfirmation: DataDeletionConfirmation?,
     ): ActivationState = withContext(Dispatchers.IO) {
-        requireConfigured().repository.activate(candidate, dataPolicy, deletionConfirmation)
+        requireConfigured().activate(candidate, dataPolicy, deletionConfirmation)
     }
 
     override suspend fun rollback(
         expectedActivationSequence: Long,
         dataPolicy: GuestDataPolicy,
     ): ActivationState = withContext(Dispatchers.IO) {
-        requireConfigured().repository.rollback(expectedActivationSequence, dataPolicy)
+        requireConfigured().rollback(expectedActivationSequence, dataPolicy)
     }
 
-    suspend fun issueDataDeletionConfirmation(
-        candidate: PreparedProfileCandidate,
-    ): DataDeletionConfirmation = withContext(Dispatchers.IO) {
-        requireConfigured().repository.issueDataDeletionConfirmation(candidate)
+    private fun requireConfigured(): ProfileRepository = repository ?: run {
+        val unavailable = availability as DownloadableProfileAvailability.Unavailable
+        throw DownloadableProfileUnavailableException(unavailable.reason)
+    }
+}
+
+/** Application-lifetime read/prepare facade. Lifecycle mutation authority is intentionally absent. */
+@Singleton
+class DownloadableProfileRuntime @Inject internal constructor(
+    private val environment: DownloadableProfileEnvironment,
+) : ActiveProfileRuntime, ProfilePreparationOperations {
+    override val availability: DownloadableProfileAvailability = environment.availability
+    private val fetcher = HttpUrlConnectionProfileArtifactFetcher()
+    private val repository = environment.openConfiguredRepository(fetcher)
+
+    /** Downloads only signed metadata/artifacts; preparation never mutates activation state. */
+    override suspend fun prepareEnvelopeUrl(url: String): PreparedProfile = runInterruptible(Dispatchers.IO) {
+        val origins = environment.approvedOrigins ?: throw unavailable()
+        val configuredRepository = repository ?: throw unavailable()
+        val admittedUrl = origins.parseUrl(url)
+        val deadlineNanos = deadlineAfterMillis(ENVELOPE_FETCH_TIMEOUT_MILLIS)
+        val request = ArtifactFetchRequest(
+            url = admittedUrl,
+            maxResponseBytes = ProfileLimits.MAX_ENVELOPE_BYTES.toLong() + 1L,
+            deadlineNanos = deadlineNanos,
+        )
+        val response = try {
+            fetcher.fetch(request)
+        } catch (failure: IOException) {
+            throw ProfileDownloadException("profile envelope fetch failed", failure)
+        }
+        val envelope = response.use {
+            validateEnvelopeResponse(request, response)
+            readEnvelopeMaxPlusOne(response.body, deadlineNanos)
+        }
+        configuredRepository.prepare(envelope)
     }
 
-    suspend fun diagnosticActivationState(): ProfileActivationDiagnostic {
-        val runtime = configured ?: return ProfileActivationDiagnostic(availability, null, null, null)
+    override suspend fun diagnosticActivationState(): ProfileActivationDiagnostic {
+        val configuredRepository = repository
+            ?: return ProfileActivationDiagnostic(availability, null, null, null)
         return withContext(Dispatchers.IO) {
             ProfileActivationDiagnostic(
                 availability = availability,
-                activation = runtime.repository.activationState(),
-                lastFailure = runtime.repository.lastActivationFailure(),
-                trustQuarantine = runtime.repository.lastTrustQuarantine(),
+                activation = configuredRepository.activationState(),
+                lastFailure = configuredRepository.lastActivationFailure(),
+                trustQuarantine = configuredRepository.lastTrustQuarantine(),
             )
         }
     }
 
-    suspend fun collectGarbage(): ProfileGarbageCollectionResult = withContext(Dispatchers.IO) {
-        requireConfigured().repository.collectGarbage()
+    override fun resolveActiveProfile(): PreparedProfile? {
+        val configuredRepository = repository
+        if (configuredRepository == null) {
+            environment.requireBundledFallbackAllowed()
+            return null
+        }
+        return configuredRepository.resolveActiveProfile()
     }
 
-    override fun resolveActiveProfile(): PreparedProfile? =
-        requireConfigured().repository.resolveActiveProfile()
-
-    private fun requireConfigured(): ConfiguredRuntime = configured ?: run {
+    private fun unavailable(): DownloadableProfileUnavailableException {
         val unavailable = availability as DownloadableProfileAvailability.Unavailable
-        throw DownloadableProfileUnavailableException(unavailable.reason)
+        return DownloadableProfileUnavailableException(unavailable.reason)
     }
 
     private fun validateEnvelopeResponse(request: ArtifactFetchRequest, response: ArtifactFetchResponse) {
@@ -213,15 +268,67 @@ class DownloadableProfileRuntime @Inject constructor(
         return if (Long.MAX_VALUE - now < timeoutNanos) Long.MAX_VALUE else now + timeoutNanos
     }
 
-    private data class ConfiguredRuntime(
-        val approvedOrigins: ApprovedArtifactOrigins,
-        val fetcher: ProfileArtifactFetcher,
-        val repository: ProfileRepository,
-    )
-
     private companion object {
-        const val PROFILE_STORE_DIRECTORY = "profile-store-v1"
         const val ENVELOPE_FETCH_TIMEOUT_MILLIS = 60_000L
         const val MAX_ZERO_READS = 8
+    }
+}
+
+internal object DownloadedProfileLineageGuard {
+    private const val STATE_DIRECTORY = "state"
+    private const val MARKER_FILE = "downloaded-lineage.claimed"
+    private val MARKER_BYTES = "podroid-downloaded-profile-lineage-v1\n".toByteArray(Charsets.US_ASCII)
+
+    fun requireBundledFallbackAllowed(repositoryDirectory: Path) {
+        val root = repositoryDirectory.toAbsolutePath().normalize()
+        if (!Files.exists(root, LinkOption.NOFOLLOW_LINKS)) return
+        requireDirectoryNoFollow(root, "profile repository")
+        val state = root.resolve(STATE_DIRECTORY)
+        if (!Files.exists(state, LinkOption.NOFOLLOW_LINKS)) return
+        requireDirectoryNoFollow(state, "profile state")
+        val marker = state.resolve(MARKER_FILE)
+        if (!Files.exists(marker, LinkOption.NOFOLLOW_LINKS)) return
+        val actual = try {
+            FileChannel.open(marker, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS).use { channel ->
+                if (channel.size() != MARKER_BYTES.size.toLong()) {
+                    throw ProfileRepositoryCorruptException("downloaded profile lineage marker is invalid")
+                }
+                val buffer = ByteBuffer.allocate(MARKER_BYTES.size)
+                var zeroReads = 0
+                while (buffer.hasRemaining()) {
+                    val count = channel.read(buffer)
+                    if (count < 0) break
+                    if (count == 0) {
+                        zeroReads++
+                        if (zeroReads > 8) {
+                            throw ProfileRepositoryCorruptException("downloaded profile lineage marker made no progress")
+                        }
+                    } else {
+                        zeroReads = 0
+                    }
+                }
+                if (buffer.hasRemaining()) {
+                    throw ProfileRepositoryCorruptException("downloaded profile lineage marker is truncated")
+                }
+                buffer.array()
+            }
+        } catch (failure: ProfileRepositoryCorruptException) {
+            throw failure
+        } catch (failure: IOException) {
+            throw ProfileRepositoryCorruptException("downloaded profile lineage marker is invalid", failure)
+        }
+        if (!actual.contentEquals(MARKER_BYTES)) {
+            throw ProfileRepositoryCorruptException("downloaded profile lineage marker is invalid")
+        }
+        throw ProfileActivationException(
+            "bundled fallback is blocked because downloaded profile lineage was previously claimed",
+        )
+    }
+
+    private fun requireDirectoryNoFollow(path: Path, label: String) {
+        val attributes = Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        if (!attributes.isDirectory || attributes.isSymbolicLink) {
+            throw ProfileRepositoryCorruptException("$label is not a fixed directory")
+        }
     }
 }

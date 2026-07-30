@@ -2036,6 +2036,10 @@ class VmManagerTest {
     ) : ProfileLifecycleStore {
         var installCalls = 0
         var rollbackCalls = 0
+        override suspend fun issueDataDeletionConfirmation(
+            candidate: PreparedProfileCandidate,
+        ): DataDeletionConfirmation = throw UnsupportedOperationException()
+
         override suspend fun install(
             candidate: PreparedProfileCandidate,
             dataPolicy: GuestDataPolicy,

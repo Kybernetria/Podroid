@@ -681,6 +681,12 @@ class DefaultVmManager internal constructor(
         false
     }
 
+    override suspend fun issueDataDeletionConfirmation(
+        candidate: PreparedProfileCandidate,
+    ): DataDeletionConfirmation = withStoppedProfileLifecycle {
+        profileLifecycleStore.issueDataDeletionConfirmation(candidate)
+    }
+
     override suspend fun activateProfile(
         candidate: PreparedProfileCandidate,
         dataPolicy: GuestDataPolicy,

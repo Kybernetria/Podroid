@@ -32,6 +32,18 @@ class RepositoryVmConfigurationSourceTest {
         }
     }
 
+    @Test fun `downloaded profile launch rejects nonblank QEMU extras before command construction`() {
+        RepositoryVmConfigurationSource.requireSignedProfileQemuArgsAreClosed(true, "")
+        RepositoryVmConfigurationSource.requireSignedProfileQemuArgsAreClosed(false, "-nodefaults")
+        val failure = runCatching {
+            RepositoryVmConfigurationSource.requireSignedProfileQemuArgsAreClosed(
+                downloadedProfileActive = true,
+                qemuExtraArgs = "  -kernel /tmp/override  ",
+            )
+        }.exceptionOrNull()
+        assertTrue(failure is IllegalStateException)
+    }
+
     @Test fun `exact loopback SSH rule is deduplicated`() {
         assertEquals(
             listOf(implicitSsh),
