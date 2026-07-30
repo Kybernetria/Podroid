@@ -74,6 +74,80 @@ class ProfileV2RepositoryRuntimeTest {
     }
 
     @Test
+    fun `policy upgrade rejects retained active noncanonical seed without mutation`() {
+        val fixture = fixture("old-policy-active")
+        val root = temporaryFolder.newFolder("old-policy-active-root")
+        val storage = File(root, "instance/storage.img").also { it.parentFile.mkdirs(); it.writeText("bundled") }
+        val vars = File(storage.parentFile, "uefi-vars.fd").also { it.writeText("bundled-vars") }
+        val oldRepository = repository(root, storage, MapFetcher(fixture.bytes), varsFile = vars)
+        val prepared = oldRepository.prepare(envelope(fixture.profile))
+        val active = oldRepository.activate(
+            prepared.candidate,
+            GuestDataPolicy.DELETE_DATA,
+            oldRepository.issueDataDeletionConfirmation(prepared.candidate),
+        )
+        val activeStorage = storage.readBytes()
+        val activeVars = vars.readBytes()
+        val activationRecord = File(root, "store/state/activation.record").readBytes()
+
+        val upgraded = repository(
+            root, storage, MapFetcher(fixture.bytes), varsFile = vars,
+            noCloudSeedPolicy = CanonicalNoCloudSeedPolicy,
+        )
+
+        assertFailure<ProfileDownloadException> { upgraded.resolveActiveProfile() }
+        assertFailure<ProfileDownloadException> {
+            upgraded.activate(prepared.candidate, GuestDataPolicy.DELETE_DATA)
+        }
+        assertArrayEquals(activeStorage, storage.readBytes())
+        assertArrayEquals(activeVars, vars.readBytes())
+        assertArrayEquals(activationRecord, File(root, "store/state/activation.record").readBytes())
+        assertEquals(prepared.candidate, active.active)
+    }
+
+    @Test
+    fun `policy upgrade aborts pending noncanonical seed before destructive mutation`() {
+        val fixture = fixture("old-policy-pending")
+        val root = temporaryFolder.newFolder("old-policy-pending-root")
+        val storage = File(root, "instance/storage.img").also { it.parentFile.mkdirs(); it.writeText("original") }
+        val vars = File(storage.parentFile, "uefi-vars.fd").also { it.writeText("original-vars") }
+        val armed = AtomicBoolean(true)
+        val oldRepository = repository(
+            root, storage, MapFetcher(fixture.bytes), vars,
+            ProfileRepositoryFaultInjector { point ->
+                if (point == ProfileRepositoryFaultPoint.AFTER_DELETION_INTENT &&
+                    armed.compareAndSet(true, false)
+                ) throw IOException("crash after deletion intent")
+            },
+        )
+        val prepared = oldRepository.prepare(envelope(fixture.profile))
+        assertFailure<IOException> {
+            oldRepository.activate(
+                prepared.candidate,
+                GuestDataPolicy.DELETE_DATA,
+                oldRepository.issueDataDeletionConfirmation(prepared.candidate),
+            )
+        }
+        assertTrue(File(root, "store/state/activation.pending").exists())
+
+        val upgraded = repository(
+            root, storage, MapFetcher(fixture.bytes), varsFile = vars,
+            noCloudSeedPolicy = CanonicalNoCloudSeedPolicy,
+        )
+        upgraded.recover()
+
+        assertEquals("original", storage.readText())
+        assertEquals("original-vars", vars.readText())
+        assertNull(upgraded.activationState())
+        assertFalse(File(root, "store/state/activation.pending").exists())
+        val failure = upgraded.lastActivationFailure()!!
+        assertEquals(prepared.candidate, failure.candidate)
+        assertEquals(ActivationFailureReason.CANDIDATE_NO_LONGER_USABLE, failure.reason)
+        assertFalse(failure.storageDeletionIrreversible)
+        assertFalse(failure.uefiVarsDeletionIrreversible)
+    }
+
+    @Test
     fun `cloud activation requires delete and atomically initializes fixed disk and vars without resize`() {
         val fixture = fixture("activate")
         val root = temporaryFolder.newFolder("activate-root")

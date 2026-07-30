@@ -1101,6 +1101,7 @@ class ProfileRepository(
         }
         if (requireCurrentTrust) revalidateTrust(record)
         validatePreparedBlobs(record)
+        validateClosedNoCloudSeed(record)
         return record
     }
 
