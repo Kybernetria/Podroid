@@ -15,8 +15,13 @@ package com.excp.podroid.engine
  * One-shot: stops scanning after the first "Ready!" to keep readiness idempotent.
  */
 class BootStageDetector(
+    private val readinessMarker: String = "Ready!",
+    private val legacyStagesEnabled: Boolean = true,
     private val onStage: (String) -> Unit,
 ) {
+    init {
+        require(readinessMarker.isNotEmpty() && readinessMarker.length <= 128)
+    }
     private val buf = StringBuilder()
     private val maxKeep = 4096
 
@@ -26,7 +31,7 @@ class BootStageDetector(
      * re-scanned alongside the new bytes — enough to reconstruct any marker
      * that begins in the prior feed and ends in this one.
      */
-    private val overlap = MARKERS.maxOf { it.first.length } - 1
+    private val overlap = maxOf(MARKERS.maxOf { it.first.length }, readinessMarker.length) - 1
 
     /** Length of [buf] before the current feed appended — start of "new" text. */
     private var scannedLen = 0
@@ -50,7 +55,8 @@ class BootStageDetector(
         val tail = buf.substring(from)
         scannedLen = buf.length
         when {
-            tail.contains("Ready!")                 -> { ready = true; onStage("Ready") }
+            tail.contains(readinessMarker)          -> { ready = true; onStage("Ready") }
+            !legacyStagesEnabled                    -> Unit
             tail.contains("Almost ready")           -> onStage("Almost ready...")
             tail.contains("Starting SSH")           -> onStage("Starting SSH...")
             tail.contains("Configuring containers") -> onStage("Configuring containers...")

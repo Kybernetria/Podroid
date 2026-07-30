@@ -30,6 +30,8 @@ import android.util.Log
 import com.excp.podroid.data.repository.PortForwardRule
 import com.excp.podroid.util.HostMetrics
 import com.excp.podroid.util.LogProxy
+import com.excp.podroid.vm.ResolvedVmBootPlan
+import com.excp.podroid.vm.UefiNoCloudVmBootPlan
 import com.excp.podroid.vm.VmBootFiles
 import com.excp.podroid.vm.VmId
 import com.excp.podroid.vm.VmPathSecurity
@@ -53,6 +55,22 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 internal fun qemuBootFiles(config: VmConfig, paths: VmPaths): VmBootFiles = config.bootFiles(paths)
+
+internal fun buildClosedCloudQemuBootArgs(plan: UefiNoCloudVmBootPlan, cpus: Int): List<String> {
+    require(cpus > 0)
+    return listOf(
+        "-drive", "if=pflash,format=raw,readonly=on,file=${plan.uefiCode.file.absolutePath}",
+        "-drive", "if=pflash,format=raw,file=${plan.uefiVars.absolutePath}",
+        "-object", "iothread,id=iothread0",
+        "-device", "virtio-blk-pci,drive=drive1,num-queues=$cpus,iothread=iothread0,bootindex=1",
+        "-drive", "file=${plan.cloudRootDisk.absolutePath},if=none,id=drive1,format=raw,cache=writeback,aio=threads,discard=unmap,detect-zeroes=unmap",
+        "-object", "iothread,id=iothread1",
+        "-device", "virtio-blk-pci,drive=drive2,num-queues=$cpus,iothread=iothread1,bootindex=2",
+        "-drive", "file=${plan.noCloudSeed.file.absolutePath},if=none,id=drive2,format=raw,readonly=on,cache=writeback,aio=threads",
+    ).also { args ->
+        check(args.none { it == "-kernel" || it == "-initrd" || it == "-append" })
+    }
+}
 
 internal fun appendValidatedQemuExtraArgs(command: MutableList<String>, config: VmConfig) {
     com.excp.podroid.vm.RepositoryVmConfigurationSource.requireSignedProfileQemuArgsAreClosed(
@@ -163,6 +181,7 @@ class QemuEngine @Inject constructor(
 
     private var bootStartTime: Long = 0L
     @Volatile private var persistedConsoleCaptureEnabled = false
+    @Volatile private var activeBootPlan: ResolvedVmBootPlan? = null
 
     /** Per-run serial monitor; created in start(), released in cleanup(). */
     private var bootMonitor: QemuBootMonitor? = null
@@ -174,23 +193,29 @@ class QemuEngine @Inject constructor(
      * feed race the new run's scan offsets / one-shot guard. A new instance per
      * run isolates each boot. Mirrors the AVF backend, which already does this.
      */
-    private fun newBootStageDetector(generation: Long) = BootStageDetector { stage ->
-        if (bootStageGate.apply(
-                generation,
-                isStarting = { _state.value is VmState.Starting },
-                isQuiescent = { _quiescent.value },
-                mutation = {
-                    _bootStage.value = stage
-                    if (stage == "Ready") {
-                        _runningSinceMs = System.currentTimeMillis()
-                        persistBootDuration()
-                        _state.value = VmState.Running
-                    }
-                },
-            ) && stage == "Ready") {
-            autoStartBridge(generation)
-        }
-    }
+    private fun newBootStageDetector(generation: Long, plan: ResolvedVmBootPlan?) = BootStageDetector(
+        onStage = { stage ->
+            if (bootStageGate.apply(
+                    generation,
+                    isStarting = { _state.value is VmState.Starting },
+                    isQuiescent = { _quiescent.value },
+                    mutation = {
+                        _bootStage.value = stage
+                        if (stage == "Ready") {
+                            _runningSinceMs = System.currentTimeMillis()
+                            persistBootDuration()
+                            _state.value = VmState.Running
+                        }
+                    },
+                ) && stage == "Ready" &&
+                (plan as? UefiNoCloudVmBootPlan)?.capabilities?.terminal != false
+            ) {
+                autoStartBridge(generation)
+            }
+        },
+        readinessMarker = (plan as? UefiNoCloudVmBootPlan)?.readinessMarker ?: "Ready!",
+        legacyStagesEnabled = plan !is UefiNoCloudVmBootPlan,
+    )
 
     /** Set once cleanup() has run for the current VM lifetime; reset by start(). */
     private val cleanedUp = AtomicBoolean(true)
@@ -262,6 +287,9 @@ class QemuEngine @Inject constructor(
     }
 
     override fun createTerminalSession(client: TerminalSessionClient): TerminalSession {
+        if ((activeBootPlan as? UefiNoCloudVmBootPlan)?.capabilities?.terminal == false) {
+            throw IllegalStateException("active cloud profile does not allow the Android terminal bridge")
+        }
         sessionClientDelegate = client
         val generation = synchronized(this) {
             val currentGeneration = activeLaunchGeneration
@@ -335,6 +363,7 @@ class QemuEngine @Inject constructor(
             activeLaunchGeneration = claimedGeneration
             bootStageGate.arm(claimedGeneration)
             cleanedUp.set(false)
+            activeBootPlan = config.bootArtifacts
             persistedConsoleCaptureEnabled = SensitiveConsolePolicy.persistedCaptureAllowed(
                 config.qemuExtraArgs,
                 config.kernelExtraCmdline,
@@ -366,7 +395,7 @@ class QemuEngine @Inject constructor(
                 artifacts.requireBackend(backendId)
                 artifacts.validateFiles()
             }
-            ensureStorageImage(config.storageSizeGb)
+            if (config.bootArtifacts !is UefiNoCloudVmBootPlan) ensureStorageImage(config.storageSizeGb)
         } catch (e: java.io.IOException) {
             // Restore the "cleanedUp=false ⟺ VM lifetime in progress" invariant
             // (same as the qemuExecutable() path); no process/scope exists yet.
@@ -389,7 +418,7 @@ class QemuEngine @Inject constructor(
         _bootStage.value = "Starting QEMU..."
         // Fresh per-run detector so a previous run's still-draining monitor can't
         // feed (or race the one-shot guard / scan offsets of) this run's detector.
-        val detector = newBootStageDetector(generation)
+        val detector = newBootStageDetector(generation, config.bootArtifacts)
 
         if (!launchGate.mayLaunch(generation)) {
             finishBeforeProcess(generation, VmState.Stopped)
@@ -541,8 +570,16 @@ class QemuEngine @Inject constructor(
                 // hostkey gen), and it logs loudly instead of silently rubber-
                 // stamping Running at a fixed 60s like the old blind fallback.
                 scope.launch {
-                    delay(BOOT_READY_SAFETY_MS)
+                    val cloudPlan = config.bootArtifacts as? UefiNoCloudVmBootPlan
+                    delay(if (cloudPlan != null) CLOUD_READY_TIMEOUT_MS else BOOT_READY_SAFETY_MS)
                     if (process?.isAlive == true) {
+                        if (cloudPlan != null) {
+                            if (_state.value is VmState.Starting) {
+                                _state.value = VmState.Error("cloud readiness marker was not observed before timeout")
+                                process?.destroy()
+                            }
+                            return@launch
+                        }
                         val promoted = bootStageGate.apply(
                             generation,
                             isStarting = { _state.value is VmState.Starting },
@@ -649,7 +686,8 @@ class QemuEngine @Inject constructor(
     }
 
     override fun openHostTransport(): com.excp.podroid.engine.hostbridge.HostTransport? =
-        com.excp.podroid.engine.hostbridge.QemuHostTransport.open(hostSockPath)
+        if ((activeBootPlan as? UefiNoCloudVmBootPlan)?.capabilities?.hostBridge == false) null
+        else com.excp.podroid.engine.hostbridge.QemuHostTransport.open(hostSockPath)
 
     override suspend fun addPortForward(rule: PortForwardRule) {
         if (_state.value !is VmState.Running) return
@@ -703,6 +741,7 @@ class QemuEngine @Inject constructor(
         _bootStage.value = ""
         activeLaunchGeneration?.let(launchGate::complete)
         activeLaunchGeneration = null
+        activeBootPlan = null
         // Terminal lifecycle is safe before quiescence releases destructive
         // manager operations. A late detector cannot overwrite it after the
         // generation invalidation above.
@@ -735,56 +774,38 @@ class QemuEngine @Inject constructor(
         args += "-smp"; args += "${config.cpus}"
         args += "-m";   args += "${config.ramMb}"
 
+        val cloudPlan = config.bootArtifacts as? UefiNoCloudVmBootPlan
         val bootFiles = qemuBootFiles(config, vmPaths)
-        val kernelPath = bootFiles.kernel
-        val initrdPath = bootFiles.initrd
-
-        if (kernelPath.exists()) {
-            args += "-kernel"; args += kernelPath.absolutePath
-            val cmdline = buildString {
-                // mitigations=off: speculative-exec attacks don't cross the TCG ISA boundary; 5–15% gain.
-                append("console=ttyAMA0 mitigations=off")
-                if (userKernelExtras.isNotEmpty()) append(" ").append(userKernelExtras)
-                append(" androidip=").append(config.androidIp)
-                if (config.sshEnabled) append(" ssh=1")
-                append(" podroid.x11.dpi=").append(config.x11Dpi)
-                if (config.bandwidthMbps > 0) append(" podroid.bandwidth=").append(config.bandwidthMbps)
+        if (cloudPlan != null) {
+            args += buildClosedCloudQemuBootArgs(cloudPlan, config.cpus)
+        } else {
+            val kernelPath = bootFiles.kernel
+            val initrdPath = bootFiles.initrd
+            if (kernelPath.exists()) {
+                args += "-kernel"; args += kernelPath.absolutePath
+                val cmdline = buildString {
+                    append("console=ttyAMA0 mitigations=off")
+                    if (userKernelExtras.isNotEmpty()) append(" ").append(userKernelExtras)
+                    append(" androidip=").append(config.androidIp)
+                    if (config.sshEnabled) append(" ssh=1")
+                    append(" podroid.x11.dpi=").append(config.x11Dpi)
+                    if (config.bandwidthMbps > 0) append(" podroid.bandwidth=").append(config.bandwidthMbps)
+                }
+                args += "-append"; args += cmdline
+            } else Log.w(TAG, "Kernel not found!")
+            if (initrdPath.exists()) {
+                args += "-initrd"; args += initrdPath.absolutePath
+            } else Log.w(TAG, "Initrd not found!")
+            if (vmPaths.storageImage.exists()) {
+                args += "-object"; args += "iothread,id=iothread0"
+                args += "-device"; args += "virtio-blk-pci,drive=drive1,num-queues=${config.cpus},iothread=iothread0"
+                args += "-drive"; args += "file=${vmPaths.storageImage.absolutePath},if=none,id=drive1,format=raw,cache=writeback,aio=threads,discard=unmap,detect-zeroes=unmap"
             }
-            args += "-append"; args += cmdline
-        } else {
-            Log.w(TAG, "Kernel not found!")
-        }
-
-        if (initrdPath.exists()) {
-            args += "-initrd"; args += initrdPath.absolutePath
-        } else {
-            Log.w(TAG, "Initrd not found!")
-        }
-
-        val storagePath = vmPaths.storageImage
-        if (storagePath.exists()) {
-            // Single dedicated iothread for the writable disk. Multi-iothread
-            // fan-out via `iothread-vq-mapping` requires `-device <full-json>`
-            // form (the keyval parser cannot supply array-typed properties),
-            // and on TCG-emulated guests the perf win is marginal vs the
-            // refactor cost. Stick with one iothread, num-queues==vCPUs.
-            args += "-object"; args += "iothread,id=iothread0"
-            args += "-device"; args += "virtio-blk-pci,drive=drive1,num-queues=${config.cpus},iothread=iothread0"
-            // discard=unmap + detect-zeroes=unmap: as the guest fstrim's the
-            // overlay, hand the punched holes back to the host filesystem so
-            // storage.img stops growing unbounded after long-term container
-            // churn. detect-zeroes converts all-zero writes (e.g. mkfs.ext4's
-            // erasure pass) into discards too.
-            args += "-drive";  args += "file=${storagePath.absolutePath},if=none,id=drive1,format=raw,cache=writeback,aio=threads,discard=unmap,detect-zeroes=unmap"
-        }
-
-        val rootfsImg = bootFiles.rootfs
-        if (rootfsImg.exists()) {
-            // Dedicated iothread for the read-only squashfs so its decompression
-            // reads don't queue behind storage.img writes on iothread0.
-            args += "-object"; args += "iothread,id=iothread1"
-            args += "-device"; args += "virtio-blk-pci,drive=drive2,num-queues=${config.cpus},iothread=iothread1"
-            args += "-drive";  args += "file=${rootfsImg.absolutePath},if=none,id=drive2,format=raw,readonly=on,cache=writeback,aio=threads"
+            if (bootFiles.rootfs.exists()) {
+                args += "-object"; args += "iothread,id=iothread1"
+                args += "-device"; args += "virtio-blk-pci,drive=drive2,num-queues=${config.cpus},iothread=iothread1"
+                args += "-drive"; args += "file=${bootFiles.rootfs.absolutePath},if=none,id=drive2,format=raw,readonly=on,cache=writeback,aio=threads"
+            }
         }
 
         // Downloads folder sharing via virtio-9p
@@ -798,6 +819,7 @@ class QemuEngine @Inject constructor(
                 context, android.Manifest.permission.WRITE_EXTERNAL_STORAGE
             ) == android.content.pm.PackageManager.PERMISSION_GRANTED
         if (config.storageAccessEnabled &&
+            (cloudPlan == null || cloudPlan.capabilities.downloads) &&
             hasStorageAccess &&
             downloadsDir.exists()) {
             // security_model=mapped-xattr keeps QEMU's 9p worker out of the
@@ -828,7 +850,7 @@ class QemuEngine @Inject constructor(
         // nothing else needs. UsbPassthroughManager streams Android
         // UsbDeviceConnection fds onto this bus at runtime via QMP add-fd +
         // device_add usb-host (needs a libusb-enabled QEMU build).
-        if (config.usbPassthroughEnabled) {
+        if (config.usbPassthroughEnabled && cloudPlan == null) {
             args += "-device"; args += "qemu-xhci,id=usbhc0"
         }
 
@@ -838,15 +860,22 @@ class QemuEngine @Inject constructor(
         // ── virtio-console bus ────────────────────────────────────────────────
         // hvc0 = primary terminal (getty runs here; bridge connects to terminal.sock)
         // hvc1 = control channel (init daemon reads RESIZE messages from ctrl.sock)
-        args += "-device";  args += "virtio-serial-pci"
-        args += "-chardev"; args += "socket,id=term0,path=$terminalSockPath,server=on,wait=off"
-        args += "-device";  args += "virtconsole,chardev=term0,name=org.podroid.term"
-        args += "-chardev"; args += "socket,id=ctrl0,path=$ctrlSockPath,server=on,wait=off"
-        args += "-device";  args += "virtconsole,chardev=ctrl0,name=org.podroid.ctrl"
-
-        // hvc2 = host bridge (guest podroid-hostd <-> Android host.sock)
-        args += "-chardev"; args += "socket,id=host0,path=$hostSockPath,server=on,wait=off"
-        args += "-device";  args += "virtconsole,chardev=host0,name=org.podroid.host"
+        val capabilities = cloudPlan?.capabilities
+        if (cloudPlan == null || capabilities!!.terminal || capabilities.resize || capabilities.hostBridge) {
+            args += "-device"; args += "virtio-serial-pci"
+        }
+        if (cloudPlan == null || capabilities!!.terminal) {
+            args += "-chardev"; args += "socket,id=term0,path=$terminalSockPath,server=on,wait=off"
+            args += "-device"; args += "virtconsole,chardev=term0,name=org.podroid.term"
+        }
+        if (cloudPlan == null || capabilities!!.resize) {
+            args += "-chardev"; args += "socket,id=ctrl0,path=$ctrlSockPath,server=on,wait=off"
+            args += "-device"; args += "virtconsole,chardev=ctrl0,name=org.podroid.ctrl"
+        }
+        if (cloudPlan == null || capabilities!!.hostBridge) {
+            args += "-chardev"; args += "socket,id=host0,path=$hostSockPath,server=on,wait=off"
+            args += "-device"; args += "virtconsole,chardev=host0,name=org.podroid.host"
+        }
 
         args += "-display"; args += "none"
         // Explicitly confine QEMU firmware/ROM/keymap lookup to this instance.
@@ -983,5 +1012,6 @@ class QemuEngine @Inject constructor(
          * fires first and this never triggers.
          */
         private const val BOOT_READY_SAFETY_MS = 120_000L
+        private const val CLOUD_READY_TIMEOUT_MS = 5L * 60 * 1000
     }
 }

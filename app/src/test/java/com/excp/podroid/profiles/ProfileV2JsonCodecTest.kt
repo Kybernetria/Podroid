@@ -89,7 +89,7 @@ class ProfileV2JsonCodecTest {
                 update(message)
                 sign()
             }
-            return SignedProfileEnvelopeJsonCodec.encode(SigningKeyId("release-2"), payload, signature)
+            return SignedProfileEnvelopeV2JsonCodec.encode(SigningKeyId("release-2"), payload, signature)
         }
 
         assertEquals(

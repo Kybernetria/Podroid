@@ -1,6 +1,6 @@
 # Debian 12 UEFI/NoCloud Profile Release Inputs
 
-This directory implements **release preparation only** for signed profile payload v2. It does not activate the profile, modify an engine, or claim that current Podroid builds can boot it. The v1 direct-kernel Alpine codec and repository remain authoritative for runtime activation.
+This directory contains reproducible release inputs for signed profile payload v2. Podroid now has a closed QEMU UEFI/NoCloud runtime path for this contract; these inputs still do not claim that the unresolved release artifacts have physically booted. The v1 direct-kernel Alpine contract remains supported unchanged.
 
 ## Closed v2 contract
 
@@ -13,7 +13,7 @@ The signed v2 payload is QEMU-only and fixes:
 - the `PODROID_CLOUD_READY_V1` serial readiness marker; and
 - a typed guest-integration capability set. The committed Debian seed declares no integration capability, so terminal, resize, Host bridge, and Downloads behavior is denied rather than inferred.
 
-V2 signatures cover `com.excp.podroid.vm-profile.v2\0 || exact_payload_bytes`. The v1 domain and deterministic bytes are unchanged. The signed-envelope framing is reused, but callers must select the v2 verifier explicitly; untrusted payload bytes never select their own signing domain.
+V2 signatures cover `com.excp.podroid.vm-profile.v2\0 || exact_payload_bytes`. The v1 domain and deterministic bytes are unchanged. V2 uses explicit envelope version 2 plus `signing_domain=com.excp.podroid.vm-profile.v2`; the closed envelope discriminator selects the verifier before payload parsing, so payload bytes cannot choose or confuse their signing domain.
 
 ## Deterministic credential-free CIDATA
 

@@ -681,7 +681,8 @@ class ProfileRepositoryTest {
         firstRepository.activate(prepared.candidate, GuestDataPolicy.PRESERVE_DATA)
 
         val restartedRepository = repository(root, RecordingFetcher(bytes), storage = storage)
-        val resolved = RepositoryProfileBootArtifactSource(restartedRepository).resolveActiveBootArtifacts("qemu")!!
+        val resolved = RepositoryProfileBootArtifactSource(restartedRepository)
+            .resolveActiveBootArtifacts("qemu") as com.excp.podroid.vm.VmBootArtifacts
 
         assertEquals(23L, resolved.generation.value)
         assertEquals(prepared.candidate.manifestSha256.value, resolved.manifestSha256.value)

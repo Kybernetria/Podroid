@@ -11,6 +11,7 @@ import com.excp.podroid.profiles.GuestDataPolicy
 import com.excp.podroid.profiles.PreparedProfileCandidate
 import com.excp.podroid.profiles.ProfileGeneration
 import com.excp.podroid.profiles.ProfileId
+import com.excp.podroid.profiles.PreparedBootContract
 import com.excp.podroid.profiles.ProfileLifecycleStore
 import com.excp.podroid.profiles.Sha256Digest
 import com.excp.podroid.profiles.SigningKeyId
@@ -108,6 +109,21 @@ class VmManagerTest {
         launch.await()
         assertEquals(1, profileStore.installCalls)
         assertEquals(1, runtime.startCalls)
+    }
+
+    @Test
+    fun `UEFI cloud activation is rejected on AVF before lifecycle store effects`() = runBlocking {
+        val store = FakeProfileLifecycleStore(bootContract = PreparedBootContract.UefiNoCloudV1)
+        val manager = manager(runtime = FakeRuntime("avf"), profileLifecycleStore = store)
+
+        try {
+            manager.activateProfile(profileCandidate(), GuestDataPolicy.DELETE_DATA)
+            fail("Expected backend contract rejection")
+        } catch (_: com.excp.podroid.profiles.ProfileActivationException) {
+            Unit
+        }
+
+        assertEquals(0, store.installCalls)
     }
 
     @Test
@@ -2033,9 +2049,11 @@ class VmManagerTest {
         private val onInstall: suspend () -> Unit = {},
         private val onRollback: suspend () -> Unit = {},
         private val rollbackResult: ActivationState? = null,
+        private val bootContract: PreparedBootContract = PreparedBootContract.DirectKernelOverlayV1,
     ) : ProfileLifecycleStore {
         var installCalls = 0
         var rollbackCalls = 0
+        override suspend fun preparedBootContract(candidate: PreparedProfileCandidate): PreparedBootContract = bootContract
         override suspend fun issueDataDeletionConfirmation(
             candidate: PreparedProfileCandidate,
         ): DataDeletionConfirmation = throw UnsupportedOperationException()
@@ -2076,13 +2094,12 @@ class VmManagerTest {
         override suspend fun awaitStopped(): Boolean = true
     }
 
-    private class FakeRuntime : ManagedVmRuntime {
+    private class FakeRuntime(override val backendId: String = "qemu") : ManagedVmRuntime {
         override val vmId = VmId.DEFAULT
         override val state = MutableStateFlow<VmState>(VmState.Idle)
         override val quiescent = MutableStateFlow(true)
         override val bootStage = MutableStateFlow("")
         override val stopping = MutableStateFlow(false)
-        override val backendId = "qemu"
         override val runningSinceMs: Long? = null
         override fun emulatorRssMb(): Long? = null
         override fun emulatorPid(): Int? = null

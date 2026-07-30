@@ -91,7 +91,7 @@ data class ProfileV2Artifact(
     }
 }
 
-/** Strict profile v2 model. Runtime activation support is intentionally outside this slice. */
+/** Strict signed input model for the closed QEMU UEFI/NoCloud runtime contract. */
 class VmProfileV2(
     val id: ProfileId,
     val generation: ProfileGeneration,

@@ -87,6 +87,22 @@ class BootStageDetectorTest {
     }
 
     @Test
+    fun `cloud readiness ignores generic markers and accepts only exact bounded contract marker`() {
+        val stages = mutableListOf<String>()
+        val detector = BootStageDetector(
+            readinessMarker = "PODROID_CLOUD_READY_V1",
+            legacyStagesEnabled = false,
+        ) { stages += it }
+
+        detector.feed("Ready! Almost ready Starting SSH")
+        assertTrue(stages.isEmpty())
+        detector.feed("PODROID_CLOUD_")
+        assertTrue(stages.isEmpty())
+        detector.feed("READY_V1\n")
+        assertEquals(listOf("Ready"), stages)
+    }
+
+    @Test
     fun `a fresh detector instance re-detects a new boot (per-run allocation)`() {
         // QEMU and AVF both allocate a new detector per run rather than resetting
         // one in place; a brand-new instance must detect a boot stream from clean.

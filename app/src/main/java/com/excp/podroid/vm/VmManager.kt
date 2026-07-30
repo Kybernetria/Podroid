@@ -12,7 +12,9 @@ import com.excp.podroid.engine.VmState
 import com.excp.podroid.profiles.ActivationState
 import com.excp.podroid.profiles.DataDeletionConfirmation
 import com.excp.podroid.profiles.GuestDataPolicy
+import com.excp.podroid.profiles.PreparedBootContract
 import com.excp.podroid.profiles.PreparedProfileCandidate
+import com.excp.podroid.profiles.ProfileActivationException
 import com.excp.podroid.profiles.ProfileLifecycleOperations
 import com.excp.podroid.profiles.ProfileLifecycleStore
 import java.io.IOException
@@ -221,7 +223,7 @@ interface VmManager {
 internal data class VmLaunchPlan(
     val portForwards: List<PortForwardRule>,
     val config: VmConfig,
-    val bootArtifacts: VmBootArtifacts? = config.bootArtifacts,
+    val bootArtifacts: ResolvedVmBootPlan? = config.bootArtifacts,
 ) {
     init {
         require(config.bootArtifacts == bootArtifacts) { "Launch plan boot artifacts must match its VM config" }
@@ -684,6 +686,7 @@ class DefaultVmManager internal constructor(
     override suspend fun issueDataDeletionConfirmation(
         candidate: PreparedProfileCandidate,
     ): DataDeletionConfirmation = withStoppedProfileLifecycle {
+        requireSelectedBackendSupports(profileLifecycleStore.preparedBootContract(candidate))
         profileLifecycleStore.issueDataDeletionConfirmation(candidate)
     }
 
@@ -692,6 +695,8 @@ class DefaultVmManager internal constructor(
         dataPolicy: GuestDataPolicy,
         deletionConfirmation: DataDeletionConfirmation?,
     ): ActivationState = withStoppedProfileLifecycle {
+        // Rechecked after confirmation and immediately before repository effects.
+        requireSelectedBackendSupports(profileLifecycleStore.preparedBootContract(candidate))
         profileLifecycleStore.install(candidate, dataPolicy, deletionConfirmation)
     }
 
@@ -1168,6 +1173,15 @@ class DefaultVmManager internal constructor(
     }
 
     /** Profile activation shares the exact lifecycle mutex and application asset-tree lease. */
+    private fun requireSelectedBackendSupports(contract: PreparedBootContract) {
+        when (contract) {
+            PreparedBootContract.DirectKernelOverlayV1 -> Unit
+            PreparedBootContract.UefiNoCloudV1 -> if (runtime.backendId != "qemu") {
+                throw ProfileActivationException("selected backend does not support the prepared boot contract")
+            }
+        }
+    }
+
     private suspend fun <T> withStoppedProfileLifecycle(action: suspend () -> T): T {
         awaitInitial(VmId.DEFAULT)
         return lifecycleMutex.withLock {
@@ -1309,12 +1323,13 @@ internal class VmPathFiles(private val paths: VmPaths) : VmFiles {
         if (!instanceExistsSafely()) return
         val rootIdentity = attrs(instanceRoot)
         val storage = paths.storageImage.toPath().toAbsolutePath().normalize()
+        val uefiVars = paths.uefiVars.toPath().toAbsolutePath().normalize()
         if (exists(storage) && !regular(storage)) {
             throw IOException("Persistent storage is not a regular no-follow file")
         }
         val entries = scanForRemoval()
         for (entry in entries) {
-            if (policy == VmRemovePolicy.PRESERVE_DATA && entry.path == storage) continue
+            if (policy == VmRemovePolicy.PRESERVE_DATA && (entry.path == storage || entry.path == uefiVars)) continue
             revalidateForDeletion(entry)
             Files.delete(entry.path)
         }

@@ -72,21 +72,59 @@ data class PreparedProfileCandidate(
     val trustEpoch: TrustEpoch,
 )
 
+sealed interface PreparedProfilePlan {
+    val supportedBackends: Set<ProfileBackend>
+
+    class DirectKernelOverlayV1 internal constructor(
+        supportedBackends: Set<ProfileBackend>,
+        artifactFiles: Map<ArtifactRole, File>,
+        artifactDigests: Map<ArtifactRole, Sha256Digest>,
+    ) : PreparedProfilePlan {
+        override val supportedBackends: Set<ProfileBackend> = Collections.unmodifiableSet(supportedBackends.toSet())
+        val artifactFiles: Map<ArtifactRole, File> = Collections.unmodifiableMap(artifactFiles.toMap())
+        val artifactDigests: Map<ArtifactRole, Sha256Digest> = Collections.unmodifiableMap(artifactDigests.toMap())
+    }
+
+    class UefiNoCloudV1 internal constructor(
+        supportedBackends: Set<ProfileBackend>,
+        artifactFiles: Map<ProfileV2ArtifactRole, File>,
+        artifactDigests: Map<ProfileV2ArtifactRole, Sha256Digest>,
+        val capabilities: ProfileV2Capabilities,
+        val readinessMarker: String,
+        internal val fixedStorageFile: File,
+        internal val fixedVarsFile: File,
+    ) : PreparedProfilePlan {
+        override val supportedBackends: Set<ProfileBackend> = Collections.unmodifiableSet(supportedBackends.toSet())
+        val artifactFiles: Map<ProfileV2ArtifactRole, File> = Collections.unmodifiableMap(artifactFiles.toMap())
+        val artifactDigests: Map<ProfileV2ArtifactRole, Sha256Digest> = Collections.unmodifiableMap(artifactDigests.toMap())
+    }
+}
+
 class PreparedProfile internal constructor(
     val candidate: PreparedProfileCandidate,
     val dataCompatibility: DataCompatibilityId,
-    supportedBackends: Set<ProfileBackend>,
-    artifactFiles: Map<ArtifactRole, File>,
-    artifactDigests: Map<ArtifactRole, Sha256Digest>,
+    val plan: PreparedProfilePlan,
 ) {
-    val supportedBackends: Set<ProfileBackend> = Collections.unmodifiableSet(supportedBackends.toSet())
-    val artifactFiles: Map<ArtifactRole, File> = Collections.unmodifiableMap(artifactFiles.toMap())
-    val artifactDigests: Map<ArtifactRole, Sha256Digest> = Collections.unmodifiableMap(artifactDigests.toMap())
+    internal constructor(
+        candidate: PreparedProfileCandidate,
+        dataCompatibility: DataCompatibilityId,
+        supportedBackends: Set<ProfileBackend>,
+        artifactFiles: Map<ArtifactRole, File>,
+        artifactDigests: Map<ArtifactRole, Sha256Digest>,
+    ) : this(
+        candidate,
+        dataCompatibility,
+        PreparedProfilePlan.DirectKernelOverlayV1(supportedBackends, artifactFiles, artifactDigests),
+    )
+    val supportedBackends: Set<ProfileBackend> get() = plan.supportedBackends
+    /** V1 compatibility view; cloud callers use the sealed [plan]. */
+    val artifactFiles: Map<ArtifactRole, File>
+        get() = (plan as? PreparedProfilePlan.DirectKernelOverlayV1)?.artifactFiles.orEmpty()
+    val artifactDigests: Map<ArtifactRole, Sha256Digest>
+        get() = (plan as? PreparedProfilePlan.DirectKernelOverlayV1)?.artifactDigests.orEmpty()
 
     init {
-        require(this.supportedBackends.isNotEmpty()) { "prepared profile backend contract is empty" }
-        require(this.artifactFiles.keys == ArtifactRole.entries.toSet()) { "prepared profile files are incomplete" }
-        require(this.artifactDigests.keys == ArtifactRole.entries.toSet()) { "prepared profile digests are incomplete" }
+        require(supportedBackends.isNotEmpty()) { "prepared profile backend contract is empty" }
     }
 }
 
@@ -138,6 +176,7 @@ class DataDeletionConfirmation private constructor(
     val expectedActivationSequence: Long,
     val candidate: PreparedProfileCandidate,
     internal val storageIdentity: StorageIdentity,
+    internal val varsIdentity: StorageIdentity,
 ) {
     internal companion object {
         fun issue(
@@ -145,7 +184,8 @@ class DataDeletionConfirmation private constructor(
             expectedActivationSequence: Long,
             candidate: PreparedProfileCandidate,
             storageIdentity: StorageIdentity,
-        ) = DataDeletionConfirmation(owner, expectedActivationSequence, candidate, storageIdentity)
+            varsIdentity: StorageIdentity = storageIdentity,
+        ) = DataDeletionConfirmation(owner, expectedActivationSequence, candidate, storageIdentity, varsIdentity)
     }
 }
 
@@ -199,6 +239,7 @@ class ProfileRepository(
     private val fetchTimeoutMillis: Long = DEFAULT_FETCH_TIMEOUT_MILLIS,
     private val lockTimeoutMillis: Long = DEFAULT_LOCK_TIMEOUT_MILLIS,
     private val faultInjector: ProfileRepositoryFaultInjector = ProfileRepositoryFaultInjector { },
+    uefiVarsFile: File = storageFile.parentFile.resolve("uefi-vars.fd"),
 ) {
     private val root = repositoryDirectory.toPath().toAbsolutePath().normalize()
     private val blobs = root.resolve(BLOBS_DIRECTORY)
@@ -210,17 +251,29 @@ class ProfileRepository(
     private val recordTemporary = temporary.resolve(RECORD_TEMP_FILE)
     private val pendingActivationPath = state.resolve(PENDING_ACTIVATION_FILE)
     private val trustQuarantinePath = state.resolve(TRUST_QUARANTINE_FILE)
+    private val cloudLineagePath = state.resolve(CLOUD_LINEAGE_FILE)
     private val fixedStorage = storageFile.toPath().toAbsolutePath().normalize()
+    private val fixedVars = uefiVarsFile.toPath().toAbsolutePath().normalize()
     private val storageTombstone = fixedStorage.parent?.resolve(
         ".podroid-profile-delete-${fixedStorage.toString().sha256Hex()}",
     ) ?: throw IllegalArgumentException("fixed storage file has no parent")
     private val storageRecoveryQuarantine = fixedStorage.parent?.resolve(
         ".podroid-profile-preserved-${fixedStorage.toString().sha256Hex()}",
     ) ?: throw IllegalArgumentException("fixed storage file has no parent")
+    private val varsTombstone = fixedVars.parent?.resolve(
+        ".podroid-profile-delete-${fixedVars.toString().sha256Hex()}",
+    ) ?: throw IllegalArgumentException("fixed UEFI vars file has no parent")
+    private val cloudStorageTemporary = fixedStorage.parent.resolve(".podroid-cloud-storage.init")
+    private val cloudVarsTemporary = fixedVars.parent.resolve(".podroid-cloud-vars.init")
     private val confirmationOwner = Any()
 
     init {
-        require(!fixedStorage.startsWith(root)) { "fixed storage file must be outside the repository metadata tree" }
+        require(!fixedStorage.startsWith(root) && !fixedVars.startsWith(root)) {
+            "fixed mutable files must be outside the repository metadata tree"
+        }
+        require(fixedStorage.parent == fixedVars.parent && fixedStorage != fixedVars) {
+            "fixed storage and UEFI vars must be distinct siblings"
+        }
         require(fetchTimeoutMillis in 1..MAX_FETCH_TIMEOUT_MILLIS) { "fetch timeout is outside the bound" }
         require(lockTimeoutMillis in 1..MAX_LOCK_TIMEOUT_MILLIS) { "lock timeout is outside the bound" }
     }
@@ -228,7 +281,7 @@ class ProfileRepository(
     /** Verifies, streams, fsyncs, CAS-publishes, then atomically records a complete generation. */
     @Throws(IOException::class)
     fun prepare(signedEnvelopeBytes: ByteArray): PreparedProfile {
-        val verified = VerifiedProfileJsonCodec.decodeManifest(
+        val verified = VerifiedProfileEnvelopeJsonCodec.decodeManifest(
             signedEnvelopeBytes,
             approvedOrigins,
             trustPolicy,
@@ -313,6 +366,14 @@ class ProfileRepository(
         readTrustQuarantineLocked()
     }
 
+    internal fun preparedBootContract(candidate: PreparedProfileCandidate): PreparedBootContract = withRepositoryLock {
+        recoverLocked()
+        when (requireUsableCandidateLocked(candidate, false, true).planKind) {
+            PreparedPlanKind.DIRECT_KERNEL_OVERLAY_V1 -> PreparedBootContract.DirectKernelOverlayV1
+            PreparedPlanKind.UEFI_NOCLOUD_V1 -> PreparedBootContract.UefiNoCloudV1
+        }
+    }
+
     /** Issues destructive authority for the current sequence, candidate, and fixed file identity. */
     @Throws(IOException::class)
     fun issueDataDeletionConfirmation(candidate: PreparedProfileCandidate): DataDeletionConfirmation =
@@ -331,7 +392,8 @@ class ProfileRepository(
                 confirmationOwner,
                 latestActivationSequenceLocked(),
                 candidate,
-                captureStorageIdentity(requireStableKeys = true),
+                captureFileIdentity(fixedStorage, "fixed storage", requireStableKeys = true),
+                captureFileIdentity(fixedVars, "fixed UEFI vars", requireStableKeys = true),
             )
         }
 
@@ -368,6 +430,9 @@ class ProfileRepository(
                 }
                 captureStorageIdentity(requireStableKeys = false)
                 if (sameActive) return@withRepositoryLock current
+                if (current == null && preparedRecord.planKind == PreparedPlanKind.UEFI_NOCLOUD_V1) {
+                    throw ProfileActivationException("UEFI cloud activation requires confirmed DELETE_DATA over bundled storage")
+                }
                 if (current == null && Files.exists(fixedStorage, LinkOption.NOFOLLOW_LINKS) &&
                     preparedRecord.dataCompatibility != ProfileDataLineage.BUNDLED_ALPINE
                 ) {
@@ -381,9 +446,7 @@ class ProfileRepository(
                         requireCurrentFloor = false,
                         requireCurrentTrust = false,
                     )
-                    if (activeRecord.dataCompatibility != preparedRecord.dataCompatibility) {
-                        throw ProfileActivationException("PRESERVE_DATA activation requires storage-compatible profiles")
-                    }
+                    requirePreserveCompatible(activeRecord, preparedRecord)
                 }
             }
             GuestDataPolicy.DELETE_DATA -> {
@@ -396,15 +459,33 @@ class ProfileRepository(
                         "DELETE_DATA requires repository-issued confirmation for the current state and candidate",
                     )
                 }
-                requireStorageIdentity(deletionConfirmation.storageIdentity, allowCompletedDeletion = false)
+                requireFileIdentity(
+                    fixedStorage, storageTombstone, deletionConfirmation.storageIdentity,
+                    "fixed storage", allowCompletedDeletion = false,
+                )
+                requireFileIdentity(
+                    fixedVars, varsTombstone, deletionConfirmation.varsIdentity,
+                    "fixed UEFI vars", allowCompletedDeletion = false,
+                )
             }
         }
 
-        val rollback = if (sameActive) current?.rollback else current?.active
+        val rollback = when {
+            sameActive -> current?.rollback
+            dataPolicy == GuestDataPolicy.DELETE_DATA -> current?.active?.takeIf { previous ->
+                val previousRecord = requireUsableCandidateLocked(previous, false, false)
+                storageContractsCompatible(previousRecord, preparedRecord)
+            }
+            else -> current?.active
+        }
         val next = ActivationState(nextActivationSequence(latestActivationSequenceLocked()), candidate, rollback)
         ensureDownloadedLineageMarkerLocked()
         if (dataPolicy == GuestDataPolicy.DELETE_DATA) {
-            val pending = PendingActivation(next, deletionConfirmation!!.storageIdentity)
+            val pending = PendingActivation(
+                next,
+                deletionConfirmation!!.storageIdentity,
+                deletionConfirmation.varsIdentity,
+            )
             writeImmutableRecord(pendingActivationPath, encodePendingActivation(pending))
             faultInjector.check(ProfileRepositoryFaultPoint.AFTER_DELETION_INTENT)
             if (completePendingActivationLocked(pending) == PendingRecoveryResult.ABORTED) {
@@ -452,9 +533,7 @@ class ProfileRepository(
             requireCurrentFloor = false,
             requireCurrentTrust = true,
         )
-        if (activeRecord.dataCompatibility != rollbackRecord.dataCompatibility) {
-            throw ProfileActivationException("rollback profile is not storage-compatible with the active profile")
-        }
+        requirePreserveCompatible(activeRecord, rollbackRecord)
 
         val next = ActivationState(nextActivationSequence(latestActivationSequenceLocked()), rollbackCandidate, current.active)
         writeReplaceRecord(activationPath(), encodeActivation(next))
@@ -470,12 +549,49 @@ class ProfileRepository(
         collectGarbageLocked()
     }
 
-    private fun prepareLocked(verified: VerifiedProfileManifest): PreparedProfile {
-        val profile = verified.profile
-        val profileKey = profileKey(profile.id)
+    private fun prepareLocked(verified: VerifiedProfileManifestAny): PreparedProfile {
+        val candidate: PreparedProfileCandidate
+        val compatibility: DataCompatibilityId
+        val backends: Set<ProfileBackend>
+        val planKind: PreparedPlanKind
+        val capabilities: Set<ProfileV2GuestIntegration>
+        val readiness: String?
+        val incoming: List<IncomingArtifact>
+        when (verified) {
+            is VerifiedProfileManifestAny.Direct -> {
+                val profile = verified.value.profile
+                candidate = PreparedProfileCandidate(
+                    profile.id, profile.generation, verified.manifestSha256, verified.signingKeyId,
+                    verified.signingKeyFingerprint, verified.trustEpoch,
+                )
+                compatibility = profile.dataCompatibility
+                backends = profile.supportedBackends
+                planKind = PreparedPlanKind.DIRECT_KERNEL_OVERLAY_V1
+                capabilities = emptySet()
+                readiness = null
+                incoming = profile.artifacts.map {
+                    IncomingArtifact(it.role.wireName, null, it.url, it.sha256, it.sizeBytes.value)
+                }
+            }
+            is VerifiedProfileManifestAny.UefiNoCloud -> {
+                val profile = verified.value.profile
+                candidate = PreparedProfileCandidate(
+                    profile.id, profile.generation, verified.manifestSha256, verified.signingKeyId,
+                    verified.signingKeyFingerprint, verified.trustEpoch,
+                )
+                compatibility = profile.dataCompatibility
+                backends = profile.supportedBackends
+                planKind = PreparedPlanKind.UEFI_NOCLOUD_V1
+                capabilities = profile.capabilities.guestIntegrations
+                readiness = profile.readinessMarker
+                incoming = profile.artifacts.map {
+                    IncomingArtifact(it.role.wireName, it.format.wireName, it.url, it.sha256, it.sizeBytes)
+                }
+            }
+        }
+        val profileKey = profileKey(candidate.profileId)
         val currentEpoch = trustPolicy.trustEpoch
         revalidateVerifiedTrust(verified)
-
         val floor = readFloor(profileKey)
         if (floor != null && floor.candidate.trustEpoch.value > currentEpoch.value) {
             throw ProfileRepositoryCorruptException("generation floor is from a future trust epoch")
@@ -490,55 +606,37 @@ class ProfileRepository(
                 throw ProfileRepositoryCorruptException("generation floor is above retained immutable state")
             }
             highest
-        } else {
-            epochRecords.maxByOrNull { it.candidate.generation.value }
+        } else epochRecords.maxByOrNull { it.candidate.generation.value }
+        if (effectiveFloor != null) when {
+            candidate.generation.value < effectiveFloor.candidate.generation.value ->
+                throw ProfileGenerationRollbackException("profile generation is below the current trust-epoch floor")
+            candidate.generation == effectiveFloor.candidate.generation &&
+                candidate.manifestSha256 != effectiveFloor.candidate.manifestSha256 ->
+                throw ProfileGenerationEquivocationException("equal profile generation has a different signed manifest")
         }
-
-        if (effectiveFloor != null) {
-            when {
-                profile.generation.value < effectiveFloor.candidate.generation.value ->
-                    throw ProfileGenerationRollbackException("profile generation is below the current trust-epoch floor")
-                profile.generation == effectiveFloor.candidate.generation &&
-                    verified.manifestSha256 != effectiveFloor.candidate.manifestSha256 ->
-                    throw ProfileGenerationEquivocationException("equal profile generation has a different signed manifest")
-            }
-        }
-
-        val candidate = PreparedProfileCandidate(
-            profile.id,
-            profile.generation,
-            verified.manifestSha256,
-            verified.signingKeyId,
-            verified.signingKeyFingerprint,
-            verified.trustEpoch,
-        )
         val expectedRecord = PreparedRecord(
-            candidate,
-            profile.dataCompatibility,
-            profile.supportedBackends,
-            profile.artifacts.sortedBy { it.role.ordinal }.map {
-                PreparedArtifact(it.role, it.sha256, it.sizeBytes)
-            },
+            candidate, compatibility, backends, planKind, capabilities, readiness,
+            incoming.sortedBy { artifactOrder(planKind, it.role) }
+                .map { PreparedArtifact(it.role, it.format, it.sha256, it.sizeBytes) },
         )
-        val existing = epochRecords.singleOrNull { it.candidate.generation == profile.generation }
+        val existing = epochRecords.singleOrNull { it.candidate.generation == candidate.generation }
         if (existing != null) {
-            if (existing != expectedRecord) {
-                throw ProfileGenerationEquivocationException("immutable generation record conflicts with the signed manifest")
-            }
+            if (existing != expectedRecord) throw ProfileGenerationEquivocationException(
+                "immutable generation record conflicts with the signed manifest",
+            )
             validatePreparedBlobs(existing)
             revalidateVerifiedTrust(verified)
             publishFloorIfNeeded(profileKey, existing)
             prunePreparedRecordsAndBlobsLocked()
             return existing.toPublic()
         }
-
         if (preparedRecords.size >= MAX_GENERATIONS_PER_PROFILE) {
             throw ProfileRepositoryException("prepared generation retention bound reached")
         }
-        ensureCasCapacity(profile.artifacts)
+        ensureCasCapacity(incoming)
         val newlyPublished = linkedSetOf<Path>()
         try {
-            profile.artifacts.sortedBy { it.role.ordinal }.forEach { ensureBlob(it, newlyPublished) }
+            incoming.sortedBy { artifactOrder(planKind, it.role) }.forEach { ensureBlob(it, newlyPublished) }
             revalidateVerifiedTrust(verified)
             publishPrepared(profileKey, expectedRecord)
             validatePreparedBlobs(expectedRecord)
@@ -551,7 +649,12 @@ class ProfileRepository(
         }
     }
 
-    private fun revalidateVerifiedTrust(verified: VerifiedProfileManifest) {
+    private fun artifactOrder(kind: PreparedPlanKind, role: String): Int = when (kind) {
+        PreparedPlanKind.DIRECT_KERNEL_OVERLAY_V1 -> ArtifactRole.fromWireName(role)!!.ordinal
+        PreparedPlanKind.UEFI_NOCLOUD_V1 -> ProfileV2ArtifactRole.fromWireName(role)!!.ordinal
+    }
+
+    private fun revalidateVerifiedTrust(verified: VerifiedProfileManifestAny) {
         if (verified.trustEpoch != trustPolicy.trustEpoch) {
             throw InvalidProfileSignatureException("profile trust policy changed during preparation")
         }
@@ -562,7 +665,7 @@ class ProfileRepository(
         }
     }
 
-    private fun ensureBlob(artifact: ProfileArtifact, newlyPublished: MutableSet<Path>) {
+    private fun ensureBlob(artifact: IncomingArtifact, newlyPublished: MutableSet<Path>) {
         val destination = blobPath(artifact.sha256)
         if (existsNoFollow(destination)) {
             validateBlob(destination, artifact.sha256, artifact.sizeBytes)
@@ -582,7 +685,7 @@ class ProfileRepository(
                 val deadline = deadlineAfterMillis(fetchTimeoutMillis)
                 val request = ArtifactFetchRequest(
                     artifact.url,
-                    artifact.sizeBytes.value + 1L,
+                    artifact.sizeBytes + 1L,
                     deadline,
                 )
                 val response = try {
@@ -613,9 +716,9 @@ class ProfileRepository(
         }
     }
 
-    private fun ensureCasCapacity(artifacts: List<ProfileArtifact>) {
+    private fun ensureCasCapacity(artifacts: List<IncomingArtifact>) {
         collectGarbageLocked()
-        val uniqueIncoming = linkedMapOf<Sha256Digest, ArtifactSizeBytes>()
+        val uniqueIncoming = linkedMapOf<Sha256Digest, Long>()
         artifacts.forEach { artifact ->
             val previous = uniqueIncoming.putIfAbsent(artifact.sha256, artifact.sizeBytes)
             if (previous != null && previous != artifact.sizeBytes) {
@@ -624,7 +727,7 @@ class ProfileRepository(
         }
         val usage = casUsage()
         val missing = uniqueIncoming.filterKeys { !existsNoFollow(blobPath(it)) }
-        val incomingBytes = missing.values.fold(0L) { total, size -> checkedAdd(total, size.value, "incoming CAS bytes") }
+        val incomingBytes = missing.values.fold(0L) { total, size -> checkedAdd(total, size, "incoming CAS bytes") }
         if (usage.first + missing.size > storeLimits.maxBlobCount) {
             throw ProfileQuotaExceededException("content-addressed blob count quota would be exceeded")
         }
@@ -764,7 +867,7 @@ class ProfileRepository(
 
     private fun validateTransportResponse(
         request: ArtifactFetchRequest,
-        artifact: ProfileArtifact,
+        artifact: IncomingArtifact,
         response: ArtifactFetchResponse,
     ) {
         if (response.statusCode != 200) throw ProfileDownloadException("artifact response status is not 200")
@@ -775,7 +878,7 @@ class ProfileRepository(
             throw ProfileDownloadException("artifact content encoding is forbidden")
         }
         val contentLength = response.contentLengthBytes
-        if (contentLength != null && contentLength != artifact.sizeBytes.value) {
+        if (contentLength != null && contentLength != artifact.sizeBytes) {
             throw ProfileDownloadException("artifact Content-Length does not match the signed size")
         }
         if (System.nanoTime() - request.deadlineNanos >= 0L) {
@@ -786,10 +889,10 @@ class ProfileRepository(
     private fun streamExactArtifact(
         input: InputStream,
         output: FileChannel,
-        artifact: ProfileArtifact,
+        artifact: IncomingArtifact,
         deadlineNanos: Long,
     ) {
-        val expected = artifact.sizeBytes.value
+        val expected = artifact.sizeBytes
         val digest = MessageDigest.getInstance("SHA-256")
         val buffer = ByteArray(STREAM_BUFFER_BYTES)
         var total = 0L
@@ -822,10 +925,10 @@ class ProfileRepository(
         if (actualDigest != artifact.sha256.value) throw ProfileDownloadException("artifact SHA-256 does not match the signed digest")
     }
 
-    private fun validateBlob(path: Path, digest: Sha256Digest, size: ArtifactSizeBytes) {
+    private fun validateBlob(path: Path, digest: Sha256Digest, size: Long) {
         requireRegularFile(path, "content-addressed blob")
         val attributes = attributesNoFollow(path)
-        if (attributes.size() != size.value) {
+        if (attributes.size() != size) {
             throw ProfileRepositoryCorruptException("content-addressed blob size does not match its manifest")
         }
         val actual = MessageDigest.getInstance("SHA-256")
@@ -833,9 +936,9 @@ class ProfileRepository(
             val buffer = ByteBuffer.allocate(STREAM_BUFFER_BYTES)
             var total = 0L
             var zeroReads = 0
-            while (total < size.value + 1L) {
+            while (total < size + 1L) {
                 buffer.clear()
-                buffer.limit(min(buffer.capacity().toLong(), size.value + 1L - total).toInt())
+                buffer.limit(min(buffer.capacity().toLong(), size + 1L - total).toInt())
                 val count = channel.read(buffer)
                 if (count < 0) break
                 if (count == 0) {
@@ -847,10 +950,10 @@ class ProfileRepository(
                 }
                 zeroReads = 0
                 total += count
-                if (total > size.value) throw ProfileRepositoryCorruptException("blob exceeds its manifest size")
+                if (total > size) throw ProfileRepositoryCorruptException("blob exceeds its manifest size")
                 actual.update(buffer.array(), 0, count)
             }
-            if (total != size.value) throw ProfileRepositoryCorruptException("blob is shorter than its manifest size")
+            if (total != size) throw ProfileRepositoryCorruptException("blob is shorter than its manifest size")
         }
         if (actual.digest().toLowerHex() != digest.value) {
             throw ProfileRepositoryCorruptException("content-addressed blob digest mismatch")
@@ -927,10 +1030,58 @@ class ProfileRepository(
 
     private fun validatePreparedBlobs(record: PreparedRecord) {
         record.artifacts.forEach { validateBlob(blobPath(it.sha256), it.sha256, it.sizeBytes) }
+        if (record.planKind == PreparedPlanKind.UEFI_NOCLOUD_V1 && readActivationStateLocked()?.active == record.candidate) {
+            requireCloudLineageCompatible(record)
+            requireMutableCloudFiles()
+        }
     }
 
-    private fun captureStorageIdentity(requireStableKeys: Boolean): StorageIdentity {
-        val parent = fixedStorage.parent ?: throw ProfileActivationException("fixed storage file has no parent")
+    private fun storageContractsCompatible(left: PreparedRecord, right: PreparedRecord): Boolean =
+        left.planKind == right.planKind && left.dataCompatibility == right.dataCompatibility &&
+            (left.planKind != PreparedPlanKind.UEFI_NOCLOUD_V1 || cloudLineageFor(left) == cloudLineageFor(right))
+
+    private fun requirePreserveCompatible(left: PreparedRecord, right: PreparedRecord) {
+        if (!storageContractsCompatible(left, right)) {
+            throw ProfileActivationException("PRESERVE_DATA requires an exact compatible storage lineage")
+        }
+        if (right.planKind == PreparedPlanKind.UEFI_NOCLOUD_V1) requireCloudLineageCompatible(right)
+    }
+
+    private fun cloudLineageFor(record: PreparedRecord): CloudLineage {
+        if (record.planKind != PreparedPlanKind.UEFI_NOCLOUD_V1) {
+            throw ProfileActivationException("profile does not use the UEFI cloud storage contract")
+        }
+        fun digest(role: ProfileV2ArtifactRole) = record.artifacts.single { it.role == role.wireName }.sha256
+        return CloudLineage(
+            record.dataCompatibility,
+            digest(ProfileV2ArtifactRole.CLOUD_DISK),
+            digest(ProfileV2ArtifactRole.UEFI_VARS_TEMPLATE),
+        )
+    }
+
+    private fun requireCloudLineageCompatible(record: PreparedRecord) {
+        val actual = readCloudLineageLocked()
+            ?: throw ProfileActivationException("active UEFI cloud mutable lineage is missing")
+        if (actual != cloudLineageFor(record)) {
+            throw ProfileActivationException("active UEFI cloud mutable lineage is incompatible")
+        }
+    }
+
+    private fun requireMutableCloudFiles() {
+        requireRegularFile(fixedStorage, "cloud root disk")
+        requireRegularFile(fixedVars, "writable UEFI vars")
+        val storageSize = attributesNoFollow(fixedStorage).size()
+        val varsSize = attributesNoFollow(fixedVars).size()
+        if (storageSize !in 1..ProfileV2Limits.MAX_CLOUD_DISK_BYTES ||
+            varsSize !in 1..ProfileV2Limits.MAX_UEFI_VARS_TEMPLATE_BYTES
+        ) throw ProfileActivationException("active UEFI cloud mutable files are outside their bounds")
+    }
+
+    private fun captureStorageIdentity(requireStableKeys: Boolean): StorageIdentity =
+        captureFileIdentity(fixedStorage, "fixed storage", requireStableKeys)
+
+    private fun captureFileIdentity(path: Path, label: String, requireStableKeys: Boolean): StorageIdentity {
+        val parent = path.parent ?: throw ProfileActivationException("$label file has no parent")
         requireDirectory(parent)
         if (parent.toRealPath() != parent) {
             throw ProfileActivationException("fixed storage parent contains a symbolic path")
@@ -941,11 +1092,11 @@ class ProfileRepository(
             throw ProfileActivationException("fixed storage parent identity is unavailable")
         }
         val parentCreationTime = parentAttributes.creationTime().toString()
-        if (!existsNoFollow(fixedStorage)) {
+        if (!existsNoFollow(path)) {
             return StorageIdentity(parentKey.orEmpty(), parentCreationTime, false, null, null, null, null)
         }
-        requireRegularFile(fixedStorage, "fixed storage file")
-        val attributes = attributesNoFollow(fixedStorage)
+        requireRegularFile(path, label)
+        val attributes = attributesNoFollow(path)
         val fileKey = attributes.fileKey()?.toString()
         if (requireStableKeys && fileKey.isNullOrBlank()) {
             throw ProfileActivationException("fixed storage file identity is unavailable")
@@ -961,56 +1112,126 @@ class ProfileRepository(
         )
     }
 
-    private fun requireStorageIdentity(expected: StorageIdentity, allowCompletedDeletion: Boolean) {
-        val actual = captureStorageIdentity(requireStableKeys = true)
+    private fun requireStorageIdentity(expected: StorageIdentity, allowCompletedDeletion: Boolean) =
+        requireFileIdentity(fixedStorage, storageTombstone, expected, "fixed storage", allowCompletedDeletion)
+
+    private fun requireFileIdentity(
+        path: Path,
+        tombstone: Path,
+        expected: StorageIdentity,
+        label: String,
+        allowCompletedDeletion: Boolean,
+    ) {
+        val actual = captureFileIdentity(path, label, requireStableKeys = true)
         if (actual.parentFileKey != expected.parentFileKey ||
             actual.parentCreationTime != expected.parentCreationTime
         ) {
             throw ProfileActivationException("fixed storage parent was replaced")
         }
         if (actual == expected) {
-            if (existsNoFollow(storageTombstone)) {
-                throw ProfileActivationException("fixed storage deletion tombstone is unexpectedly occupied")
+            if (existsNoFollow(tombstone)) {
+                throw ProfileActivationException("$label deletion tombstone is unexpectedly occupied")
             }
             return
         }
-        if (expected.existed && !actual.existed && existsNoFollow(storageTombstone)) {
-            requireRegularFile(storageTombstone, "fixed storage deletion tombstone")
-            val tombstoneAttributes = attributesNoFollow(storageTombstone)
+        if (expected.existed && !actual.existed && existsNoFollow(tombstone)) {
+            requireRegularFile(tombstone, "$label deletion tombstone")
+            val tombstoneAttributes = attributesNoFollow(tombstone)
             if (tombstoneAttributes.matches(expected)) return
             throw ProfileActivationException("fixed storage deletion tombstone has a different identity")
         }
-        if (expected.existed && !actual.existed && allowCompletedDeletion && !existsNoFollow(storageTombstone)) return
-        if (!expected.existed && !actual.existed && !existsNoFollow(storageTombstone)) return
+        if (expected.existed && !actual.existed && allowCompletedDeletion && !existsNoFollow(tombstone)) return
+        if (!expected.existed && !actual.existed && !existsNoFollow(tombstone)) return
         throw ProfileActivationException("fixed storage file was replaced after confirmation")
     }
 
-    private fun deleteFixedStorage(expected: StorageIdentity) {
-        requireStorageIdentity(expected, allowCompletedDeletion = true)
-        if (existsNoFollow(fixedStorage)) {
-            Files.move(fixedStorage, storageTombstone, StandardCopyOption.ATOMIC_MOVE)
-            forceDirectory(fixedStorage.parent)
-            val movedIdentityMatches = try {
-                requireRegularFile(storageTombstone, "fixed storage deletion tombstone")
-                attributesNoFollow(storageTombstone).matches(expected)
-            } catch (failure: Throwable) {
-                restoreStorageTombstone(failure)
-                throw failure
-            }
-            if (!movedIdentityMatches) {
-                val failure = ProfileActivationException("fixed storage was replaced during deletion")
-                restoreStorageTombstone(failure)
-                throw failure
+    private fun deleteFixedStorage(expected: StorageIdentity) =
+        deleteFixedFile(fixedStorage, storageTombstone, expected, "fixed storage")
+
+    private fun deleteFixedFile(path: Path, tombstone: Path, expected: StorageIdentity, label: String) {
+        requireFileIdentity(path, tombstone, expected, label, allowCompletedDeletion = true)
+        if (existsNoFollow(path)) {
+            Files.move(path, tombstone, StandardCopyOption.ATOMIC_MOVE)
+            forceDirectory(path.parent)
+            requireRegularFile(tombstone, "$label deletion tombstone")
+            if (!attributesNoFollow(tombstone).matches(expected)) {
+                throw ProfileActivationException("$label was replaced during deletion")
             }
         }
-        if (existsNoFollow(storageTombstone)) {
-            requireRegularFile(storageTombstone, "fixed storage deletion tombstone")
-            if (!attributesNoFollow(storageTombstone).matches(expected)) {
-                throw ProfileActivationException("fixed storage deletion tombstone was replaced")
+        if (existsNoFollow(tombstone)) {
+            requireRegularFile(tombstone, "$label deletion tombstone")
+            if (!attributesNoFollow(tombstone).matches(expected)) {
+                throw ProfileActivationException("$label deletion tombstone was replaced")
             }
-            Files.delete(storageTombstone)
-            forceDirectory(fixedStorage.parent)
+            Files.delete(tombstone)
+            forceDirectory(path.parent)
         }
+    }
+
+    private fun initializeCloudMutableFiles(record: PreparedRecord, pending: PendingActivation) {
+        val varsIdentity = pending.varsIdentity
+            ?: throw ProfileRepositoryCorruptException("cloud activation has no fixed UEFI vars identity")
+        val diskArtifact = record.artifacts.single { it.role == ProfileV2ArtifactRole.CLOUD_DISK.wireName }
+        val varsArtifact = record.artifacts.single { it.role == ProfileV2ArtifactRole.UEFI_VARS_TEMPLATE.wireName }
+        initializeFixedCopy(
+            fixedStorage, storageTombstone, cloudStorageTemporary, pending.storageIdentity,
+            diskArtifact, "cloud root disk",
+        )
+        faultInjector.check(ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION)
+        initializeFixedCopy(
+            fixedVars, varsTombstone, cloudVarsTemporary, varsIdentity,
+            varsArtifact, "writable UEFI vars",
+        )
+        faultInjector.check(ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION)
+        writeReplaceRecord(cloudLineagePath, encodeCloudLineage(cloudLineageFor(record)))
+        faultInjector.check(ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION)
+    }
+
+    private fun initializeFixedCopy(
+        target: Path,
+        tombstone: Path,
+        temporaryPath: Path,
+        expected: StorageIdentity,
+        sourceArtifact: PreparedArtifact,
+        label: String,
+    ) {
+        if (existsNoFollow(target) && !attributesNoFollow(target).matches(expected)) {
+            validateBlob(target, sourceArtifact.sha256, sourceArtifact.sizeBytes)
+            return
+        }
+        deleteFixedFile(target, tombstone, expected, label)
+        if (existsNoFollow(temporaryPath)) {
+            requireRegularFile(temporaryPath, "$label temporary file")
+            Files.delete(temporaryPath)
+            forceDirectory(temporaryPath.parent)
+        }
+        val source = blobPath(sourceArtifact.sha256)
+        validateBlob(source, sourceArtifact.sha256, sourceArtifact.sizeBytes)
+        FileChannel.open(source, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS).use { input ->
+            FileChannel.open(
+                temporaryPath,
+                StandardOpenOption.CREATE_NEW,
+                StandardOpenOption.WRITE,
+                LinkOption.NOFOLLOW_LINKS,
+            ).use { output ->
+                var position = 0L
+                var zeroProgress = 0
+                while (position < sourceArtifact.sizeBytes) {
+                    val count = input.transferTo(position, sourceArtifact.sizeBytes - position, output)
+                    if (count == 0L) {
+                        zeroProgress++
+                        if (zeroProgress > MAX_ZERO_READS) throw ProfileActivationException("$label copy made no progress")
+                    } else {
+                        zeroProgress = 0
+                        position += count
+                    }
+                }
+                output.force(true)
+            }
+        }
+        Files.move(temporaryPath, target, StandardCopyOption.ATOMIC_MOVE)
+        forceDirectory(target.parent)
+        validateBlob(target, sourceArtifact.sha256, sourceArtifact.sizeBytes)
     }
 
     private fun BasicFileAttributes.matches(expected: StorageIdentity): Boolean =
@@ -1038,30 +1259,42 @@ class ProfileRepository(
         val activation = readActivationStateLocked()
         validatePendingSequence(pending, activation)
         if (activation == pending.desired) {
+            val activeRecord = requireUsableCandidateLocked(activation.active, false, false)
+            if (activeRecord.planKind == PreparedPlanKind.UEFI_NOCLOUD_V1) {
+                requireCloudLineageCompatible(activeRecord)
+                requireMutableCloudFiles()
+            }
             clearPendingActivation()
             reconcileActivationTrustLocked()
             prunePreparedRecordsAndBlobsLocked()
             return PendingRecoveryResult.COMPLETED
         }
 
-        try {
-            val desiredRecord = requireUsableCandidateLocked(
+        val desiredRecord = try {
+            requireUsableCandidateLocked(
                 pending.desired.active,
                 requireCurrentFloor = activation?.active != pending.desired.active,
                 requireCurrentTrust = true,
-            )
-            pending.desired.rollback?.let {
-                requireUsableCandidateLocked(it, requireCurrentFloor = false, requireCurrentTrust = false)
+            ).also { record ->
+                pending.desired.rollback?.let {
+                    requireUsableCandidateLocked(it, requireCurrentFloor = false, requireCurrentTrust = false)
+                }
+                revalidateTrust(record)
             }
-            revalidateTrust(desiredRecord)
         } catch (_: ProfileRepositoryException) {
             abortPendingActivationLocked(pending)
             return PendingRecoveryResult.ABORTED
         }
 
-        requireStorageIdentity(pending.storageIdentity, allowCompletedDeletion = true)
-        deleteFixedStorage(pending.storageIdentity)
-        faultInjector.check(ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION)
+        if (desiredRecord.planKind == PreparedPlanKind.UEFI_NOCLOUD_V1) {
+            initializeCloudMutableFiles(desiredRecord, pending)
+        } else {
+            requireStorageIdentity(pending.storageIdentity, allowCompletedDeletion = true)
+            deleteFixedStorage(pending.storageIdentity)
+            pending.varsIdentity?.let { deleteFixedFile(fixedVars, varsTombstone, it, "fixed UEFI vars") }
+            clearCloudLineageLocked()
+            faultInjector.check(ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION)
+        }
         writeReplaceRecord(activationPath(), encodeActivation(pending.desired))
         clearPendingActivation()
         reconcileActivationTrustLocked()
@@ -1122,7 +1355,8 @@ class ProfileRepository(
             pending.desired.rollback == null
         } else {
             (pending.desired.active == activation.active && pending.desired.rollback == activation.rollback) ||
-                (pending.desired.active != activation.active && pending.desired.rollback == activation.active)
+                (pending.desired.active != activation.active &&
+                    (pending.desired.rollback == activation.active || pending.desired.rollback == null))
         }
         if (!sequenceFollows || !candidatesFollow) {
             throw ProfileRepositoryCorruptException("pending activation does not follow current state")
@@ -1240,7 +1474,16 @@ class ProfileRepository(
             val record = decodePrepared(readBoundedRecord(path), key, path.fileName.toString())
             if (record.candidate != candidate) throw ProfileRepositoryCorruptException("activation candidate conflicts with local state")
         }
-        if (pendingActivation == null) reconcileActivationTrustLocked()
+        if (pendingActivation == null) {
+            reconcileActivationTrustLocked()
+            readActivationStateLocked()?.let { active ->
+                val record = requireUsableCandidateLocked(active.active, false, false)
+                if (record.planKind == PreparedPlanKind.UEFI_NOCLOUD_V1) {
+                    requireCloudLineageCompatible(record)
+                    requireMutableCloudFiles()
+                }
+            }
+        }
         prunePreparedRecordsAndBlobsLocked()
     }
 
@@ -1308,7 +1551,7 @@ class ProfileRepository(
                 val name = entry.fileName.toString()
                 if (name != ACTIVATION_FILE && name != PENDING_ACTIVATION_FILE &&
                     name != ACTIVATION_FAILURE_FILE && name != TRUST_QUARANTINE_FILE &&
-                    name != DOWNLOADED_LINEAGE_FILE && !FLOOR_NAME.matches(name)
+                    name != CLOUD_LINEAGE_FILE && name != DOWNLOADED_LINEAGE_FILE && !FLOOR_NAME.matches(name)
                 ) {
                     throw ProfileRepositoryCorruptException("unknown repository state entry")
                 }
@@ -1484,59 +1727,146 @@ class ProfileRepository(
         }
     }
 
-    private fun encodePrepared(record: PreparedRecord): ByteArray = encodeRecord(PREPARED_MAGIC) { output ->
+    private fun encodePrepared(record: PreparedRecord): ByteArray = when (record.planKind) {
+        PreparedPlanKind.DIRECT_KERNEL_OVERLAY_V1 -> encodeRecord(PREPARED_MAGIC) { output ->
+            writePreparedHeader(output, record)
+            output.writeInt(record.artifacts.size)
+            record.artifacts.sortedBy { ArtifactRole.fromWireName(it.role)!!.ordinal }.forEach { artifact ->
+                output.writeUTF(artifact.role)
+                output.writeUTF(artifact.sha256.value)
+                output.writeLong(artifact.sizeBytes)
+            }
+        }
+        PreparedPlanKind.UEFI_NOCLOUD_V1 -> encodeRecord(PREPARED_V2_MAGIC) { output ->
+            writePreparedHeader(output, record)
+            output.writeUTF(VmProfileV2.BOOT_CONTRACT)
+            output.writeUTF(VmProfileV2.STORAGE_CONTRACT)
+            output.writeUTF(VmProfileV2.HEALTH_CONTRACT)
+            output.writeUTF(record.readinessMarker!!)
+            output.writeInt(record.capabilities.size)
+            record.capabilities.sortedBy { it.ordinal }.forEach { output.writeUTF(it.wireName) }
+            output.writeInt(record.artifacts.size)
+            record.artifacts.sortedBy { ProfileV2ArtifactRole.fromWireName(it.role)!!.ordinal }.forEach { artifact ->
+                output.writeUTF(artifact.role)
+                output.writeUTF(artifact.format!!)
+                output.writeUTF(artifact.sha256.value)
+                output.writeLong(artifact.sizeBytes)
+            }
+        }
+    }
+
+    private fun writePreparedHeader(output: DataOutputStream, record: PreparedRecord) {
         writeCandidate(output, record.candidate)
         output.writeUTF(record.dataCompatibility.value)
         output.writeInt(record.supportedBackends.size)
         record.supportedBackends.sortedBy { it.ordinal }.forEach { output.writeUTF(it.wireName) }
-        output.writeInt(record.artifacts.size)
-        record.artifacts.sortedBy { it.role.ordinal }.forEach { artifact ->
-            output.writeUTF(artifact.role.wireName)
-            output.writeUTF(artifact.sha256.value)
-            output.writeLong(artifact.sizeBytes.value)
-        }
     }
 
     private fun decodePrepared(
         bytes: ByteArray,
         expectedProfileKey: String,
         expectedFileName: String,
-    ): PreparedRecord =
-        decodeRecord(bytes, PREPARED_MAGIC) { input ->
-            val candidate = readCandidate(input)
-            val compatibility = checkedRecordValue { DataCompatibilityId(input.readUTF()) }
-            val backendCount = input.readInt()
-            if (backendCount !in 1..ProfileBackend.entries.size) {
-                throw ProfileRepositoryCorruptException("prepared backend count is invalid")
+    ): PreparedRecord {
+        if (bytes.size < 4) throw ProfileRepositoryCorruptException("prepared record is truncated")
+        val magic = ByteBuffer.wrap(bytes, 0, 4).int
+        val record = when (magic) {
+            PREPARED_MAGIC -> decodeRecord(bytes, PREPARED_MAGIC) { input ->
+                val header = readPreparedHeader(input)
+                val count = input.readInt()
+                if (count != ArtifactRole.entries.size) throw ProfileRepositoryCorruptException("prepared artifact count is invalid")
+                val artifacts = (0 until count).map {
+                    val role = input.readUTF()
+                    if (ArtifactRole.fromWireName(role) == null) throw ProfileRepositoryCorruptException("prepared artifact role is invalid")
+                    PreparedArtifact(role, null, checkedRecordValue { Sha256Digest(input.readUTF()) }, checkedArtifactSize(input.readLong()))
+                }
+                if (artifacts.map { it.role }.toSet() != ArtifactRole.entries.map { it.wireName }.toSet()) {
+                    throw ProfileRepositoryCorruptException("prepared artifact roles are not closed")
+                }
+                PreparedRecord(header.first, header.second, header.third, PreparedPlanKind.DIRECT_KERNEL_OVERLAY_V1, artifacts = artifacts)
             }
-            val supportedBackends = (0 until backendCount).map {
-                ProfileBackend.fromWireName(input.readUTF())
-                    ?: throw ProfileRepositoryCorruptException("prepared backend is invalid")
-            }.toSet()
-            if (supportedBackends.size != backendCount) {
-                throw ProfileRepositoryCorruptException("prepared backends are duplicated")
+            PREPARED_V2_MAGIC -> decodeRecord(bytes, PREPARED_V2_MAGIC) { input ->
+                val header = readPreparedHeader(input)
+                if (input.readUTF() != VmProfileV2.BOOT_CONTRACT ||
+                    input.readUTF() != VmProfileV2.STORAGE_CONTRACT ||
+                    input.readUTF() != VmProfileV2.HEALTH_CONTRACT
+                ) throw ProfileRepositoryCorruptException("prepared cloud contracts are invalid")
+                val readiness = input.readUTF()
+                if (readiness != ProfileV2Limits.READINESS_MARKER) throw ProfileRepositoryCorruptException("prepared cloud readiness is invalid")
+                val capabilityCount = input.readInt()
+                if (capabilityCount !in 0..ProfileV2GuestIntegration.entries.size) throw ProfileRepositoryCorruptException("prepared capability count is invalid")
+                val capabilities = (0 until capabilityCount).map {
+                    ProfileV2GuestIntegration.fromWireName(input.readUTF())
+                        ?: throw ProfileRepositoryCorruptException("prepared capability is invalid")
+                }.toSet()
+                if (capabilities.size != capabilityCount) throw ProfileRepositoryCorruptException("prepared capabilities are duplicated")
+                val count = input.readInt()
+                if (count != ProfileV2ArtifactRole.entries.size) throw ProfileRepositoryCorruptException("prepared cloud artifact count is invalid")
+                val artifacts = (0 until count).map {
+                    val role = ProfileV2ArtifactRole.fromWireName(input.readUTF())
+                        ?: throw ProfileRepositoryCorruptException("prepared cloud artifact role is invalid")
+                    val format = ProfileV2ArtifactFormat.fromWireName(input.readUTF())
+                        ?: throw ProfileRepositoryCorruptException("prepared cloud artifact format is invalid")
+                    if (format != role.requiredFormat) throw ProfileRepositoryCorruptException("prepared cloud artifact role and format conflict")
+                    val digest = checkedRecordValue { Sha256Digest(input.readUTF()) }
+                    val size = checkedArtifactSize(input.readLong())
+                    if (size > role.maxSizeBytes) throw ProfileRepositoryCorruptException("prepared cloud artifact exceeds role bound")
+                    PreparedArtifact(role.wireName, format.wireName, digest, size)
+                }
+                if (artifacts.map { it.role }.toSet() != ProfileV2ArtifactRole.entries.map { it.wireName }.toSet()) {
+                    throw ProfileRepositoryCorruptException("prepared cloud artifact roles are not closed")
+                }
+                PreparedRecord(header.first, header.second, header.third, PreparedPlanKind.UEFI_NOCLOUD_V1, capabilities, readiness, artifacts)
             }
-            val count = input.readInt()
-            if (count != ArtifactRole.entries.size) throw ProfileRepositoryCorruptException("prepared artifact count is invalid")
-            val artifacts = (0 until count).map {
-                val role = ArtifactRole.fromWireName(input.readUTF())
-                    ?: throw ProfileRepositoryCorruptException("prepared artifact role is invalid")
-                PreparedArtifact(
-                    role,
-                    checkedRecordValue { Sha256Digest(input.readUTF()) },
-                    checkedRecordValue { ArtifactSizeBytes(input.readLong()) },
-                )
-            }
-            if (artifacts.map { it.role }.toSet() != ArtifactRole.entries.toSet()) {
-                throw ProfileRepositoryCorruptException("prepared artifact roles are not closed")
-            }
-            if (profileKey(candidate.profileId) != expectedProfileKey ||
-                expectedFileName != "${candidate.trustEpoch.value}-${candidate.generation.value}$PREPARED_SUFFIX"
-            ) {
-                throw ProfileRepositoryCorruptException("prepared record is in the wrong fixed candidate path")
-            }
-            PreparedRecord(candidate, compatibility, supportedBackends, artifacts)
+            else -> throw ProfileRepositoryCorruptException("prepared record type is invalid")
         }
+        val candidate = record.candidate
+        if (profileKey(candidate.profileId) != expectedProfileKey ||
+            expectedFileName != "${candidate.trustEpoch.value}-${candidate.generation.value}$PREPARED_SUFFIX"
+        ) throw ProfileRepositoryCorruptException("prepared record is in the wrong fixed candidate path")
+        return record
+    }
+
+    private fun readPreparedHeader(input: DataInputStream): Triple<PreparedProfileCandidate, DataCompatibilityId, Set<ProfileBackend>> {
+        val candidate = readCandidate(input)
+        val compatibility = checkedRecordValue { DataCompatibilityId(input.readUTF()) }
+        val backendCount = input.readInt()
+        if (backendCount !in 1..ProfileBackend.entries.size) throw ProfileRepositoryCorruptException("prepared backend count is invalid")
+        val backends = (0 until backendCount).map {
+            ProfileBackend.fromWireName(input.readUTF()) ?: throw ProfileRepositoryCorruptException("prepared backend is invalid")
+        }.toSet()
+        if (backends.size != backendCount) throw ProfileRepositoryCorruptException("prepared backends are duplicated")
+        return Triple(candidate, compatibility, backends)
+    }
+
+    private fun checkedArtifactSize(value: Long): Long {
+        if (value !in 1..ProfileLimits.MAX_ARTIFACT_BYTES) throw ProfileRepositoryCorruptException("prepared artifact size is invalid")
+        return value
+    }
+
+    private fun encodeCloudLineage(lineage: CloudLineage): ByteArray = encodeRecord(CLOUD_LINEAGE_MAGIC) { output ->
+        output.writeUTF(lineage.dataCompatibility.value)
+        output.writeUTF(lineage.cloudDiskSha256.value)
+        output.writeUTF(lineage.varsTemplateSha256.value)
+    }
+
+    private fun decodeCloudLineage(bytes: ByteArray): CloudLineage = decodeRecord(bytes, CLOUD_LINEAGE_MAGIC) { input ->
+        CloudLineage(
+            checkedRecordValue { DataCompatibilityId(input.readUTF()) },
+            checkedRecordValue { Sha256Digest(input.readUTF()) },
+            checkedRecordValue { Sha256Digest(input.readUTF()) },
+        )
+    }
+
+    private fun readCloudLineageLocked(): CloudLineage? =
+        if (existsNoFollow(cloudLineagePath)) decodeCloudLineage(readBoundedRecord(cloudLineagePath)) else null
+
+    private fun clearCloudLineageLocked() {
+        if (existsNoFollow(cloudLineagePath)) {
+            requireRegularFile(cloudLineagePath, "cloud lineage record")
+            Files.delete(cloudLineagePath)
+            forceDirectory(state)
+        }
+    }
 
     private fun encodeFloor(record: FloorRecord): ByteArray = encodeRecord(FLOOR_MAGIC) { output ->
         writeCandidate(output, record.candidate)
@@ -1558,18 +1888,23 @@ class ProfileRepository(
     private fun decodeActivation(bytes: ByteArray): ActivationState = decodeRecord(bytes, ACTIVATION_MAGIC, ::readActivation)
 
     private fun encodePendingActivation(record: PendingActivation): ByteArray =
-        encodeRecord(PENDING_ACTIVATION_MAGIC) { output ->
+        encodeRecord(PENDING_ACTIVATION_V2_MAGIC) { output ->
             writeActivation(output, record.desired)
-            output.writeUTF(record.storageIdentity.parentFileKey)
-            output.writeUTF(record.storageIdentity.parentCreationTime)
-            output.writeBoolean(record.storageIdentity.existed)
-            if (record.storageIdentity.existed) {
-                output.writeUTF(record.storageIdentity.fileKey!!)
-                output.writeLong(record.storageIdentity.sizeBytes!!)
-                output.writeUTF(record.storageIdentity.creationTime!!)
-                output.writeUTF(record.storageIdentity.lastModifiedTime!!)
-            }
+            writeStorageIdentity(output, record.storageIdentity)
+            writeStorageIdentity(output, record.varsIdentity!!)
         }
+
+    private fun writeStorageIdentity(output: DataOutputStream, identity: StorageIdentity) {
+        output.writeUTF(identity.parentFileKey)
+        output.writeUTF(identity.parentCreationTime)
+        output.writeBoolean(identity.existed)
+        if (identity.existed) {
+            output.writeUTF(identity.fileKey!!)
+            output.writeLong(identity.sizeBytes!!)
+            output.writeUTF(identity.creationTime!!)
+            output.writeUTF(identity.lastModifiedTime!!)
+        }
+    }
 
     private fun encodeActivationFailure(record: ActivationFailureState): ByteArray =
         encodeRecord(ACTIVATION_FAILURE_MAGIC) { output ->
@@ -1629,31 +1964,31 @@ class ProfileRepository(
             TrustQuarantineState(sequence, candidates)
         }
 
-    private fun decodePendingActivation(bytes: ByteArray): PendingActivation =
-        decodeRecord(bytes, PENDING_ACTIVATION_MAGIC) { input ->
-            val desired = readActivation(input)
-            val parentKey = checkedFileKey(input.readUTF())
-            val parentCreationTime = checkedFileTimestamp(input.readUTF())
-            val existed = input.readBoolean()
-            val fileKey = if (existed) checkedFileKey(input.readUTF()) else null
-            val sizeBytes = if (existed) input.readLong().also {
-                if (it < 0) throw ProfileRepositoryCorruptException("stored file size is invalid")
-            } else null
-            val creationTime = if (existed) checkedFileTimestamp(input.readUTF()) else null
-            val lastModifiedTime = if (existed) checkedFileTimestamp(input.readUTF()) else null
-            PendingActivation(
-                desired,
-                StorageIdentity(
-                    parentKey,
-                    parentCreationTime,
-                    existed,
-                    fileKey,
-                    sizeBytes,
-                    creationTime,
-                    lastModifiedTime,
-                ),
-            )
+    private fun decodePendingActivation(bytes: ByteArray): PendingActivation {
+        if (bytes.size < 4) throw ProfileRepositoryCorruptException("pending activation is truncated")
+        return when (ByteBuffer.wrap(bytes, 0, 4).int) {
+            PENDING_ACTIVATION_MAGIC -> decodeRecord(bytes, PENDING_ACTIVATION_MAGIC) { input ->
+                PendingActivation(readActivation(input), readStorageIdentity(input), null)
+            }
+            PENDING_ACTIVATION_V2_MAGIC -> decodeRecord(bytes, PENDING_ACTIVATION_V2_MAGIC) { input ->
+                PendingActivation(readActivation(input), readStorageIdentity(input), readStorageIdentity(input))
+            }
+            else -> throw ProfileRepositoryCorruptException("pending activation type is invalid")
         }
+    }
+
+    private fun readStorageIdentity(input: DataInputStream): StorageIdentity {
+        val parentKey = checkedFileKey(input.readUTF())
+        val parentCreationTime = checkedFileTimestamp(input.readUTF())
+        val existed = input.readBoolean()
+        val fileKey = if (existed) checkedFileKey(input.readUTF()) else null
+        val sizeBytes = if (existed) input.readLong().also {
+            if (it < 0) throw ProfileRepositoryCorruptException("stored file size is invalid")
+        } else null
+        val creationTime = if (existed) checkedFileTimestamp(input.readUTF()) else null
+        val lastModifiedTime = if (existed) checkedFileTimestamp(input.readUTF()) else null
+        return StorageIdentity(parentKey, parentCreationTime, existed, fileKey, sizeBytes, creationTime, lastModifiedTime)
+    }
 
     private fun writeActivation(output: DataOutputStream, record: ActivationState) {
         output.writeLong(record.activationSequence)
@@ -1744,13 +2079,25 @@ class ProfileRepository(
         throw ProfileRepositoryCorruptException("repository record contains an invalid domain value", failure)
     }
 
-    private fun PreparedRecord.toPublic(): PreparedProfile = PreparedProfile(
-        candidate,
-        dataCompatibility,
-        supportedBackends,
-        artifacts.associate { it.role to blobPath(it.sha256).toFile() },
-        artifacts.associate { it.role to it.sha256 },
-    )
+    private fun PreparedRecord.toPublic(): PreparedProfile {
+        val plan = when (planKind) {
+            PreparedPlanKind.DIRECT_KERNEL_OVERLAY_V1 -> PreparedProfilePlan.DirectKernelOverlayV1(
+                supportedBackends,
+                artifacts.associate { ArtifactRole.fromWireName(it.role)!! to blobPath(it.sha256).toFile() },
+                artifacts.associate { ArtifactRole.fromWireName(it.role)!! to it.sha256 },
+            )
+            PreparedPlanKind.UEFI_NOCLOUD_V1 -> PreparedProfilePlan.UefiNoCloudV1(
+                supportedBackends,
+                artifacts.associate { ProfileV2ArtifactRole.fromWireName(it.role)!! to blobPath(it.sha256).toFile() },
+                artifacts.associate { ProfileV2ArtifactRole.fromWireName(it.role)!! to it.sha256 },
+                ProfileV2Capabilities(capabilities),
+                readinessMarker!!,
+                fixedStorage.toFile(),
+                fixedVars.toFile(),
+            )
+        }
+        return PreparedProfile(candidate, dataCompatibility, plan)
+    }
 
     private fun profileKey(profileId: ProfileId): String = MessageDigest.getInstance("SHA-256")
         .digest(profileId.value.toByteArray(Charsets.UTF_8)).toLowerHex()
@@ -1911,17 +2258,31 @@ class ProfileRepository(
         return current + 1L
     }
 
+    private enum class PreparedPlanKind { DIRECT_KERNEL_OVERLAY_V1, UEFI_NOCLOUD_V1 }
+
     private data class PreparedArtifact(
-        val role: ArtifactRole,
+        val role: String,
+        val format: String?,
         val sha256: Sha256Digest,
-        val sizeBytes: ArtifactSizeBytes,
+        val sizeBytes: Long,
     )
 
     private data class PreparedRecord(
         val candidate: PreparedProfileCandidate,
         val dataCompatibility: DataCompatibilityId,
         val supportedBackends: Set<ProfileBackend>,
+        val planKind: PreparedPlanKind,
+        val capabilities: Set<ProfileV2GuestIntegration> = emptySet(),
+        val readinessMarker: String? = null,
         val artifacts: List<PreparedArtifact>,
+    )
+
+    private data class IncomingArtifact(
+        val role: String,
+        val format: String?,
+        val url: ArtifactDownloadUrl,
+        val sha256: Sha256Digest,
+        val sizeBytes: Long,
     )
 
     private data class FloorRecord(val candidate: PreparedProfileCandidate)
@@ -1929,6 +2290,13 @@ class ProfileRepository(
     private data class PendingActivation(
         val desired: ActivationState,
         val storageIdentity: StorageIdentity,
+        val varsIdentity: StorageIdentity?,
+    )
+
+    private data class CloudLineage(
+        val dataCompatibility: DataCompatibilityId,
+        val cloudDiskSha256: Sha256Digest,
+        val varsTemplateSha256: Sha256Digest,
     )
 
     private enum class PendingRecoveryResult {
@@ -1948,6 +2316,7 @@ class ProfileRepository(
         const val PENDING_ACTIVATION_FILE = "activation.pending"
         const val ACTIVATION_FAILURE_FILE = "activation.failure"
         const val TRUST_QUARANTINE_FILE = "trust.quarantine"
+        const val CLOUD_LINEAGE_FILE = "cloud-lineage.record"
         const val DOWNLOADED_LINEAGE_FILE = "downloaded-lineage.claimed"
         val DOWNLOADED_LINEAGE_BYTES = "podroid-downloaded-profile-lineage-v1\n".toByteArray(Charsets.US_ASCII)
         const val BLOB_SUFFIX = ".blob"
@@ -1956,9 +2325,12 @@ class ProfileRepository(
         const val RECORD_VERSION = 3
         const val RECORD_CHECKSUM_BYTES = 32
         const val PREPARED_MAGIC = 0x50525044
+        const val PREPARED_V2_MAGIC = 0x50525632
+        const val CLOUD_LINEAGE_MAGIC = 0x5052434c
         const val FLOOR_MAGIC = 0x5052464c
         const val ACTIVATION_MAGIC = 0x50524143
         const val PENDING_ACTIVATION_MAGIC = 0x5052504e
+        const val PENDING_ACTIVATION_V2_MAGIC = 0x50524e32
         const val ACTIVATION_FAILURE_MAGIC = 0x50524641
         const val TRUST_QUARANTINE_MAGIC = 0x50525154
         const val MAX_RECORD_BYTES = 16 * 1024
@@ -1967,7 +2339,7 @@ class ProfileRepository(
         const val MAX_ZERO_READS = 16
         const val MAX_PROFILES = 32
         const val MAX_GENERATIONS_PER_PROFILE = 64
-        const val MAX_STATE_RECORDS = MAX_PROFILES + 5
+        const val MAX_STATE_RECORDS = MAX_PROFILES + 6
         const val MAX_FILE_KEY_CHARS = 512
         const val MAX_FILE_TIMESTAMP_CHARS = 64
         const val DEFAULT_FETCH_TIMEOUT_MILLIS = 5L * 60 * 1000

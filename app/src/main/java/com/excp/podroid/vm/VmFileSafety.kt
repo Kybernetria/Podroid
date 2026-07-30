@@ -68,6 +68,7 @@ class VmPathSecurity(private val paths: VmPaths) {
         }
         for (optional in listOf(
             paths.storageImage,
+            paths.uefiVars,
             paths.rawKernel,
             paths.rawKernelDigestStamp,
             paths.qemuEfiRom,

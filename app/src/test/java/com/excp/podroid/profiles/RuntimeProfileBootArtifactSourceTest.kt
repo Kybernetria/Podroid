@@ -45,7 +45,7 @@ class RuntimeProfileBootArtifactSourceTest {
         val prepared = prepared(setOf(ProfileBackend.QEMU))
 
         val resolved = RuntimeProfileBootArtifactSource(fakeRuntime { prepared })
-            .resolveActiveBootArtifacts("qemu")!!
+            .resolveActiveBootArtifacts("qemu") as com.excp.podroid.vm.VmBootArtifacts
 
         assertEquals(7L, resolved.generation.value)
         assertEquals(prepared.artifactFiles.getValue(ArtifactRole.KERNEL).absoluteFile, resolved.kernel.file)

@@ -37,7 +37,15 @@ interface ProfileLifecycleOperations {
     ): ActivationState
 }
 
+internal sealed interface PreparedBootContract {
+    data object DirectKernelOverlayV1 : PreparedBootContract
+    data object UefiNoCloudV1 : PreparedBootContract
+}
+
 internal interface ProfileLifecycleStore {
+    /** Read-only contract inspection used for backend fencing before lifecycle effects. */
+    suspend fun preparedBootContract(candidate: PreparedProfileCandidate): PreparedBootContract =
+        PreparedBootContract.DirectKernelOverlayV1
     suspend fun issueDataDeletionConfirmation(candidate: PreparedProfileCandidate): DataDeletionConfirmation
 
     suspend fun install(
@@ -90,6 +98,7 @@ internal class DownloadableProfileEnvironment @Inject constructor(
         (configuration as? DownloadableProfileConfigurationResult.Configured)?.value?.trustPolicy
     private val repositoryDirectory = context.filesDir.resolve(PROFILE_STORE_DIRECTORY)
     private val storageFile = vmPaths.storageImage
+    private val uefiVarsFile = vmPaths.uefiVars
 
     fun openConfiguredRepository(fetcher: ProfileArtifactFetcher): ProfileRepository? {
         val origins = approvedOrigins ?: return null
@@ -101,6 +110,7 @@ internal class DownloadableProfileEnvironment @Inject constructor(
             trustPolicy = trust,
             artifactFetcher = fetcher,
             directoryDurability = AndroidDirectoryDurability,
+            uefiVarsFile = uefiVarsFile,
         )
     }
 
@@ -123,6 +133,9 @@ internal class ManagerProfileLifecycleStore @Inject constructor(
 ) : ProfileLifecycleStore {
     private val repository = environment.openConfiguredRepository(HttpUrlConnectionProfileArtifactFetcher())
     private val availability = environment.availability
+
+    override suspend fun preparedBootContract(candidate: PreparedProfileCandidate): PreparedBootContract =
+        withContext(Dispatchers.IO) { requireConfigured().preparedBootContract(candidate) }
 
     override suspend fun issueDataDeletionConfirmation(
         candidate: PreparedProfileCandidate,

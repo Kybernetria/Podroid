@@ -43,19 +43,32 @@ data class VmBootArtifact(
     }
 }
 
-/**
- * Distro-neutral, all-or-nothing boot artifact generation. Null at the [VmConfig] boundary means
- * the bundled legacy paths remain authoritative.
- */
+sealed interface ResolvedVmBootPlan {
+    val generation: VmBootGeneration
+    val manifestSha256: VmBootDigest
+    val supportedBackendIds: Set<String>
+    fun requireBackend(backendId: String)
+    @Throws(IOException::class)
+    fun validateFiles()
+}
+
+data class VmGuestCapabilities(
+    val terminal: Boolean = false,
+    val resize: Boolean = false,
+    val hostBridge: Boolean = false,
+    val downloads: Boolean = false,
+)
+
+/** Existing signed direct-kernel/overlay v1 plan. */
 class VmBootArtifacts(
-    val generation: VmBootGeneration,
-    val manifestSha256: VmBootDigest,
+    override val generation: VmBootGeneration,
+    override val manifestSha256: VmBootDigest,
     val kernel: VmBootArtifact,
     val initrd: VmBootArtifact,
     val rootfs: VmBootArtifact,
     supportedBackendIds: Set<String> = setOf("qemu", "avf"),
-) {
-    val supportedBackendIds: Set<String> = supportedBackendIds.toSet()
+) : ResolvedVmBootPlan {
+    override val supportedBackendIds: Set<String> = supportedBackendIds.toSet()
 
     init {
         require(supportedBackendIds.isNotEmpty() && supportedBackendIds.all { it == "qemu" || it == "avf" }) {
@@ -63,7 +76,7 @@ class VmBootArtifacts(
         }
     }
 
-    fun requireBackend(backendId: String) {
+    override fun requireBackend(backendId: String) {
         if (backendId !in supportedBackendIds) {
             throw IOException("active profile does not support selected backend '$backendId'")
         }
@@ -71,7 +84,7 @@ class VmBootArtifacts(
 
     /** Revalidates every hostile file immediately before a backend consumes this generation. */
     @Throws(IOException::class)
-    fun validateFiles() {
+    override fun validateFiles() {
         listOf(kernel, initrd, rootfs).forEach { artifact ->
             val path = artifact.file.toPath().toAbsolutePath().normalize()
             val attributes = Files.readAttributes(
@@ -93,7 +106,7 @@ class VmBootArtifacts(
     }
 
     companion object {
-        private const val MAX_ARTIFACT_BYTES = 4L * 1024 * 1024 * 1024
+        internal const val MAX_ARTIFACT_BYTES = 4L * 1024 * 1024 * 1024
         private const val BUFFER_BYTES = 64 * 1024
 
         @Throws(IOException::class)
@@ -128,6 +141,48 @@ class VmBootArtifacts(
     }
 }
 
+/** Closed QEMU-only UEFI/NoCloud v1 plan. Mutable files are fixed app-confined paths. */
+class UefiNoCloudVmBootPlan(
+    override val generation: VmBootGeneration,
+    override val manifestSha256: VmBootDigest,
+    val cloudRootDisk: File,
+    val uefiCode: VmBootArtifact,
+    val uefiVars: File,
+    val noCloudSeed: VmBootArtifact,
+    val readinessMarker: String,
+    val capabilities: VmGuestCapabilities,
+) : ResolvedVmBootPlan {
+    override val supportedBackendIds: Set<String> = setOf("qemu")
+
+    init {
+        require(cloudRootDisk.isAbsolute && uefiVars.isAbsolute)
+        require(readinessMarker == "PODROID_CLOUD_READY_V1")
+    }
+
+    override fun requireBackend(backendId: String) {
+        if (backendId != "qemu") throw IOException("UEFI NoCloud boot plan requires QEMU")
+    }
+
+    override fun validateFiles() {
+        validateMutable(cloudRootDisk, 4L * 1024 * 1024 * 1024, "cloud root disk")
+        validateMutable(uefiVars, 64L * 1024 * 1024, "UEFI vars")
+        validateImmutable(uefiCode)
+        validateImmutable(noCloudSeed)
+    }
+
+    private fun validateMutable(file: File, maxBytes: Long, label: String) {
+        val attrs = Files.readAttributes(file.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        if (attrs.isSymbolicLink || !attrs.isRegularFile || attrs.size() !in 1..maxBytes) {
+            throw IOException("$label is not a bounded regular file")
+        }
+    }
+
+    private fun validateImmutable(artifact: VmBootArtifact) {
+        val actual = VmBootArtifacts.digest(artifact.file)
+        if (actual != artifact.sha256) throw IOException("immutable UEFI boot artifact digest mismatch")
+    }
+}
+
 /** Effective paths consumed identically by both concrete backends. */
 internal data class VmBootFiles(
     val kernel: File,
@@ -136,7 +191,7 @@ internal data class VmBootFiles(
     val kernelDigest: VmBootDigest?,
 )
 
-internal fun VmConfig.bootFiles(paths: VmPaths): VmBootFiles = bootArtifacts?.let { artifacts ->
+internal fun VmConfig.bootFiles(paths: VmPaths): VmBootFiles = (bootArtifacts as? VmBootArtifacts)?.let { artifacts ->
     VmBootFiles(
         kernel = artifacts.kernel.file,
         initrd = artifacts.initrd.file,

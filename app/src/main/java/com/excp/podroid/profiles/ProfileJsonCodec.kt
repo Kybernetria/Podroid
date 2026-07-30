@@ -131,7 +131,9 @@ object ProfilePayloadJsonCodec {
 }
 
 object ProfileSigningV2 {
-    const val DOMAIN_SEPARATOR = "com.excp.podroid.vm-profile.v2\u0000"
+    const val ENVELOPE_VERSION = 2L
+    const val DOMAIN_ID = "com.excp.podroid.vm-profile.v2"
+    const val DOMAIN_SEPARATOR = "$DOMAIN_ID\u0000"
 
     fun messageFor(payloadBytes: ByteArray): ByteArray {
         require(payloadBytes.size in 1..ProfileLimits.MAX_PAYLOAD_BYTES) {
@@ -313,6 +315,98 @@ object SignedProfileEnvelopeJsonCodec {
     private val ENVELOPE_FIELDS = setOf("version", "key_id", "payload", "signature")
 }
 
+/** V2 framing makes both the envelope version and signing domain explicit. */
+object SignedProfileEnvelopeV2JsonCodec {
+    fun decode(envelopeBytes: ByteArray): SignedProfileEnvelope {
+        val root = parseObject(envelopeBytes, ProfileLimits.MAX_ENVELOPE_BYTES, "signed profile v2 envelope")
+        requireExactFields(root, ENVELOPE_FIELDS, "signed profile v2 envelope")
+        requireVersion(root, ProfileSigningV2.ENVELOPE_VERSION, "signed profile v2 envelope")
+        if (root.requiredString("signing_domain", "signed profile v2 envelope") != ProfileSigningV2.DOMAIN_ID) {
+            throw ProfileCodecException("signed profile v2 envelope signing domain is unsupported")
+        }
+        return decodeEnvelopeValues(root, "signed profile v2 envelope")
+    }
+
+    fun encode(keyId: SigningKeyId, payloadBytes: ByteArray, signatureBytes: ByteArray): ByteArray {
+        require(payloadBytes.size in 1..ProfileLimits.MAX_PAYLOAD_BYTES)
+        require(signatureBytes.size == ProfileLimits.ED25519_SIGNATURE_BYTES)
+        val base64 = Base64.getEncoder()
+        val encoded = ("{" +
+            "\"version\":${ProfileSigningV2.ENVELOPE_VERSION}," +
+            "\"signing_domain\":${jsonString(ProfileSigningV2.DOMAIN_ID)}," +
+            "\"key_id\":${jsonString(keyId.value)}," +
+            "\"payload\":${jsonString(base64.encodeToString(payloadBytes))}," +
+            "\"signature\":${jsonString(base64.encodeToString(signatureBytes))}" +
+            "}").toByteArray(Charsets.UTF_8)
+        require(encoded.size <= ProfileLimits.MAX_ENVELOPE_BYTES)
+        return encoded
+    }
+
+    private val ENVELOPE_FIELDS = setOf("version", "signing_domain", "key_id", "payload", "signature")
+}
+
+private fun decodeEnvelopeValues(root: Map<String, JsonValue>, label: String): SignedProfileEnvelope = codecBoundary {
+    val keyId = SigningKeyId(root.requiredString("key_id", label))
+    val payload = decodeCanonicalBase64(
+        root.requiredString("payload", label),
+        ((ProfileLimits.MAX_PAYLOAD_BYTES + 2) / 3) * 4,
+        "payload",
+    )
+    require(payload.size in 1..ProfileLimits.MAX_PAYLOAD_BYTES)
+    val signature = decodeCanonicalBase64(
+        root.requiredString("signature", label),
+        ((ProfileLimits.ED25519_SIGNATURE_BYTES + 2) / 3) * 4,
+        "signature",
+    )
+    require(signature.size == ProfileLimits.ED25519_SIGNATURE_BYTES)
+    SignedProfileEnvelope(keyId, payload, signature)
+}
+
+/** Closed discriminator; payload bytes never choose their verification domain. */
+internal fun signedProfileEnvelopeVersion(envelopeBytes: ByteArray): Long {
+    val root = parseObject(envelopeBytes, ProfileLimits.MAX_ENVELOPE_BYTES, "signed profile envelope")
+    return (root["version"] as? JsonValue.NumberValue)?.value
+        ?: throw ProfileCodecException("signed profile envelope version must be an integer")
+}
+
+sealed interface VerifiedProfileManifestAny {
+    val manifestSha256: Sha256Digest
+    val signingKeyId: SigningKeyId
+    val signingKeyFingerprint: Sha256Digest
+    val trustEpoch: TrustEpoch
+
+    data class Direct(val value: VerifiedProfileManifest) : VerifiedProfileManifestAny {
+        override val manifestSha256 get() = value.manifestSha256
+        override val signingKeyId get() = value.signingKeyId
+        override val signingKeyFingerprint get() = value.signingKeyFingerprint
+        override val trustEpoch get() = value.trustEpoch
+    }
+
+    data class UefiNoCloud(val value: VerifiedProfileV2Manifest) : VerifiedProfileManifestAny {
+        override val manifestSha256 get() = value.manifestSha256
+        override val signingKeyId get() = value.signingKeyId
+        override val signingKeyFingerprint get() = value.signingKeyFingerprint
+        override val trustEpoch get() = value.trustEpoch
+    }
+}
+
+object VerifiedProfileEnvelopeJsonCodec {
+    fun decodeManifest(
+        envelopeBytes: ByteArray,
+        approvedOrigins: ApprovedArtifactOrigins,
+        trustPolicy: ProfileTrustPolicy,
+        verifier: Ed25519Verifier = TinkEd25519Verifier,
+    ): VerifiedProfileManifestAny = when (signedProfileEnvelopeVersion(envelopeBytes)) {
+        ProfileLimits.ENVELOPE_VERSION -> VerifiedProfileManifestAny.Direct(
+            VerifiedProfileJsonCodec.decodeManifest(envelopeBytes, approvedOrigins, trustPolicy, verifier),
+        )
+        ProfileSigningV2.ENVELOPE_VERSION -> VerifiedProfileManifestAny.UefiNoCloud(
+            VerifiedProfileV2JsonCodec.decodeManifest(envelopeBytes, approvedOrigins, trustPolicy, verifier),
+        )
+        else -> throw UnsupportedProfileVersionException("unsupported signed profile envelope version")
+    }
+}
+
 data class VerifiedProfileManifest(
     val profile: VmProfile,
     /** SHA-256 of the exact signed payload bytes, used as the manifest identity. */
@@ -388,7 +482,7 @@ object VerifiedProfileV2JsonCodec {
         trustPolicy: ProfileTrustPolicy,
         verifier: Ed25519Verifier = TinkEd25519Verifier,
     ): VerifiedProfileV2Manifest {
-        val envelope = SignedProfileEnvelopeJsonCodec.decode(envelopeBytes)
+        val envelope = SignedProfileEnvelopeV2JsonCodec.decode(envelopeBytes)
         val trustedKey = trustPolicy.resolve(envelope.keyId)
             ?: throw InvalidProfileSignatureException("profile v2 signing key is not trusted")
         val publicKey = trustedKey.publicKey

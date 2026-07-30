@@ -19,6 +19,7 @@ class VmPaths private constructor(
     val instanceDirectory: File = confined(instancesDirectory.toPath().resolve(vmId.serialized))
 
     val storageImage: File = child("storage.img")
+    val uefiVars: File = child("uefi-vars.fd")
     val kernel: File = child("vmlinuz-virt")
     val rawKernel: File = child("vmlinuz-virt.raw")
     val rawKernelDigestStamp: File = child(".vmlinuz-virt.raw.digest")
@@ -47,6 +48,7 @@ class VmPaths private constructor(
     /** Exact named VM files, used by confinement/uniqueness regression tests. */
     internal val namedFiles: Map<String, File> = linkedMapOf(
         "storage" to storageImage,
+        "uefiVars" to uefiVars,
         "kernel" to kernel,
         "rawKernel" to rawKernel,
         "rawKernelDigestStamp" to rawKernelDigestStamp,
