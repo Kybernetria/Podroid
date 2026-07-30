@@ -5,3 +5,5 @@ iproute2
 dropbear
 dropbear-openrc
 ca-certificates
+tailscale=1.90.9-r6
+tailscale-openrc=1.90.9-r6

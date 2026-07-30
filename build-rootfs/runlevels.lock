@@ -6,6 +6,8 @@ default dropbear /etc/init.d/dropbear
 default podroid-migrate /etc/init.d/podroid-migrate
 default podroid-bootstrap /etc/init.d/podroid-bootstrap
 default podroid-network /etc/init.d/podroid-network
+default tailscale /etc/init.d/tailscale
+default podroid-tailscale-reconnect /etc/init.d/podroid-tailscale-reconnect
 default podroid-resize /etc/init.d/podroid-resize
 default podroid-vsock /etc/init.d/podroid-vsock
 default podroid-downloads /etc/init.d/podroid-downloads

@@ -35,10 +35,14 @@ class MinimalGuestVerifierTest(unittest.TestCase):
             ):
                 verifier.verify_package_closure(changed)
 
-    def test_resolved_package_lock_matches_successful_41_package_artifact(self):
+    def test_resolved_package_lock_matches_successful_44_package_arm64_artifact(self):
         data = (REPO_ROOT / "build-rootfs/resolved-packages.lock").read_bytes()
-        self.assertEqual(verifier.parse_resolved_package_lock(data), verifier.EXPECTED_RESOLVED_PACKAGES)
-        self.assertEqual(len(verifier.EXPECTED_RESOLVED_PACKAGES), 41)
+        rows = verifier.parse_resolved_package_lock(data)
+        self.assertEqual(tuple(row[0] for row in rows), verifier.EXPECTED_RESOLVED_PACKAGES)
+        self.assertEqual(len(rows), 44)
+        self.assertEqual(tuple(row for row in rows if row[0].startswith("tailscale")), verifier.TAILSCALE_PROVENANCE)
+        with self.assertRaisesRegex(verifier.VerificationError, "version/origin/commit"):
+            verifier.parse_resolved_package_lock(data.replace(b"1.90.9-r6", b"1.90.9-r5", 1))
 
     def test_runlevel_lock_requires_all_and_only_inittab_runlevels(self):
         data = (REPO_ROOT / "build-rootfs/runlevels.lock").read_bytes()

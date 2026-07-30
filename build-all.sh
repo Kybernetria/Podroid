@@ -129,6 +129,9 @@ build_rootfs() {
     command -v python3 >/dev/null || error "Python 3 is required for rootfs verification"
     command -v unsquashfs >/dev/null || error "unsquashfs (squashfs-tools) is required for rootfs verification"
     "${SCRIPT_DIR}/build-rootfs/overlay-normalize/test_normalize.sh"
+    python3 -m unittest -v \
+        tests/test_verify_minimal_guest.py \
+        tests/networking/test_guest_tailscale.py
     python3 "${SCRIPT_DIR}/tests/verify_minimal_guest.py"
     log "Building Alpine rootfs squashfs with ${container_engine}..."
     local sysver

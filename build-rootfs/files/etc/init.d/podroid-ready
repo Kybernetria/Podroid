@@ -3,7 +3,9 @@ description="Podroid VM ready marker (consumed by Android boot detector)"
 
 depend() {
     need podroid-network
-    after dropbear *
+    # Guest overlay enrollment and control-plane reachability are optional.
+    # Do not order Ready behind tailscale or its bounded reconnect one-shot.
+    after dropbear podroid-vsock podroid-hostd
 }
 
 start() {

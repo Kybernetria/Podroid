@@ -1,0 +1,187 @@
+#!/bin/sh
+set -eu
+export LC_ALL=C
+
+if [ -n "${PODROID_TAILSCALE_TEST_ROOT:-}" ]; then
+    COMMON="$PODROID_TAILSCALE_TEST_ROOT/usr/local/libexec/podroid-tailscale-common"
+else
+    COMMON=/usr/local/libexec/podroid-tailscale-common
+fi
+# shellcheck source=/dev/null
+. "$COMMON"
+podroid_tailscale_init_paths
+
+CONTROL_URL=
+NODE_HOSTNAME=
+AUTH_SOURCE=
+AUTH_RUN_FILE=
+MARKER_TEMP=
+READ_STDIN=0
+REAUTH=0
+CLEANUP_ARMED=0
+LOCK_OPEN=0
+
+# Invoked indirectly by the EXIT trap below.
+# shellcheck disable=SC2329
+cleanup() {
+    trap - EXIT HUP INT TERM
+    [ -z "$AUTH_RUN_FILE" ] || rm -f -- "$AUTH_RUN_FILE"
+    [ -z "$MARKER_TEMP" ] || rm -f -- "$MARKER_TEMP"
+    if [ "$CLEANUP_ARMED" -eq 1 ] && [ -n "$AUTH_SOURCE" ]; then
+        rm -f -- "$AUTH_SOURCE"
+    fi
+    if [ "$LOCK_OPEN" -eq 1 ]; then
+        exec 9>&-
+    fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+usage_error() {
+    echo "usage: podroid-tailscale-enroll --login-server HTTPS_URL --hostname NAME (--auth-key-file /run/FILE | --auth-key-stdin) [--reauth]" >&2
+    exit 2
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --login-server)
+            [ "$#" -ge 2 ] && [ -z "$CONTROL_URL" ] || usage_error
+            CONTROL_URL=$2
+            shift 2
+            ;;
+        --hostname)
+            [ "$#" -ge 2 ] && [ -z "$NODE_HOSTNAME" ] || usage_error
+            NODE_HOSTNAME=$2
+            shift 2
+            ;;
+        --auth-key-file)
+            [ "$#" -ge 2 ] && [ -z "$AUTH_SOURCE" ] && [ "$READ_STDIN" -eq 0 ] || usage_error
+            AUTH_SOURCE=$2
+            case "$AUTH_SOURCE" in
+                "$PODROID_RUN_DIR"/*)
+                    remainder=${AUTH_SOURCE#"$PODROID_RUN_DIR"/}
+                    case "$remainder" in ''|*/*|.|..) usage_error ;; esac
+                    ;;
+                *) usage_error ;;
+            esac
+            CLEANUP_ARMED=1
+            shift 2
+            ;;
+        --auth-key-stdin)
+            [ -z "$AUTH_SOURCE" ] && [ "$READ_STDIN" -eq 0 ] || usage_error
+            READ_STDIN=1
+            shift
+            ;;
+        --reauth)
+            [ "$REAUTH" -eq 0 ] || usage_error
+            REAUTH=1
+            shift
+            ;;
+        *) usage_error ;;
+    esac
+done
+
+[ -n "$CONTROL_URL" ] && [ -n "$NODE_HOSTNAME" ] || usage_error
+[ -n "$AUTH_SOURCE" ] || [ "$READ_STDIN" -eq 1 ] || usage_error
+podroid_tailscale_require_client
+CANONICAL_URL=$(podroid_canonical_control_url "$CONTROL_URL") || {
+    echo "invalid HTTPS control URL" >&2
+    exit 2
+}
+CANONICAL_HOSTNAME=$(podroid_canonical_dns_name "$NODE_HOSTNAME") || {
+    echo "invalid Tailscale hostname" >&2
+    exit 2
+}
+
+if [ -n "$AUTH_SOURCE" ]; then
+    [ -f "$AUTH_SOURCE" ] && [ ! -L "$AUTH_SOURCE" ] || {
+        echo "auth key input must be a regular temporary file" >&2
+        exit 2
+    }
+    [ "$(stat -c '%a' "$AUTH_SOURCE" 2>/dev/null)" = 600 ] &&
+        [ "$(stat -c '%u' "$AUTH_SOURCE" 2>/dev/null)" = "$PODROID_EXPECTED_UID" ] || {
+        echo "auth key input must be owned by root with mode 0600" >&2
+        exit 2
+    }
+fi
+
+# Serialize enrollment decisions and marker publication. The lock lives only in
+# tmpfs; descriptor-scoped flock releases it on normal exit, error, or signal.
+umask 077
+exec 9> "$PODROID_RUN_DIR/podroid-tailscale-enroll.lock"
+LOCK_OPEN=1
+if ! podroid_tailscale_lock_enrollment >/dev/null 2>&1; then
+    echo "timed out waiting for another Tailscale enrollment" >&2
+    exit 1
+fi
+
+AUTH_RUN_FILE=$(mktemp "$PODROID_RUN_DIR/podroid-tailscale-auth.XXXXXX") || {
+    echo "cannot create auth key staging file" >&2
+    exit 1
+}
+if [ -n "$AUTH_SOURCE" ]; then
+    if ! timeout 10 dd if="$AUTH_SOURCE" of="$AUTH_RUN_FILE" bs=514 count=1 2>/dev/null; then
+        echo "cannot read auth key input" >&2
+        exit 1
+    fi
+    rm -f -- "$AUTH_SOURCE"
+    AUTH_SOURCE=
+    CLEANUP_ARMED=0
+else
+    if ! timeout 30 dd of="$AUTH_RUN_FILE" bs=514 count=1 2>/dev/null; then
+        echo "timed out reading auth key from stdin" >&2
+        exit 1
+    fi
+fi
+chmod 0600 "$AUTH_RUN_FILE"
+key_bytes=$(wc -c < "$AUTH_RUN_FILE")
+[ "$key_bytes" -ge 8 ] && [ "$key_bytes" -le 513 ] || {
+    echo "auth key must contain 8..512 characters" >&2
+    exit 2
+}
+if ! awk 'NR != 1 { exit 1 } $0 !~ /^[A-Za-z0-9_-]+$/ { exit 1 } END { if (NR != 1) exit 1 }' "$AUTH_RUN_FILE"; then
+    echo "auth key has invalid format" >&2
+    exit 2
+fi
+
+if [ -e "$PODROID_ENROLLMENT_FILE" ]; then
+    if ! podroid_read_enrollment; then
+        [ "$REAUTH" -eq 1 ] || {
+            echo "existing enrollment metadata is invalid; explicit --reauth is required" >&2
+            exit 1
+        }
+    elif [ "$PODROID_STORED_URL" = "$CANONICAL_URL" ]; then
+        # A successful prior enrollment committed this marker. Never consume a
+        # second one-use key for the same control server.
+        exit 0
+    elif [ "$REAUTH" -ne 1 ]; then
+        echo "control server changed; explicit --reauth is required" >&2
+        exit 1
+    fi
+fi
+
+mkdir -p "$PODROID_STATE_DIR"
+[ -d "$PODROID_STATE_DIR" ] && [ ! -L "$PODROID_STATE_DIR" ] || {
+    echo "tailscale state directory is unsafe" >&2
+    exit 1
+}
+
+set -- "--auth-key=file:$AUTH_RUN_FILE"
+[ "$REAUTH" -eq 0 ] || set -- "$@" --force-reauth
+if ! podroid_tailscale_up "$CANONICAL_URL" "$CANONICAL_HOSTNAME" "$@"; then
+    echo "tailscale enrollment failed" >&2
+    exit 1
+fi
+
+MARKER_TEMP=$(mktemp "$PODROID_STATE_DIR/.podroid-enrollment.XXXXXX") || {
+    echo "cannot stage enrollment metadata" >&2
+    exit 1
+}
+chmod 0600 "$MARKER_TEMP"
+printf 'podroid-tailscale-enrollment-v1\n%s\n%s\n' \
+    "$CANONICAL_URL" "$CANONICAL_HOSTNAME" > "$MARKER_TEMP"
+mv -f "$MARKER_TEMP" "$PODROID_ENROLLMENT_FILE"
+MARKER_TEMP=
+exit 0

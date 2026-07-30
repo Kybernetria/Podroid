@@ -23,6 +23,7 @@ The shipped Alpine 3.23 image deliberately contains only the reviewed explicit p
 - `iproute2` for QEMU static SLIRP networking and AVF DHCP
 - `dropbear` and `dropbear-openrc`, configured for public-key authentication only
 - `ca-certificates`; `apk` remains available through Alpine base
+- Alpine community `tailscale` and `tailscale-openrc` for an independently identified guest workload overlay
 
 Docker, Podman, LXC, X11/VNC, PulseAudio, desktop/font packages, predefined workload services, and container backup/status helpers are **not bundled**. They are not part of the minimal base-image contract. The inherited Android X11 UI remains during the staged application refactor, but this guest image does not provide an X11/audio server for it.
 
@@ -59,6 +60,18 @@ ssh root@<phone-ip> -p 9922
 ```
 
 Password authentication is disabled.
+
+To enroll the guest with a one-use Headscale key, create the key file only under guest `/run`, set mode 0600, and consume it with the root-only helper:
+
+```sh
+install -m 0600 /dev/stdin /run/headscale-one-use.key
+podroid-tailscale-enroll \
+  --login-server https://headscale.example.invalid \
+  --hostname podroid-guest \
+  --auth-key-file /run/headscale-one-use.key
+```
+
+The helper always deletes the key file. It disables Tailscale SSH, routes, and exit-node features by default. Guest node state persists only in guest `/var/lib/tailscale`; it is separate from the future Android host transport identity. Re-enrolling against a different server requires explicit `--reauth`.
 
 ## Recovery behavior
 

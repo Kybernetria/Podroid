@@ -8,7 +8,11 @@ Containers and Swarm nodes need Linux-native workload connectivity. Routing this
 
 ## Decision
 
-Run ordinary upstream Linux `tailscaled` inside the guest for workload networking. The guest owns its workload-plane node identity, daemon lifecycle, routes, and failure recovery.
+Run ordinary upstream Linux `tailscaled` inside the guest for workload networking. The guest owns its workload-plane node identity, daemon lifecycle, routes, and failure recovery. Alpine OpenRC starts it after `podroid-network`; a bounded optional reconnect one-shot runs after the daemon, while the Android `Ready!` gate remains independent of enrollment and control-plane reachability.
+
+The Android host and Linux guest use separate node identities. Their auth keys, node keys, state directories, hostnames, and control-plane lifecycle must never be reused or copied across the VM boundary. Guest daemon identity is persisted only by the guest overlay under `/var/lib/tailscale`; the future Android transport owns different host-private state outside the guest disk.
+
+Guest enrollment is an explicit root-only operation through `podroid-tailscale-enroll`. It consumes a one-use key from a mode-0600 temporary file under `/run` (or bounded stdin staged under `/run`), passes only a `file:` reference to `tailscale up`, removes the input and staging file on every exit path, and records only the canonical control URL and guest hostname after success. A changed server requires explicit `--reauth`. Tailscale SSH, accepted/advertised routes, and exit-node behavior are disabled by default.
 
 ## Consequences
 

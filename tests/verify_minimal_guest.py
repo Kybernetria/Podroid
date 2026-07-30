@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -31,6 +32,8 @@ EXPECTED_EXPLICIT_PACKAGES = (
     "dropbear",
     "dropbear-openrc",
     "ca-certificates",
+    "tailscale=1.90.9-r6",
+    "tailscale-openrc=1.90.9-r6",
 )
 EXPECTED_RESOLVED_PACKAGES = (
     "alpine-base", "alpine-baselayout", "alpine-baselayout-data", "alpine-conf",
@@ -40,13 +43,20 @@ EXPECTED_RESOLVED_PACKAGES = (
     "ifupdown-ng", "ifupdown-ng-iproute2", "iproute2", "iproute2-minimal",
     "iproute2-ss", "iproute2-tc", "libapk", "libcap2", "libcrypto3", "libelf",
     "libmnl", "libssl3", "libxtables", "mdev-conf", "musl", "musl-utils",
-    "openrc", "openrc-user", "scanelf", "skalibs-libs", "ssl_client",
-    "utmps-libs", "zlib", "zstd-libs",
+    "openrc", "openrc-user", "openresolv", "scanelf", "skalibs-libs", "ssl_client",
+    "tailscale", "tailscale-openrc", "utmps-libs", "zlib", "zstd-libs",
+)
+RESOLVED_PROVENANCE_SHA256 = "0c3be7f3622d51f8760578f2031c17d3014be7f0aecce5f6d385abf9c3682429"
+TAILSCALE_PROVENANCE = (
+    ("tailscale", "1.90.9-r6", "aarch64", "tailscale", "cb528479ce7389730baa832e757b0e00914bba19"),
+    ("tailscale-openrc", "1.90.9-r6", "aarch64", "tailscale", "cb528479ce7389730baa832e757b0e00914bba19"),
 )
 REQUIRED_SERVICES = (
     "podroid-migrate",
     "podroid-bootstrap",
     "podroid-network",
+    "tailscale",
+    "podroid-tailscale-reconnect",
     "podroid-resize",
     "dropbear",
     "podroid-vsock",
@@ -90,9 +100,12 @@ REQUIRED_ARTIFACT_PATHS = (
     "sbin/swapon",
     "usr/sbin/dropbear",
     "usr/bin/pgrep",
+    "usr/bin/tailscale",
+    "usr/sbin/tailscaled",
     "etc/ssl/certs/ca-certificates.crt",
     "etc/inittab",
     "etc/conf.d/dropbear",
+    "etc/conf.d/tailscale",
     "etc/podroid/forwards.conf",
     "etc/podroid/system-version",
     "etc/podroid/migrations/index",
@@ -105,10 +118,19 @@ REQUIRED_ARTIFACT_PATHS = (
     "usr/local/bin/podroid-overlay-normalize",
     "usr/local/bin/podroid-migrate-safe",
     "usr/local/bin/podroid-migrate-runner",
+    "usr/local/bin/podroid-tailscale-enroll",
+    "usr/local/bin/podroid-tailscale-status",
+    "usr/local/bin/podroid-tailscale-reconnect",
+    "usr/local/libexec/podroid-tailscale-common",
     "usr/local/bin/podroid-notify",
     "usr/local/bin/podroid-forward",
+    "var/lib/tailscale",
 )
 PACKAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9+_.-]{0,127}$")
+PACKAGE_SPEC = re.compile(r"^[a-z0-9][a-z0-9+_.-]{0,127}(?:=[0-9][a-zA-Z0-9._-]{0,63})?$")
+PACKAGE_VERSION = re.compile(r"^[0-9][a-zA-Z0-9._-]{0,63}$")
+APORTS_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+AUTH_KEY_LITERAL = re.compile(rb"(?:tskey-auth-|hskey-auth-)[A-Za-z0-9_-]{8,}")
 
 VerificationError = bounded.VerificationError
 fail = bounded.fail
@@ -124,8 +146,8 @@ def parse_explicit_packages(data: bytes) -> tuple[str, ...]:
     lines = text.splitlines()
     if not lines or len(lines) > MAX_EXPLICIT_PACKAGES:
         fail(f"minimal package manifest must contain 1..{MAX_EXPLICIT_PACKAGES} entries")
-    if any(not PACKAGE_NAME.fullmatch(line) for line in lines):
-        fail("minimal package manifest contains a blank or malformed package name")
+    if any(not PACKAGE_SPEC.fullmatch(line) for line in lines):
+        fail("minimal package manifest contains a blank or malformed package specification")
     if len(set(lines)) != len(lines):
         fail("minimal package manifest contains duplicate package names")
     packages = tuple(lines)
@@ -134,13 +156,53 @@ def parse_explicit_packages(data: bytes) -> tuple[str, ...]:
     return packages
 
 
-def parse_resolved_package_lock(data: bytes) -> tuple[str, ...]:
-    if len(data) > 16 * 1024:
-        fail("resolved package lock exceeds 16 KiB")
-    packages = parse_installed_packages(b"\n\n".join(b"P:" + line for line in data.splitlines()))
+def parse_provenance_rows(data: bytes) -> tuple[tuple[str, str, str, str, str], ...]:
+    if not data or len(data) > 16 * 1024:
+        fail("resolved package provenance lock is empty or exceeds 16 KiB")
+    rows: list[tuple[str, str, str, str, str]] = []
+    for raw_line in data.splitlines():
+        try:
+            fields = tuple(field.decode("ascii") for field in raw_line.split(b"\t"))
+        except UnicodeDecodeError:
+            fail("resolved package provenance lock is not ASCII")
+        if len(fields) != 5:
+            fail("resolved package provenance row does not have five fields")
+        name, version, architecture, origin, commit = fields
+        if (
+            not PACKAGE_NAME.fullmatch(name)
+            or not PACKAGE_VERSION.fullmatch(version)
+            or architecture != "aarch64"
+            or not PACKAGE_NAME.fullmatch(origin)
+            or not APORTS_COMMIT.fullmatch(commit)
+        ):
+            fail("resolved package provenance row is malformed")
+        rows.append((name, version, architecture, origin, commit))
+        if len(rows) > MAX_RESOLVED_PACKAGES:
+            fail(f"resolved package provenance exceeds {MAX_RESOLVED_PACKAGES} rows")
+    if tuple(sorted(rows)) != tuple(rows) or len({row[0] for row in rows}) != len(rows):
+        fail("resolved package provenance rows are unsorted or duplicated")
+    return tuple(rows)
+
+
+def provenance_bytes(rows: tuple[tuple[str, str, str, str, str], ...]) -> bytes:
+    return b"".join(("\t".join(row) + "\n").encode("ascii") for row in rows)
+
+
+def verify_provenance(rows: tuple[tuple[str, str, str, str, str], ...]) -> None:
+    packages = tuple(row[0] for row in rows)
     if packages != EXPECTED_RESOLVED_PACKAGES:
-        fail("resolved package lock differs from the reviewed 41-package artifact")
-    return packages
+        fail("resolved package provenance differs from the exact reviewed package closure")
+    if hashlib.sha256(provenance_bytes(rows)).hexdigest() != RESOLVED_PROVENANCE_SHA256:
+        fail("resolved package provenance differs from the exact reviewed version/origin/commit lock")
+    tailscale_rows = tuple(row for row in rows if row[0].startswith("tailscale"))
+    if tailscale_rows != TAILSCALE_PROVENANCE:
+        fail("tailscale packages do not match signed Alpine 3.23 community provenance")
+
+
+def parse_resolved_package_lock(data: bytes) -> tuple[tuple[str, str, str, str, str], ...]:
+    rows = parse_provenance_rows(data)
+    verify_provenance(rows)
+    return rows
 
 
 def active_fields(data: bytes) -> list[list[bytes]]:
@@ -230,6 +292,67 @@ def verify_boot_dependency_policy(
         b"need podroid-network",
         "podroid-ready does not need successful networking",
     )
+
+
+def verify_tailscale_policy(
+    config: bytes,
+    common: bytes,
+    enroll: bytes,
+    status: bytes,
+    reconnect: bytes,
+    reconnect_service: bytes,
+    ready: bytes,
+    identity_docs: bytes,
+) -> None:
+    expected_config = [
+        b'statedir="/var/lib/tailscale"',
+        b'command_user="root:tailscale"',
+        b'no_logs_no_support=yes',
+        b'logfile="/run/tailscaled.log"',
+        b'rc_need="podroid-network"',
+        b'rc_before="podroid-tailscale-reconnect"',
+    ]
+    if bounded.active_config_lines(config) != expected_config:
+        fail("tailscale config differs from exact guest state and OpenRC ordering policy")
+
+    packaged_policy = b"\n".join((config, common, enroll, status, reconnect, reconnect_service))
+    if AUTH_KEY_LITERAL.search(packaged_policy):
+        fail("guest Tailscale packageable policy contains an auth key literal")
+    if re.search(rb"https://[A-Za-z0-9]", packaged_policy):
+        fail("guest Tailscale packageable policy contains a configured control URL")
+    for forbidden in (b"--ssh=true", b"TS_AUTHKEY=", b"TAILSCALE_AUTHKEY=", b"/var/lib/tailscale/tailscaled.state"):
+        if forbidden in packaged_policy:
+            fail(f"guest Tailscale policy contains forbidden bundled state/feature token {forbidden!r}")
+
+    for token in (
+        b'[ "$(id -u)" -eq 0 ]', b'[ "${#value}" -le 2048 ]', b'https://*',
+        b'--accept-routes=false', b'--advertise-exit-node=false', b'--advertise-routes=',
+        b'--exit-node=', b'--ssh=false', b'timeout 40', b'--timeout=30s',
+        b'timeout 45 /bin/busybox flock -x 9',
+    ):
+        require_bytes(common, token, f"Tailscale common policy omits {token!r}")
+    for token in (
+        b'--auth-key=file:$AUTH_RUN_FILE', b'--force-reauth', b'trap cleanup EXIT', b"trap 'exit 143' TERM",
+        b'auth key input must be owned by root with mode 0600', b'control server changed;',
+        b'mv -f "$MARKER_TEMP" "$PODROID_ENROLLMENT_FILE"',
+        b'exec 9> "$PODROID_RUN_DIR/podroid-tailscale-enroll.lock"',
+        b'podroid_tailscale_lock_enrollment',
+    ):
+        require_bytes(enroll, token, f"Tailscale enrollment helper omits {token!r}")
+    if enroll.count(b'rm -f -- "$AUTH_SOURCE"') < 2 or enroll.count(b'rm -f -- "$AUTH_RUN_FILE"') != 1:
+        fail("Tailscale enrollment helper does not clean both input and staged key on every path")
+    for helper, timeout_token in ((status, b"timeout 10"), (reconnect, b"timeout 10")):
+        require_bytes(helper, timeout_token, "Tailscale helper omits bounded CLI wait")
+        require_bytes(helper, b"262144", "Tailscale helper omits bounded status output")
+    for token in (b"need tailscale", b"after podroid-network"):
+        require_bytes(reconnect_service, token, f"Tailscale reconnect service omits {token!r}")
+    if b"tailscale" in b"\n".join(bounded.active_config_lines(ready)) or b"after dropbear *" in ready:
+        fail("guest Ready is incorrectly ordered behind optional Tailscale reachability")
+    for token in (
+        b"separate node identities", b"must never be reused", b"/var/lib/tailscale",
+        b"Android host", b"Linux guest",
+    ):
+        require_bytes(identity_docs, token, f"identity separation documentation omits {token!r}")
 
 
 def verify_migration_policy(
@@ -336,7 +459,8 @@ def verify_source(repo_root: Path) -> None:
     require_bytes(dockerfile, b"COPY minimal-packages.txt /work/minimal-packages.txt", "rootfs Dockerfile does not copy the reviewed package manifest")
     require_bytes(dockerfile, b"COPY resolved-packages.lock /work/resolved-packages.lock", "rootfs Dockerfile does not copy the resolved package lock")
     require_bytes(dockerfile, b"COPY runlevels.lock /work/runlevels.lock", "rootfs Dockerfile does not copy the reviewed runlevel lock")
-    require_bytes(build_script, b'resolved package closure differs from reviewed lock', "rootfs build does not enforce the resolved package lock")
+    require_bytes(build_script, b'resolved package provenance differs from reviewed lock', "rootfs build does not enforce exact resolved package provenance")
+    require_bytes(build_script, b'--keys-dir "$ROOTFS/etc/apk/keys"', "rootfs build does not authenticate packages with Alpine signing keys")
     require_bytes(dockerfile, MINIROOTFS_SHA256.encode(), "minirootfs SHA-256 is not pinned")
     require_bytes(dockerfile, b"sha256sum -c -", "minirootfs download is not checksum verified")
     require_bytes(dockerfile, b"--connect-timeout 30 --max-time 300 --retry 2", "minirootfs download is not deadline bounded")
@@ -373,7 +497,39 @@ def verify_source(repo_root: Path) -> None:
     ready_service = bounded.read_regular_file(
         repo_root / "build-rootfs/files/etc/init.d/podroid-ready"
     )
+    tailscale_config = bounded.read_regular_file(
+        repo_root / "build-rootfs/files/etc/conf.d/tailscale"
+    )
+    tailscale_common = bounded.read_regular_file(
+        repo_root / "build-rootfs/files/usr/local/libexec/podroid-tailscale-common"
+    )
+    tailscale_enroll = bounded.read_regular_file(
+        repo_root / "build-rootfs/files/usr/local/bin/podroid-tailscale-enroll"
+    )
+    tailscale_status = bounded.read_regular_file(
+        repo_root / "build-rootfs/files/usr/local/bin/podroid-tailscale-status"
+    )
+    tailscale_reconnect = bounded.read_regular_file(
+        repo_root / "build-rootfs/files/usr/local/bin/podroid-tailscale-reconnect"
+    )
+    tailscale_reconnect_service = bounded.read_regular_file(
+        repo_root / "build-rootfs/files/etc/init.d/podroid-tailscale-reconnect"
+    )
+    identity_docs = (
+        bounded.read_regular_file(repo_root / "docs/adr/0007-linux-tailscaled-for-guest-workloads.md")
+        + bounded.read_regular_file(repo_root / "tests/networking/README.md")
+    )
     verify_boot_dependency_policy(bootstrap_service, network_service, ready_service)
+    verify_tailscale_policy(
+        tailscale_config,
+        tailscale_common,
+        tailscale_enroll,
+        tailscale_status,
+        tailscale_reconnect,
+        tailscale_reconnect_service,
+        ready_service,
+        identity_docs,
+    )
 
     required_service_content = {
         "podroid-bootstrap": (b"Loading kernel modules...", b"mount --make-rshared /", b"/dev/net/tun", b"cgroup2", b"zram0", b"downloads /mnt/downloads"),
@@ -435,7 +591,7 @@ def verify_source(repo_root: Path) -> None:
 
     print(
         f"minimal guest source verification passed: {len(packages)} explicit packages, "
-        f"{len(resolved_lock)} locked resolved packages"
+        f"{len(resolved_lock)} locked resolved package provenance rows"
     )
 
 
@@ -461,6 +617,33 @@ def parse_installed_packages(database: bytes) -> tuple[str, ...]:
     if not packages or len(set(packages)) != len(packages):
         fail("artifact apk database has no packages or duplicate package records")
     return tuple(sorted(packages))
+
+
+def parse_installed_provenance(database: bytes) -> tuple[tuple[str, str, str, str, str], ...]:
+    if not database or len(database) > MAX_PACKAGE_DATABASE_BYTES:
+        fail("artifact apk database is empty or exceeds its 2 MiB bound")
+    rows = []
+    for record in database.split(b"\n\n"):
+        if not record.strip():
+            continue
+        fields = {}
+        for prefix in (b"P:", b"V:", b"A:", b"o:", b"c:"):
+            values = [line[len(prefix):] for line in record.splitlines() if line.startswith(prefix)]
+            if len(values) != 1:
+                fail("artifact apk database omits exact package provenance fields")
+            try:
+                fields[prefix] = values[0].decode("ascii")
+            except UnicodeDecodeError:
+                fail("artifact apk database package provenance is not ASCII")
+        rows.append((fields[b"P:"], fields[b"V:"], fields[b"A:"], fields[b"o:"], fields[b"c:"]))
+        if len(rows) > MAX_RESOLVED_PACKAGES:
+            fail(f"artifact package closure exceeds {MAX_RESOLVED_PACKAGES} packages")
+    rows_tuple = tuple(sorted(rows))
+    # Reuse all syntax, uniqueness, architecture, closure, and lock checks.
+    normalized = provenance_bytes(rows_tuple)
+    parsed = parse_provenance_rows(normalized)
+    verify_provenance(parsed)
+    return parsed
 
 
 def verify_package_closure(packages: tuple[str, ...]) -> None:
@@ -579,6 +762,7 @@ def verify_open_artifact(tool: str, artifact: Path, artifact_fd: int, artifact_s
         "sbin/apk",
         "sbin/ip",
         "usr/sbin/dropbear",
+        "usr/sbin/tailscaled",
         "usr/local/bin/podroid-getty",
         "usr/local/bin/podroid-login",
         "usr/local/bin/podroid-resize",
@@ -587,6 +771,10 @@ def verify_open_artifact(tool: str, artifact: Path, artifact_fd: int, artifact_s
         "usr/local/bin/podroid-overlay-normalize",
         "usr/local/bin/podroid-migrate-safe",
         "usr/local/bin/podroid-migrate-runner",
+        "usr/local/bin/podroid-tailscale-enroll",
+        "usr/local/bin/podroid-tailscale-status",
+        "usr/local/bin/podroid-tailscale-reconnect",
+        "usr/local/libexec/podroid-tailscale-common",
     }
     for executable_path in executable_paths:
         mode, target = paths[executable_path]
@@ -599,12 +787,23 @@ def verify_open_artifact(tool: str, artifact: Path, artifact_fd: int, artifact_s
     init_mode, init_target = paths["sbin/init"]
     if not init_mode.startswith(b"l") or init_target != "/bin/busybox":
         fail("minimal artifact /sbin/init is not the expected BusyBox PID 1 link")
+    tailscale_mode, tailscale_target = paths["usr/bin/tailscale"]
+    if not tailscale_mode.startswith(b"l") or tailscale_target != "/usr/sbin/tailscaled":
+        fail("minimal artifact tailscale client is not the exact Alpine multicall link")
+    state_mode, state_target = paths["var/lib/tailscale"]
+    if not state_mode.startswith(b"d") or state_target is not None:
+        fail("minimal artifact Tailscale state location is not a real guest directory")
+    seeded_state = sorted(
+        path for path in paths if path.startswith("var/lib/tailscale/")
+    )
+    if seeded_state:
+        fail("minimal artifact seeds forbidden Tailscale identity or enrollment state")
 
     database = bounded.artifact_cat(tool, artifact, artifact_fd, "lib/apk/db/installed")
     if len(database) > MAX_PACKAGE_DATABASE_BYTES:
         fail("artifact apk database exceeds its 2 MiB bound")
-    packages = parse_installed_packages(database)
-    verify_package_closure(packages)
+    provenance = parse_installed_provenance(database)
+    packages = tuple(row[0] for row in provenance)
 
     system_version = bounded.artifact_cat(tool, artifact, artifact_fd, "etc/podroid/system-version")
     forwards = bounded.artifact_cat(tool, artifact, artifact_fd, "etc/podroid/forwards.conf")
@@ -617,11 +816,30 @@ def verify_open_artifact(tool: str, artifact: Path, artifact_fd: int, artifact_s
     migration_index = bounded.artifact_cat(tool, artifact, artifact_fd, "etc/podroid/migrations/index")
     migrate_runner = bounded.artifact_cat(tool, artifact, artifact_fd, "usr/local/bin/podroid-migrate-runner")
     migrate_helper = bounded.artifact_cat(tool, artifact, artifact_fd, "usr/local/bin/podroid-migrate-safe")
+    tailscale_service = bounded.artifact_cat(tool, artifact, artifact_fd, "etc/init.d/tailscale")
+    tailscale_config = bounded.artifact_cat(tool, artifact, artifact_fd, "etc/conf.d/tailscale")
+    tailscale_common = bounded.artifact_cat(tool, artifact, artifact_fd, "usr/local/libexec/podroid-tailscale-common")
+    tailscale_enroll = bounded.artifact_cat(tool, artifact, artifact_fd, "usr/local/bin/podroid-tailscale-enroll")
+    tailscale_status = bounded.artifact_cat(tool, artifact, artifact_fd, "usr/local/bin/podroid-tailscale-status")
+    tailscale_reconnect = bounded.artifact_cat(tool, artifact, artifact_fd, "usr/local/bin/podroid-tailscale-reconnect")
+    tailscale_reconnect_service = bounded.artifact_cat(tool, artifact, artifact_fd, "etc/init.d/podroid-tailscale-reconnect")
     if system_version != b"31\n":
         fail("minimal artifact system-version is not 31")
     if active_fields(forwards) != [[b"9100", b"ctl"]]:
         fail("minimal artifact seeds a forbidden display/audio/default forward")
     verify_boot_dependency_policy(bootstrap, network, ready)
+    for token in (b'command="/usr/sbin/tailscaled"', b'--state=$statedir/tailscaled.state', b"need net"):
+        require_bytes(tailscale_service, token, f"Alpine tailscale-openrc service omits {token!r}")
+    verify_tailscale_policy(
+        tailscale_config,
+        tailscale_common,
+        tailscale_enroll,
+        tailscale_status,
+        tailscale_reconnect,
+        tailscale_reconnect_service,
+        ready,
+        b"Android host and Linux guest use separate node identities that must never be reused; /var/lib/tailscale.",
+    )
     for data, needle in (
         (bootstrap, b"/dev/net/tun"),
         (bootstrap, b"cgroup2"),

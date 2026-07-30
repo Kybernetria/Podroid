@@ -1,0 +1,48 @@
+#!/bin/sh
+set -eu
+export LC_ALL=C
+
+if [ -n "${PODROID_TAILSCALE_TEST_ROOT:-}" ]; then
+    COMMON="$PODROID_TAILSCALE_TEST_ROOT/usr/local/libexec/podroid-tailscale-common"
+else
+    COMMON=/usr/local/libexec/podroid-tailscale-common
+fi
+# shellcheck source=/dev/null
+. "$COMMON"
+podroid_tailscale_init_paths
+podroid_tailscale_require_client
+
+# An unenrolled guest is healthy: workload enrollment is optional and must not
+# hold the Android Ready marker behind control-plane reachability.
+[ -e "$PODROID_ENROLLMENT_FILE" ] || exit 0
+podroid_read_enrollment || {
+    echo "tailscale enrollment metadata is invalid" >&2
+    exit 1
+}
+
+STATUS_FILE=$(mktemp "$PODROID_RUN_DIR/podroid-tailscale-reconnect-status.XXXXXX") || exit 1
+cleanup() {
+    trap - EXIT HUP INT TERM
+    rm -f -- "$STATUS_FILE"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if timeout 10 "$PODROID_TAILSCALE_BIN" --socket="$PODROID_TAILSCALE_SOCKET" status --json \
+    > "$STATUS_FILE" 2>/dev/null; then
+    status_bytes=$(wc -c < "$STATUS_FILE")
+    [ "$status_bytes" -le 262144 ] || {
+        echo "tailscale status exceeds 256 KiB" >&2
+        exit 1
+    }
+    if grep -Eq '"BackendState"[[:space:]]*:[[:space:]]*"Running"' "$STATUS_FILE"; then
+        exit 0
+    fi
+fi
+
+if ! podroid_tailscale_up "$PODROID_STORED_URL" "$PODROID_STORED_HOSTNAME"; then
+    echo "tailscale reconnect failed" >&2
+    exit 1
+fi

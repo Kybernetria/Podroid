@@ -1,0 +1,158 @@
+#!/bin/sh
+# shellcheck disable=SC2034
+# Shared, side-effect-free validation and bounded tailscale invocation policy.
+
+podroid_tailscale_init_paths() {
+    if [ -n "${PODROID_TAILSCALE_TEST_ROOT:-}" ]; then
+        case "$PODROID_TAILSCALE_TEST_ROOT" in
+            /*) ;;
+            *) echo "test root must be absolute" >&2; return 1 ;;
+        esac
+        case "/$PODROID_TAILSCALE_TEST_ROOT/" in
+            */../*|*/./*) echo "test root must be normalized" >&2; return 1 ;;
+        esac
+        [ -d "$PODROID_TAILSCALE_TEST_ROOT" ] && [ ! -L "$PODROID_TAILSCALE_TEST_ROOT" ] || {
+            echo "test root must be a real directory" >&2
+            return 1
+        }
+        PODROID_EXPECTED_UID=$(id -u)
+        PODROID_RUN_DIR="$PODROID_TAILSCALE_TEST_ROOT/run"
+        PODROID_STATE_DIR="$PODROID_TAILSCALE_TEST_ROOT/var/lib/tailscale"
+        PODROID_TAILSCALE_BIN="$PODROID_TAILSCALE_TEST_ROOT/usr/bin/tailscale"
+    else
+        [ "$(id -u)" -eq 0 ] || {
+            echo "this helper must run as root" >&2
+            return 1
+        }
+        PODROID_EXPECTED_UID=0
+        PODROID_RUN_DIR=/run
+        PODROID_STATE_DIR=/var/lib/tailscale
+        PODROID_TAILSCALE_BIN=/usr/bin/tailscale
+    fi
+    PODROID_TAILSCALE_SOCKET="$PODROID_RUN_DIR/tailscale/tailscaled.sock"
+    PODROID_ENROLLMENT_FILE="$PODROID_STATE_DIR/podroid-enrollment"
+    mkdir -p "$PODROID_RUN_DIR"
+}
+
+podroid_tailscale_require_client() {
+    [ -x "$PODROID_TAILSCALE_BIN" ] || {
+        echo "tailscale client is unavailable" >&2
+        return 1
+    }
+    if [ -z "${PODROID_TAILSCALE_TEST_ROOT:-}" ]; then
+        [ -L "$PODROID_TAILSCALE_BIN" ] &&
+            [ "$(readlink "$PODROID_TAILSCALE_BIN")" = /usr/sbin/tailscaled ] || {
+            echo "tailscale client link differs from the signed Alpine package" >&2
+            return 1
+        }
+    else
+        [ ! -L "$PODROID_TAILSCALE_BIN" ] || return 1
+    fi
+}
+
+podroid_tailscale_lock_enrollment() {
+    if [ -n "${PODROID_TAILSCALE_TEST_ROOT:-}" ]; then
+        timeout 45 flock -x 9
+    else
+        timeout 45 /bin/busybox flock -x 9
+    fi
+}
+
+podroid_canonical_dns_name() {
+    value=$1
+    [ -n "$value" ] && [ "${#value}" -le 253 ] || return 1
+    case "$value" in
+        .*|*.|*..*|*[!A-Za-z0-9.-]*) return 1 ;;
+    esac
+    old_ifs=$IFS
+    IFS=.
+    # Validation above excludes glob metacharacters; splitting on dots is intentional.
+    # shellcheck disable=SC2086
+    set -- $value
+    IFS=$old_ifs
+    [ "$#" -gt 0 ] || return 1
+    for label do
+        [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
+        case "$label" in
+            -*|*-|*[!A-Za-z0-9-]*) return 1 ;;
+        esac
+    done
+    printf '%s\n' "$value" | tr '[:upper:]' '[:lower:]'
+}
+
+podroid_canonical_control_url() {
+    value=$1
+    [ -n "$value" ] && [ "${#value}" -le 2048 ] || return 1
+    case "$value" in
+        https://*) ;;
+        *) return 1 ;;
+    esac
+    authority=${value#https://}
+    case "$authority" in
+        */) authority=${authority%/} ;;
+    esac
+    case "$authority" in
+        ''|*'/'*|*'?'*|*'#'*|*'@'*|*'['*|*']'*|*[!A-Za-z0-9.:-]*) return 1 ;;
+    esac
+    case "$authority" in
+        *:*)
+            host=${authority%:*}
+            port=${authority##*:}
+            [ "$host" != "$authority" ] && [ -n "$port" ] && [ "${#port}" -le 5 ] || return 1
+            case "$port" in *[!0-9]*) return 1 ;; esac
+            [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+            ;;
+        *) host=$authority; port= ;;
+    esac
+    canonical_host=$(podroid_canonical_dns_name "$host") || return 1
+    if [ -n "$port" ]; then
+        printf 'https://%s:%s\n' "$canonical_host" "$port"
+    else
+        printf 'https://%s\n' "$canonical_host"
+    fi
+}
+
+podroid_read_enrollment() {
+    [ -f "$PODROID_ENROLLMENT_FILE" ] && [ ! -L "$PODROID_ENROLLMENT_FILE" ] || return 1
+    [ "$(stat -c '%a' "$PODROID_ENROLLMENT_FILE" 2>/dev/null)" = 600 ] || return 1
+    [ "$(stat -c '%u' "$PODROID_ENROLLMENT_FILE" 2>/dev/null)" = "$PODROID_EXPECTED_UID" ] || return 1
+    version=
+    stored_url=
+    stored_hostname=
+    extra=
+    {
+        IFS= read -r version &&
+        IFS= read -r stored_url &&
+        IFS= read -r stored_hostname &&
+        ! IFS= read -r extra
+    } < "$PODROID_ENROLLMENT_FILE" || return 1
+    [ "$version" = podroid-tailscale-enrollment-v1 ] || return 1
+    canonical_url=$(podroid_canonical_control_url "$stored_url") || return 1
+    canonical_hostname=$(podroid_canonical_dns_name "$stored_hostname") || return 1
+    [ "$stored_url" = "$canonical_url" ] && [ "$stored_hostname" = "$canonical_hostname" ] || return 1
+    PODROID_STORED_URL=$canonical_url
+    PODROID_STORED_HOSTNAME=$canonical_hostname
+}
+
+podroid_tailscale_up() {
+    control_url=$1
+    node_hostname=$2
+    shift 2
+    timeout 40 "$PODROID_TAILSCALE_BIN" --socket="$PODROID_TAILSCALE_SOCKET" up \
+        --timeout=30s \
+        --reset \
+        --accept-dns=false \
+        --accept-routes=false \
+        --advertise-connector=false \
+        --advertise-exit-node=false \
+        --advertise-routes= \
+        --exit-node= \
+        --exit-node-allow-lan-access=false \
+        --login-server="$control_url" \
+        --hostname="$node_hostname" \
+        --shields-up=false \
+        --snat-subnet-routes=false \
+        --ssh=false \
+        --stateful-filtering=false \
+        "$@" >/dev/null 2>&1
+}

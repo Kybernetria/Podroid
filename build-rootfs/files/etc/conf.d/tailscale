@@ -1,0 +1,11 @@
+# Podroid guest workload-plane Tailscale policy.
+# Identity and daemon state live only in the guest overlay at this path.
+statedir="/var/lib/tailscale"
+command_user="root:tailscale"
+no_logs_no_support=yes
+logfile="/run/tailscaled.log"
+
+# Add the exact Podroid network dependency without replacing Alpine's signed
+# tailscale-openrc init script.
+rc_need="podroid-network"
+rc_before="podroid-tailscale-reconnect"

@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+# shellcheck disable=SC2034
+description="Reconnect the independently enrolled guest Tailscale node"
+
+# Optional one-shot recovery: failure is visible in OpenRC but never blocks the
+# backend-neutral podroid-ready service.
+depend() {
+    need tailscale
+    after podroid-network
+}
+
+start() {
+    ebegin "Checking guest Tailscale reconnect state"
+    /usr/local/bin/podroid-tailscale-reconnect
+    eend $?
+}

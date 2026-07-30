@@ -23,7 +23,7 @@ EOF
 set --
 while IFS= read -r package || [ -n "$package" ]; do
     case "$package" in
-        ''|*[!a-z0-9+_.-]*)
+        ''|*[!a-z0-9+_.=-]*)
             echo "invalid minimal package entry: $package" >&2
             exit 1
             ;;
@@ -41,17 +41,28 @@ apk -X "https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_BRANCH}/main" \
     --keys-dir "$ROOTFS/etc/apk/keys" \
     -U --root "$ROOTFS" --initdb add "$@"
 
-# Fail the build if repository drift changes the reviewed 41-package closure.
-# The lock contains package names (not versions) from the successful Alpine
-# 3.23.4 artifact; signature verification still authenticates package bytes.
-resolved_packages=$(apk --root "$ROOTFS" info | LC_ALL=C sort)
+# Fail the build if repository drift changes any reviewed package identity.
+# Every lock row is: name, version, architecture, Alpine origin, aports commit.
+# apk has already authenticated each package with the pinned Alpine signing keys.
+resolved_packages=$(awk 'BEGIN { RS=""; FS="\n" }
+    {
+        p=v=a=o=c=""
+        for (i=1; i<=NF; i++) {
+            if ($i ~ /^P:/) p=substr($i,3)
+            else if ($i ~ /^V:/) v=substr($i,3)
+            else if ($i ~ /^A:/) a=substr($i,3)
+            else if ($i ~ /^o:/) o=substr($i,3)
+            else if ($i ~ /^c:/) c=substr($i,3)
+        }
+        if (p != "") print p "\t" v "\t" a "\t" o "\t" c
+    }' "$ROOTFS/lib/apk/db/installed" | LC_ALL=C sort)
 resolved_count=$(printf '%s\n' "$resolved_packages" | wc -l)
 [ "$resolved_count" -le "$MAX_RESOLVED_PACKAGES" ] || {
     echo "resolved package closure exceeds $MAX_RESOLVED_PACKAGES entries" >&2
     exit 1
 }
 [ "$resolved_packages" = "$(cat "$RESOLVED_PACKAGES_LOCK")" ] || {
-    echo "resolved package closure differs from reviewed lock" >&2
+    echo "resolved package provenance differs from reviewed lock" >&2
     printf '%s\n' "$resolved_packages" >&2
     exit 1
 }
@@ -66,16 +77,18 @@ rm -rf "$ROOTFS/usr/share/man" "$ROOTFS/usr/share/doc" \
        "$ROOTFS/usr/share/locale" "$ROOTFS/usr/share/info"
 
 # Copy the backend-neutral OpenRC boot contract into the rootfs.
-for svc in bootstrap network resize ready vsock hostd downloads migrate; do
+for svc in bootstrap network resize ready vsock hostd downloads migrate tailscale-reconnect; do
     cp "/work/files/etc/init.d/podroid-$svc" "$ROOTFS/etc/init.d/"
 done
 chmod +x "$ROOTFS/etc/init.d/podroid-"*
 
-# Console/getty helpers.
-mkdir -p "$ROOTFS/usr/local/bin"
-for helper in resize login getty; do
+# Console/getty and bounded guest Tailscale helpers.
+mkdir -p "$ROOTFS/usr/local/bin" "$ROOTFS/usr/local/libexec"
+for helper in resize login getty tailscale-enroll tailscale-status tailscale-reconnect; do
     cp "/work/files/usr/local/bin/podroid-$helper" "$ROOTFS/usr/local/bin/"
 done
+cp /work/files/usr/local/libexec/podroid-tailscale-common "$ROOTFS/usr/local/libexec/"
+chmod 0755 "$ROOTFS/usr/local/libexec/podroid-tailscale-common"
 
 # Native backend/control helpers are COPY'd from the builder stage. The guest
 # host CLIs are argv[0]-dispatch symlinks onto one multi-call binary.
@@ -91,6 +104,21 @@ chmod +x "$ROOTFS/usr/local/bin/podroid-"*
 mkdir -p "$ROOTFS/etc/conf.d"
 cp /work/files/etc/conf.d/podroid  "$ROOTFS/etc/conf.d/"
 cp /work/files/etc/conf.d/dropbear "$ROOTFS/etc/conf.d/"
+cp /work/files/etc/conf.d/tailscale "$ROOTFS/etc/conf.d/"
+
+# tailscale-openrc creates this guest-owned state directory. It is the only
+# persistent Tailscale location; enrollment material is never seeded here.
+[ -d "$ROOTFS/var/lib/tailscale" ] && [ ! -L "$ROOTFS/var/lib/tailscale" ] || {
+    echo "tailscale package omitted its regular state directory" >&2
+    exit 1
+}
+chmod 0750 "$ROOTFS/var/lib/tailscale"
+for forbidden_state in tailscaled.state podroid-enrollment; do
+    [ ! -e "$ROOTFS/var/lib/tailscale/$forbidden_state" ] || {
+        echo "rootfs must not seed Tailscale identity or enrollment state" >&2
+        exit 1
+    }
+done
 
 # The AVF vsock control channel is the only initial forward. SSH and user rules
 # are applied by Android at runtime.

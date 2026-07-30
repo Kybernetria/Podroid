@@ -81,9 +81,14 @@ val testMinimalGuestVerifier by tasks.registering(Exec::class) {
     group = "verification"
     description = "Runs minimal guest verifier regression tests."
     workingDir(rootProject.projectDir)
-    commandLine("python3", "-m", "unittest", "-v", "tests/test_verify_minimal_guest.py")
+    commandLine(
+        "python3", "-m", "unittest", "-v",
+        "tests/test_verify_minimal_guest.py",
+        "tests/networking/test_guest_tailscale.py"
+    )
     inputs.files(
         rootProject.file("tests/test_verify_minimal_guest.py"),
+        rootProject.file("tests/networking/test_guest_tailscale.py"),
         rootProject.file("tests/verify_minimal_guest.py"),
         rootProject.file("tests/verify_guest_credentials.py"),
         rootProject.fileTree("build-rootfs"),
