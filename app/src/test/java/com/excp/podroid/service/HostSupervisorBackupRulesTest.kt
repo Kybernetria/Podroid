@@ -49,6 +49,7 @@ class HostSupervisorBackupRulesTest {
         private val EXCLUSIONS = setOf(
             "file" to "datastore/host_supervisor_state.preferences_pb",
             "file" to "host-transport/",
+            "file" to "host-management/",
         )
     }
 }

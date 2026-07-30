@@ -4,9 +4,11 @@
         <!-- Runtime intent and embedded Host identity are device-local. -->
         <exclude domain="file" path="datastore/host_supervisor_state.preferences_pb" />
         <exclude domain="file" path="host-transport/" />
+        <exclude domain="file" path="host-management/" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="file" path="datastore/host_supervisor_state.preferences_pb" />
         <exclude domain="file" path="host-transport/" />
+        <exclude domain="file" path="host-management/" />
     </device-transfer>
 </data-extraction-rules>
