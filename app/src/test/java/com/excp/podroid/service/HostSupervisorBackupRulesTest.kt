@@ -50,6 +50,8 @@ class HostSupervisorBackupRulesTest {
             "file" to "datastore/host_supervisor_state.preferences_pb",
             "file" to "host-transport/",
             "file" to "host-management/",
+            "file" to "profile-store-v1/",
+            "file" to "instances/default/",
         )
     }
 }

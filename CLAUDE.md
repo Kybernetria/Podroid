@@ -72,6 +72,8 @@ Below the manager, backend operations go through `engine/VmEngine.kt`, a single 
 - **`engine/avf/AvfEngine.kt`** - AVF/pKVM. Uses the Android Virtualization Framework (reached by reflection in `AvfReflect.kt`); networking and control ride **vsock**. Hardware-accelerated; needs `MANAGE_VIRTUAL_MACHINE` + `USE_CUSTOM_VIRTUAL_MACHINE` granted via `pm grant`.
 - **`EngineHolder.kt`** - the single Hilt binding for `VmEngine`. Picks the concrete engine at startup based on `EngineSelection` (Auto / AVF / QEMU), watches Settings for backend changes, and routes imperative calls + flow access to whichever is current. Also owns the live diff that applies `PortForwardRepository` changes to the running VM.
 
+Optional downloadable boot profiles are composed in `profiles/DownloadableProfileRuntime.kt`. BuildConfig supplies one immutable Ed25519 trust root and canonical HTTPS origins from the non-secret Gradle properties `podroidProfileSigningKeyId`, `podroidProfileEd25519X509PublicKeyBase64`, `podroidProfileTrustEpoch`, and `podroidProfileCanonicalOrigins`; absent or invalid configuration remains bundled-only. The singleton repository lives under `filesDir/profile-store-v1`, while activation and rollback are available only through the separate local `ProfileLifecycleOperations` boundary implemented by `DefaultVmManager`, sharing its lifecycle mutex, fixed-runtime preflight, and application asset-tree lease. These operations are intentionally not exposed by `PodroidService` Binder endpoints.
+
 When you touch VM behavior, decide whether it is backend-neutral (put it behind `VmEngine` / `EngineHolder`) or backend-specific (inside `QemuEngine` or `AvfEngine`).
 
 ### Data flow

@@ -16,8 +16,10 @@ import com.excp.podroid.data.repository.HostSupervisorRepository
 import com.excp.podroid.data.repository.PortForwardRepository
 import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.di.ApplicationScope
-import com.excp.podroid.profiles.BundledProfileBootArtifactSource
+import com.excp.podroid.profiles.DownloadableProfileRuntime
 import com.excp.podroid.profiles.ProfileBootArtifactSource
+import com.excp.podroid.profiles.ProfileLifecycleOperations
+import com.excp.podroid.profiles.RuntimeProfileBootArtifactSource
 import com.excp.podroid.vm.ApplicationVmInstaller
 import com.excp.podroid.vm.DefaultVmManager
 import com.excp.podroid.vm.EngineManagedVmRuntime
@@ -39,7 +41,9 @@ object EngineModule {
 
     @Provides
     @Singleton
-    fun provideProfileBootArtifactSource(): ProfileBootArtifactSource = BundledProfileBootArtifactSource
+    fun provideProfileBootArtifactSource(
+        runtime: DownloadableProfileRuntime,
+    ): ProfileBootArtifactSource = RuntimeProfileBootArtifactSource(runtime)
 
     @Provides
     @Singleton
@@ -47,17 +51,18 @@ object EngineModule {
 
     @Provides
     @Singleton
-    fun provideVmManager(
+    fun provideDefaultVmManager(
         engine: VmEngine,
         @ApplicationContext context: Context,
         settings: SettingsRepository,
         portForwards: PortForwardRepository,
         profileBootArtifacts: ProfileBootArtifactSource,
+        downloadableProfiles: DownloadableProfileRuntime,
         hostSupervisor: HostSupervisorRepository,
         paths: VmPaths,
         runtimePreflight: ProductionRuntimePreflight,
         @ApplicationScope scope: CoroutineScope,
-    ): VmManager = DefaultVmManager(
+    ): DefaultVmManager = DefaultVmManager(
         runtime = EngineManagedVmRuntime(engine),
         installer = ApplicationVmInstaller(context),
         configuration = RepositoryVmConfigurationSource(context, settings, portForwards, profileBootArtifacts),
@@ -65,5 +70,12 @@ object EngineModule {
         supervisor = hostSupervisor,
         scope = scope,
         runtimePreflight = runtimePreflight.coordinator,
+        profileLifecycleStore = downloadableProfiles,
     )
+
+    @Provides
+    fun provideVmManager(manager: DefaultVmManager): VmManager = manager
+
+    @Provides
+    fun provideProfileLifecycleOperations(manager: DefaultVmManager): ProfileLifecycleOperations = manager
 }

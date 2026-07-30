@@ -24,6 +24,30 @@ abstract class BuildDebugLibTailscaleTask : Exec() {
 
 val podroidQemuVersion = providers.gradleProperty("podroidQemuVersion").get()
 
+fun String.asBuildConfigStringLiteral(): String = buildString {
+    append('"')
+    this@asBuildConfigStringLiteral.forEach { character ->
+        when (character) {
+            '\\' -> append("\\\\")
+            '"' -> append("\\\"")
+            '\n' -> append("\\n")
+            '\r' -> append("\\r")
+            '\t' -> append("\\t")
+            else -> if (character.code in 0x20..0x7e) append(character) else {
+                append("\\u")
+                append(character.code.toString(16).padStart(4, '0'))
+            }
+        }
+    }
+    append('"')
+}
+
+val profileSigningKeyId = providers.gradleProperty("podroidProfileSigningKeyId").orElse("").get()
+val profileEd25519X509PublicKeyBase64 = providers
+    .gradleProperty("podroidProfileEd25519X509PublicKeyBase64").orElse("").get()
+val profileTrustEpoch = providers.gradleProperty("podroidProfileTrustEpoch").orElse("").get()
+val profileCanonicalOrigins = providers.gradleProperty("podroidProfileCanonicalOrigins").orElse("").get()
+
 val guestRootfs = rootProject.file("app/src/main/assets/alpine-rootfs.squashfs")
 val debugApk = layout.buildDirectory.file("outputs/apk/debug/app-debug.apk")
 val releaseApk = layout.buildDirectory.file("outputs/apk/release/app-release.apk")
@@ -423,6 +447,18 @@ android {
         versionCode = 31
         versionName = "1.2.6"
         buildConfigField("String", "QEMU_VERSION", "\"$podroidQemuVersion\"")
+        buildConfigField("String", "PROFILE_SIGNING_KEY_ID", profileSigningKeyId.asBuildConfigStringLiteral())
+        buildConfigField(
+            "String",
+            "PROFILE_ED25519_X509_PUBLIC_KEY_BASE64",
+            profileEd25519X509PublicKeyBase64.asBuildConfigStringLiteral(),
+        )
+        buildConfigField("String", "PROFILE_TRUST_EPOCH", profileTrustEpoch.asBuildConfigStringLiteral())
+        buildConfigField(
+            "String",
+            "PROFILE_CANONICAL_ORIGINS",
+            profileCanonicalOrigins.asBuildConfigStringLiteral(),
+        )
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

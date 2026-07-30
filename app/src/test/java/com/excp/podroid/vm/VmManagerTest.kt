@@ -5,6 +5,16 @@ import com.excp.podroid.data.repository.HostSupervisorRepository
 import com.excp.podroid.engine.ExactValueStateFlow
 import com.excp.podroid.engine.VmConfig
 import com.excp.podroid.engine.VmState
+import com.excp.podroid.profiles.ActivationState
+import com.excp.podroid.profiles.DataDeletionConfirmation
+import com.excp.podroid.profiles.GuestDataPolicy
+import com.excp.podroid.profiles.PreparedProfileCandidate
+import com.excp.podroid.profiles.ProfileGeneration
+import com.excp.podroid.profiles.ProfileId
+import com.excp.podroid.profiles.ProfileLifecycleStore
+import com.excp.podroid.profiles.Sha256Digest
+import com.excp.podroid.profiles.SigningKeyId
+import com.excp.podroid.profiles.TrustEpoch
 import com.excp.podroid.service.ServiceLaunchCoordinator
 import java.io.IOException
 import java.nio.file.Files
@@ -53,6 +63,122 @@ class VmManagerTest {
         assertEquals(VmLifecycleState.ERROR, manager.lifecycle(VmId.DEFAULT).value)
         assertEquals("boom", manager.status(VmId.DEFAULT).errorMessage)
         assertEquals("qemu", manager.status(VmId.DEFAULT).backendId)
+    }
+
+    @Test
+    fun `profile activation shares lifecycle serialization and asset lease with launch`() = runBlocking {
+        val runtime = FakeRuntime()
+        val activationEntered = CompletableDeferred<Unit>()
+        val releaseActivation = CompletableDeferred<Unit>()
+        var leaseHeld = false
+        val installer = object : TestInstaller() {
+            override suspend fun install(vmId: VmId) = Unit
+            override suspend fun <T> withExclusiveTree(
+                vmId: VmId,
+                action: suspend (VmAssetTreeLease) -> T,
+            ): T {
+                check(!leaseHeld)
+                leaseHeld = true
+                return try { super.withExclusiveTree(vmId, action) } finally { leaseHeld = false }
+            }
+        }
+        val profileStore = FakeProfileLifecycleStore(
+            onInstall = {
+                assertTrue(leaseHeld)
+                activationEntered.complete(Unit)
+                releaseActivation.await()
+            },
+        )
+        val manager = manager(
+            runtime = runtime,
+            installer = installer,
+            profileLifecycleStore = profileStore,
+        )
+
+        val activation = async(start = CoroutineStart.UNDISPATCHED) {
+            manager.activateProfile(profileCandidate(), GuestDataPolicy.PRESERVE_DATA)
+        }
+        activationEntered.await()
+        val launch = async { manager.start(VmId.DEFAULT) }
+        delay(30)
+        assertEquals(0, runtime.startCalls)
+
+        releaseActivation.complete(Unit)
+        activation.await()
+        launch.await()
+        assertEquals(1, profileStore.installCalls)
+        assertEquals(1, runtime.startCalls)
+    }
+
+    @Test
+    fun `profile rollback uses stopped-runtime preflight and the same lifecycle store`() = runBlocking {
+        val candidate = profileCandidate()
+        val qemu = CountingProbe(RuntimeBackend.QEMU, RuntimeProbeResult.Absent)
+        val avf = CountingProbe(RuntimeBackend.AVF, RuntimeProbeResult.Absent)
+        var leaseHeld = false
+        val installer = object : TestInstaller() {
+            override suspend fun install(vmId: VmId) = Unit
+            override suspend fun <T> withExclusiveTree(
+                vmId: VmId,
+                action: suspend (VmAssetTreeLease) -> T,
+            ): T {
+                leaseHeld = true
+                return try { super.withExclusiveTree(vmId, action) } finally { leaseHeld = false }
+            }
+        }
+        val store = FakeProfileLifecycleStore(
+            onRollback = { assertTrue(leaseHeld) },
+            rollbackResult = ActivationState(4, candidate, null),
+        )
+        val manager = manager(
+            installer = installer,
+            profileLifecycleStore = store,
+            runtimePreflight = RuntimePreflightCoordinator(qemu, avf) {},
+        )
+
+        val result = manager.rollbackProfile(3, GuestDataPolicy.PRESERVE_DATA)
+
+        assertEquals(4, result.activationSequence)
+        assertEquals(1, store.rollbackCalls)
+        assertEquals(1, qemu.probeCalls)
+        assertEquals(1, avf.probeCalls)
+    }
+
+    @Test
+    fun `profile activation rejects active runtime and failed fixed-runtime preflight`() = runBlocking {
+        val activeRuntime = FakeRuntime().apply {
+            state.value = VmState.Running
+            quiescent.value = false
+        }
+        val activeStore = FakeProfileLifecycleStore()
+        val activeManager = manager(runtime = activeRuntime, profileLifecycleStore = activeStore)
+        try {
+            activeManager.activateProfile(profileCandidate(), GuestDataPolicy.PRESERVE_DATA)
+            fail("Expected active runtime rejection")
+        } catch (_: IllegalStateException) {
+            Unit
+        }
+        assertEquals(0, activeStore.installCalls)
+
+        val uncertain = CountingProbe(
+            RuntimeBackend.QEMU,
+            RuntimeProbeResult.Uncertain(LifecycleErrorCode.RUNTIME_OWNERSHIP, true),
+        )
+        val stoppedStore = FakeProfileLifecycleStore()
+        val stoppedManager = manager(
+            profileLifecycleStore = stoppedStore,
+            runtimePreflight = RuntimePreflightCoordinator(
+                uncertain,
+                CountingProbe(RuntimeBackend.AVF, RuntimeProbeResult.Absent),
+            ) {},
+        )
+        try {
+            stoppedManager.activateProfile(profileCandidate(), GuestDataPolicy.PRESERVE_DATA)
+            fail("Expected fixed-runtime preflight rejection")
+        } catch (_: RuntimeProbeException) {
+            Unit
+        }
+        assertEquals(0, stoppedStore.installCalls)
     }
 
     @Test
@@ -1720,6 +1846,7 @@ class VmManagerTest {
         beforeDirectCommandClaim: suspend (LifecycleTransactionToken) -> Unit = {},
         beforeDirectCommandEffect: suspend (LifecycleTransactionToken) -> Unit = {},
         runtimePreflight: RuntimePreflightCoordinator? = null,
+        profileLifecycleStore: ProfileLifecycleStore = FakeProfileLifecycleStore(),
     ): DefaultVmManager {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default).also(scopes::add)
         return DefaultVmManager(
@@ -1738,6 +1865,7 @@ class VmManagerTest {
                 CountingProbe(RuntimeBackend.QEMU, RuntimeProbeResult.Absent),
                 CountingProbe(RuntimeBackend.AVF, RuntimeProbeResult.Absent),
             ) {},
+            profileLifecycleStore = profileLifecycleStore,
             beforeFinalLaunchAuthorization = beforeFinalLaunchAuthorization,
             beforeFinalStopAuthorization = beforeFinalStopAuthorization,
             beforeCoordinatedStop = beforeCoordinatedStop,
@@ -1889,6 +2017,42 @@ class VmManagerTest {
                 ),
             )
             return true
+        }
+    }
+
+    private fun profileCandidate() = PreparedProfileCandidate(
+        profileId = ProfileId("default"),
+        generation = ProfileGeneration(1),
+        manifestSha256 = Sha256Digest("a".repeat(64)),
+        signingKeyId = SigningKeyId("release-1"),
+        signingKeyFingerprint = Sha256Digest("b".repeat(64)),
+        trustEpoch = TrustEpoch(1),
+    )
+
+    private class FakeProfileLifecycleStore(
+        private val onInstall: suspend () -> Unit = {},
+        private val onRollback: suspend () -> Unit = {},
+        private val rollbackResult: ActivationState? = null,
+    ) : ProfileLifecycleStore {
+        var installCalls = 0
+        var rollbackCalls = 0
+        override suspend fun install(
+            candidate: PreparedProfileCandidate,
+            dataPolicy: GuestDataPolicy,
+            deletionConfirmation: DataDeletionConfirmation?,
+        ): ActivationState {
+            installCalls++
+            onInstall()
+            return ActivationState(1, candidate, null)
+        }
+
+        override suspend fun rollback(
+            expectedActivationSequence: Long,
+            dataPolicy: GuestDataPolicy,
+        ): ActivationState {
+            rollbackCalls++
+            onRollback()
+            return rollbackResult ?: throw UnsupportedOperationException()
         }
     }
 

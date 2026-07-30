@@ -9,6 +9,12 @@ import com.excp.podroid.engine.QmpController
 import com.excp.podroid.engine.VmConfig
 import com.excp.podroid.engine.VmEngine
 import com.excp.podroid.engine.VmState
+import com.excp.podroid.profiles.ActivationState
+import com.excp.podroid.profiles.DataDeletionConfirmation
+import com.excp.podroid.profiles.GuestDataPolicy
+import com.excp.podroid.profiles.PreparedProfileCandidate
+import com.excp.podroid.profiles.ProfileLifecycleOperations
+import com.excp.podroid.profiles.ProfileLifecycleStore
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
@@ -283,13 +289,14 @@ class DefaultVmManager internal constructor(
     private val forceStopTimeoutMs: Long = 7_000L,
     private val qmpTimeoutMs: Long = 5_000L,
     private val runtimePreflight: RuntimePreflightCoordinator,
+    private val profileLifecycleStore: ProfileLifecycleStore,
     /** Deterministic test seams around command admission and backend task dispatch. */
     private val beforeFinalLaunchAuthorization: suspend (LifecycleTransactionToken) -> Unit = {},
     private val beforeFinalStopAuthorization: suspend (LifecycleTransactionToken) -> Unit = {},
     private val beforeCoordinatedStop: suspend () -> Unit = {},
     private val beforeDirectCommandClaim: suspend (LifecycleTransactionToken) -> Unit = {},
     private val beforeDirectCommandEffect: suspend (LifecycleTransactionToken) -> Unit = {},
-) : VmManager {
+) : VmManager, ProfileLifecycleOperations {
     private val lifecycleMutex = Mutex()
     private val stopTaskMutex = Mutex()
     private val launchCompletionMutex = Mutex()
@@ -672,6 +679,21 @@ class DefaultVmManager internal constructor(
             }
         }
         false
+    }
+
+    override suspend fun activateProfile(
+        candidate: PreparedProfileCandidate,
+        dataPolicy: GuestDataPolicy,
+        deletionConfirmation: DataDeletionConfirmation?,
+    ): ActivationState = withStoppedProfileLifecycle {
+        profileLifecycleStore.install(candidate, dataPolicy, deletionConfirmation)
+    }
+
+    override suspend fun rollbackProfile(
+        expectedActivationSequence: Long,
+        dataPolicy: GuestDataPolicy,
+    ): ActivationState = withStoppedProfileLifecycle {
+        profileLifecycleStore.rollback(expectedActivationSequence, dataPolicy)
     }
 
     override suspend fun readConsoleLog(vmId: VmId, request: ConsoleLogRequest): ConsoleLog =
@@ -1137,6 +1159,29 @@ class DefaultVmManager internal constructor(
     private suspend fun awaitInitial(vmId: VmId) {
         requireDefault(vmId)
         installer.awaitInitial(vmId)
+    }
+
+    /** Profile activation shares the exact lifecycle mutex and application asset-tree lease. */
+    private suspend fun <T> withStoppedProfileLifecycle(action: suspend () -> T): T {
+        awaitInitial(VmId.DEFAULT)
+        return lifecycleMutex.withLock {
+            requireStoppedAndQuiescentForProfileMutation()
+            installer.withExclusiveTree(VmId.DEFAULT) {
+                requireStoppedAndQuiescentForProfileMutation()
+                runtimePreflight.ensureAllFixedRuntimesStopped()
+                requireStoppedAndQuiescentForProfileMutation()
+                action()
+            }
+        }
+    }
+
+    private fun requireStoppedAndQuiescentForProfileMutation() {
+        check(!busyFlow.value && runtime.quiescent.value) {
+            "Profile activation requires a quiescent VM runtime"
+        }
+        check(runtime.state.value is VmState.Idle || runtime.state.value is VmState.Stopped) {
+            "Profile activation requires a stopped VM runtime"
+        }
     }
 
     private suspend fun <T> withTree(vmId: VmId, action: suspend () -> T): T {

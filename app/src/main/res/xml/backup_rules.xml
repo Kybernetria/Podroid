@@ -4,4 +4,7 @@
     <exclude domain="file" path="datastore/host_supervisor_state.preferences_pb" />
     <exclude domain="file" path="host-transport/" />
     <exclude domain="file" path="host-management/" />
+    <!-- Downloaded boot trust state and VM data are device-local and too large for transfer. -->
+    <exclude domain="file" path="profile-store-v1/" />
+    <exclude domain="file" path="instances/default/" />
 </full-backup-content>
