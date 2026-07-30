@@ -10,6 +10,7 @@
 package com.excp.podroid.engine
 
 import com.excp.podroid.data.repository.PortForwardRule
+import com.excp.podroid.vm.VmBootArtifacts
 import com.excp.podroid.vm.VmId
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
@@ -113,6 +114,7 @@ interface VmEngine {
  */
 data class VmConfig(
     val vmId: VmId = VmId.DEFAULT,
+    val bootArtifacts: VmBootArtifacts? = null,
     val ramMb: Int = 512,
     val cpus: Int = 1,
     val sshEnabled: Boolean = false,

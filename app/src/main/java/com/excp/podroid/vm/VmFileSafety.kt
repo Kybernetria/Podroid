@@ -66,7 +66,13 @@ class VmPathSecurity(private val paths: VmPaths) {
         for (required in listOf(paths.kernel, paths.initrd, paths.rootfs)) {
             requireRegularFile(required.toPath(), "required VM boot input")
         }
-        for (optional in listOf(paths.storageImage, paths.rawKernel, paths.qemuEfiRom, paths.consoleLog)) {
+        for (optional in listOf(
+            paths.storageImage,
+            paths.rawKernel,
+            paths.rawKernelDigestStamp,
+            paths.qemuEfiRom,
+            paths.consoleLog,
+        )) {
             val path = optional.toPath().toAbsolutePath().normalize()
             if (existsNoFollow(path)) requireRegularFile(path, "VM file")
         }

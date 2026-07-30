@@ -21,6 +21,7 @@ class VmPaths private constructor(
     val storageImage: File = child("storage.img")
     val kernel: File = child("vmlinuz-virt")
     val rawKernel: File = child("vmlinuz-virt.raw")
+    val rawKernelDigestStamp: File = child(".vmlinuz-virt.raw.digest")
     val initrd: File = child("initrd.img")
     val rootfs: File = child("alpine-rootfs.squashfs")
     val assetStamp: File = child(".assets_stamp")
@@ -48,6 +49,7 @@ class VmPaths private constructor(
         "storage" to storageImage,
         "kernel" to kernel,
         "rawKernel" to rawKernel,
+        "rawKernelDigestStamp" to rawKernelDigestStamp,
         "initrd" to initrd,
         "rootfs" to rootfs,
         "assetStamp" to assetStamp,

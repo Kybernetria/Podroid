@@ -215,7 +215,12 @@ interface VmManager {
 internal data class VmLaunchPlan(
     val portForwards: List<PortForwardRule>,
     val config: VmConfig,
-)
+    val bootArtifacts: VmBootArtifacts? = config.bootArtifacts,
+) {
+    init {
+        require(config.bootArtifacts == bootArtifacts) { "Launch plan boot artifacts must match its VM config" }
+    }
+}
 
 internal interface ManagedVmRuntime {
     val vmId: VmId
@@ -1195,7 +1200,10 @@ internal class EngineManagedVmRuntime(private val engine: VmEngine) : ManagedVmR
     override fun emulatorPid(): Int? = engine.emulatorPid()
     override fun diagnosticsReport(): String = engine.diagnosticsReport()
 
-    override suspend fun start(plan: VmLaunchPlan) = engine.start(plan.portForwards, plan.config)
+    override suspend fun start(plan: VmLaunchPlan) = engine.start(
+        plan.portForwards,
+        plan.config.copy(bootArtifacts = plan.bootArtifacts),
+    )
     override fun stop() = engine.stop()
     override fun forceStop() = engine.forceStop()
     override suspend fun systemPowerdown(): Result<Unit> =

@@ -30,9 +30,11 @@ import android.util.Log
 import com.excp.podroid.data.repository.PortForwardRule
 import com.excp.podroid.util.HostMetrics
 import com.excp.podroid.util.LogProxy
+import com.excp.podroid.vm.VmBootFiles
 import com.excp.podroid.vm.VmId
 import com.excp.podroid.vm.VmPathSecurity
 import com.excp.podroid.vm.VmPaths
+import com.excp.podroid.vm.bootFiles
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -49,6 +51,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import javax.inject.Singleton
+
+internal fun qemuBootFiles(config: VmConfig, paths: VmPaths): VmBootFiles = config.bootFiles(paths)
 
 @SuppressLint("StaticFieldLeak") // ApplicationContext — lives as long as the process, no leak
 @Singleton
@@ -348,6 +352,7 @@ class QemuEngine @Inject constructor(
         val pathSecurity = VmPathSecurity(vmPaths)
         try {
             pathSecurity.validateForLaunch()
+            config.bootArtifacts?.validateFiles()
             ensureStorageImage(config.storageSizeGb)
         } catch (e: java.io.IOException) {
             // Restore the "cleanedUp=false ⟺ VM lifetime in progress" invariant
@@ -409,6 +414,7 @@ class QemuEngine @Inject constructor(
             // Recheck after disk preparation/socket cleanup and directly before
             // the irreversible process launch.
             pathSecurity.validateForLaunch()
+            config.bootArtifacts?.validateFiles()
             val owner = QemuProcessOwner<Process, Int>(
                 commit = { child ->
                     val pid = HostMetrics.processPid(child)?.toLong()
@@ -714,8 +720,9 @@ class QemuEngine @Inject constructor(
         args += "-smp"; args += "${config.cpus}"
         args += "-m";   args += "${config.ramMb}"
 
-        val kernelPath = vmPaths.kernel
-        val initrdPath = vmPaths.initrd
+        val bootFiles = qemuBootFiles(config, vmPaths)
+        val kernelPath = bootFiles.kernel
+        val initrdPath = bootFiles.initrd
 
         if (kernelPath.exists()) {
             args += "-kernel"; args += kernelPath.absolutePath
@@ -756,7 +763,7 @@ class QemuEngine @Inject constructor(
             args += "-drive";  args += "file=${storagePath.absolutePath},if=none,id=drive1,format=raw,cache=writeback,aio=threads,discard=unmap,detect-zeroes=unmap"
         }
 
-        val rootfsImg = vmPaths.rootfs
+        val rootfsImg = bootFiles.rootfs
         if (rootfsImg.exists()) {
             // Dedicated iothread for the read-only squashfs so its decompression
             // reads don't queue behind storage.img writes on iothread0.

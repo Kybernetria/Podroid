@@ -120,6 +120,25 @@ class VmManagerTest {
     }
 
     @Test
+    fun `invalid configured boot artifacts block launch before runtime start`() = runBlocking {
+        val runtime = FakeRuntime()
+        val configuration = FakeConfiguration(
+            launchFailure = IOException("configured active profile is invalid"),
+        )
+        val manager = manager(runtime = runtime, configuration = configuration)
+
+        val failure = runCatching { manager.start(VmId.DEFAULT) }.exceptionOrNull()
+
+        assertTrue(failure is IOException)
+        assertEquals(0, runtime.startCalls)
+        assertTrue(runtime.quiescent.value)
+        assertEquals(
+            LifecycleOutcome.FAILED,
+            manager.supervisorState(VmId.DEFAULT).latestTransaction?.outcome,
+        )
+    }
+
+    @Test
     fun `concurrent ensure installed is serialized and duplicate is idempotent`() = runBlocking {
         val files = FakeFiles(installed = false)
         val entered = CompletableDeferred<Unit>()
@@ -1964,8 +1983,15 @@ class VmManagerTest {
         override fun redactPrivatePaths(text: String): String = text
     }
 
-    private class FakeConfiguration(var ssh: Boolean = false) : VmConfigurationSource {
-        override suspend fun launchPlan(vmId: VmId) = VmLaunchPlan(emptyList(), VmConfig(vmId = vmId))
+    private class FakeConfiguration(
+        var ssh: Boolean = false,
+        var launchFailure: IOException? = null,
+    ) : VmConfigurationSource {
+        override suspend fun launchPlan(vmId: VmId): VmLaunchPlan {
+            launchFailure?.let { throw it }
+            return VmLaunchPlan(emptyList(), VmConfig(vmId = vmId))
+        }
+
         override suspend fun sshEnabled(vmId: VmId) = ssh
     }
 

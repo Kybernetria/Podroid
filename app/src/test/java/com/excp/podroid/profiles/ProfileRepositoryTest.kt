@@ -652,6 +652,37 @@ class ProfileRepositoryTest {
     }
 
     @Test
+    fun `boot artifact source resolves the validated active generation after process restart`() {
+        val root = temporaryFolder.newFolder("boot-source-restart")
+        val storage = storageFor(root)
+        val bytes = artifactBytes("boot-source")
+        val firstRepository = repository(root, RecordingFetcher(bytes), storage = storage)
+        val prepared = firstRepository.prepare(envelope(23, artifacts = bytes))
+        firstRepository.activate(prepared.candidate, GuestDataPolicy.PRESERVE_DATA)
+
+        val restartedRepository = repository(root, RecordingFetcher(bytes), storage = storage)
+        val resolved = RepositoryProfileBootArtifactSource(restartedRepository).resolveActiveBootArtifacts()!!
+
+        assertEquals(23L, resolved.generation.value)
+        assertEquals(prepared.candidate.manifestSha256.value, resolved.manifestSha256.value)
+        ArtifactRole.entries.forEach { role ->
+            val selected = when (role) {
+                ArtifactRole.KERNEL -> resolved.kernel
+                ArtifactRole.INITRD -> resolved.initrd
+                ArtifactRole.ROOTFS -> resolved.rootfs
+            }
+            assertEquals(prepared.artifactFiles.getValue(role), selected.file)
+            assertEquals(prepared.artifactDigests.getValue(role).value, selected.sha256.value)
+        }
+        resolved.validateFiles()
+
+        resolved.kernel.file.writeText("invalid-configured-active-profile")
+        assertFailure<ProfileRepositoryCorruptException> {
+            RepositoryProfileBootArtifactSource(restartedRepository).resolveActiveBootArtifacts()
+        }
+    }
+
+    @Test
     fun `prepared generation pruning recovers the retention bound`() {
         val root = temporaryFolder.newFolder("generation-pruning")
         var artifacts = artifactBytes("generation-1")

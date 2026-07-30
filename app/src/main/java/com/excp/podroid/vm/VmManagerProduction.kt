@@ -10,6 +10,7 @@ import com.excp.podroid.data.repository.PortForwardRepository
 import com.excp.podroid.data.repository.PortForwardRule
 import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.engine.VmConfig
+import com.excp.podroid.profiles.ProfileBootArtifactSource
 import com.excp.podroid.util.NetworkUtils
 
 /** Reuses the application's hardened, atomic extraction path for reinstalls. */
@@ -44,17 +45,23 @@ internal class RepositoryVmConfigurationSource(
     private val context: Context,
     private val settings: SettingsRepository,
     private val portForwards: PortForwardRepository,
+    private val profileBootArtifacts: ProfileBootArtifactSource,
 ) : VmConfigurationSource {
     override suspend fun launchPlan(vmId: VmId): VmLaunchPlan {
         require(vmId == VmId.DEFAULT) { "Only the default VM is supported" }
         val persistedRules = portForwards.getRulesSnapshot()
         val sshEnabled = settings.getSshEnabledSnapshot()
         val rules = assembleRules(persistedRules, sshEnabled)
+        // DefaultVmManager invokes launchPlan while it owns the application asset-tree lease.
+        // Any configured active profile is repository/trust/digest validated here; only a truly
+        // absent activation returns null and selects the bundled legacy paths.
+        val bootArtifacts = profileBootArtifacts.resolveActiveBootArtifacts()
 
         return VmLaunchPlan(
             portForwards = rules,
             config = VmConfig(
                 vmId = vmId,
+                bootArtifacts = bootArtifacts,
                 ramMb = settings.getVmRamMbSnapshot(),
                 cpus = settings.getVmCpusSnapshot(),
                 sshEnabled = sshEnabled,

@@ -31,10 +31,12 @@ import com.excp.podroid.engine.VmConfig
 import com.excp.podroid.engine.VmEngine
 import com.excp.podroid.engine.VmState
 import com.excp.podroid.util.LogProxy
-import com.excp.podroid.vm.VmAtomicFile
+import com.excp.podroid.vm.VmBootArtifacts
+import com.excp.podroid.vm.VmBootFiles
 import com.excp.podroid.vm.VmId
 import com.excp.podroid.vm.VmPathSecurity
 import com.excp.podroid.vm.VmPaths
+import com.excp.podroid.vm.bootFiles
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -52,6 +54,8 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import javax.inject.Singleton
+
+internal fun avfBootFiles(config: VmConfig, paths: VmPaths): VmBootFiles = config.bootFiles(paths)
 
 // AVF requires API 34 (UpsideDownCake). EngineHolder only resolves the
 // Provider<AvfEngine> when getCapabilities() reports AVF support, which implies
@@ -388,6 +392,7 @@ class AvfEngine @Inject constructor(
         val pathSecurity = VmPathSecurity(vmPaths)
         try {
             pathSecurity.validateForLaunch()
+            config.bootArtifacts?.validateFiles()
             val mgr = AvfReflect.manager(context)
             val vmConfigObj = buildConfig(mgr, config, pathSecurity)
 
@@ -1032,32 +1037,6 @@ class AvfEngine @Inject constructor(
         return storageFile
     }
 
-    /**
-     * crosvm requires the raw ARM64 Image (magic `ARM\x64` at offset 0x38), not
-     * the gzip-compressed `vmlinuz` that QEMU happily auto-decompresses. We
-     * gunzip on-demand to a sibling .raw file and feed THAT to AVF.
-     *
-     * Skips decompression if the .raw file's mtime is newer than the source.
-     * Returns the decompressed file (or the source if already raw).
-     */
-    private fun ensureRawKernel(source: File, pathSecurity: VmPathSecurity): File {
-        val magic = ByteArray(4)
-        source.inputStream().use { it.read(magic) }
-        val isGzip = magic[0] == 0x1f.toByte() && magic[1] == 0x8b.toByte()
-        if (!isGzip) return source
-
-        val raw = vmPaths.rawKernel
-        if (raw.exists() && raw.lastModified() >= source.lastModified()) return raw
-
-        Log.d(TAG, "Decompressing ${source.name} → ${raw.name}")
-        VmAtomicFile.write(raw, pathSecurity) { output ->
-            java.util.zip.GZIPInputStream(source.inputStream().buffered()).use { gz ->
-                gz.copyTo(output)
-            }
-        }
-        return raw
-    }
-
     override fun diagnosticsReport(): String = buildString {
         appendLine("persisted console capture: $persistedConsoleCaptureEnabled")
         appendLine("backend launch config: $launchConfigSummary")
@@ -1090,15 +1069,24 @@ class AvfEngine @Inject constructor(
         // NOT rewrite this launch's topology back up (issue #29).
         if (!useExplicitCpuCount) AvfReflect.disarmExplicitCpuCount()
 
-        val kernelSrc = vmPaths.kernel.also {
+        config.bootArtifacts?.validateFiles()
+        val bootFiles = avfBootFiles(config, vmPaths)
+        val kernelSrc = bootFiles.kernel.also {
             require(it.exists()) { "kernel missing at ${it.absolutePath}" }
         }
-        val kernel = ensureRawKernel(kernelSrc, pathSecurity)
-        val initrd = vmPaths.initrd.also {
+        val kernelDigest = bootFiles.kernelDigest ?: VmBootArtifacts.digest(kernelSrc)
+        val kernel = AvfRawKernelCache.prepare(
+            source = kernelSrc,
+            sourceDigest = kernelDigest,
+            raw = vmPaths.rawKernel,
+            stamp = vmPaths.rawKernelDigestStamp,
+            pathSecurity = pathSecurity,
+        )
+        val initrd = bootFiles.initrd.also {
             require(it.exists()) { "initrd missing at ${it.absolutePath}" }
         }
         val storage = ensureStorageImage(config.storageSizeGb)
-        val squashfs = vmPaths.rootfs.also {
+        val squashfs = bootFiles.rootfs.also {
             require(it.exists()) { "rootfs missing at ${it.absolutePath}" }
         }
 

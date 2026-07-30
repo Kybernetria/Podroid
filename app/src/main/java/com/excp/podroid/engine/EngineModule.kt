@@ -16,6 +16,8 @@ import com.excp.podroid.data.repository.HostSupervisorRepository
 import com.excp.podroid.data.repository.PortForwardRepository
 import com.excp.podroid.data.repository.SettingsRepository
 import com.excp.podroid.di.ApplicationScope
+import com.excp.podroid.profiles.BundledProfileBootArtifactSource
+import com.excp.podroid.profiles.ProfileBootArtifactSource
 import com.excp.podroid.vm.ApplicationVmInstaller
 import com.excp.podroid.vm.DefaultVmManager
 import com.excp.podroid.vm.EngineManagedVmRuntime
@@ -37,6 +39,10 @@ object EngineModule {
 
     @Provides
     @Singleton
+    fun provideProfileBootArtifactSource(): ProfileBootArtifactSource = BundledProfileBootArtifactSource
+
+    @Provides
+    @Singleton
     fun provideVmEngine(holder: EngineHolder): VmEngine = holder
 
     @Provides
@@ -46,6 +52,7 @@ object EngineModule {
         @ApplicationContext context: Context,
         settings: SettingsRepository,
         portForwards: PortForwardRepository,
+        profileBootArtifacts: ProfileBootArtifactSource,
         hostSupervisor: HostSupervisorRepository,
         paths: VmPaths,
         runtimePreflight: ProductionRuntimePreflight,
@@ -53,7 +60,7 @@ object EngineModule {
     ): VmManager = DefaultVmManager(
         runtime = EngineManagedVmRuntime(engine),
         installer = ApplicationVmInstaller(context),
-        configuration = RepositoryVmConfigurationSource(context, settings, portForwards),
+        configuration = RepositoryVmConfigurationSource(context, settings, portForwards, profileBootArtifacts),
         files = VmPathFiles(paths),
         supervisor = hostSupervisor,
         scope = scope,

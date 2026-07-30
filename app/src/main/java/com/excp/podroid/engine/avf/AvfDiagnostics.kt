@@ -22,7 +22,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import com.excp.podroid.PodroidApplication
 import com.excp.podroid.vm.MonotonicDeadline
-import com.excp.podroid.vm.VmAtomicFile
+import com.excp.podroid.vm.VmBootArtifacts
 import com.excp.podroid.vm.VmPathSecurity
 import com.excp.podroid.vm.VmPaths
 import java.io.File
@@ -250,7 +250,13 @@ object AvfDiagnostics {
                     ?: throw SmokeOutcome("FAILED: VirtualMachineManager system service returned null")
                 // crosvm requires the raw ARM64 Image. Preparation and all
                 // reflective builder calls remain inside the bounded Future.
-                val kernel = ensureRawKernel(kernelSrc, vmPaths.rawKernel, pathSecurity)
+                val kernel = AvfRawKernelCache.prepare(
+                    source = kernelSrc,
+                    sourceDigest = VmBootArtifacts.digest(kernelSrc),
+                    raw = vmPaths.rawKernel,
+                    stamp = vmPaths.rawKernelDigestStamp,
+                    pathSecurity = pathSecurity,
+                )
                 val customConfig = buildCustomImageConfig(kernel.absolutePath, initrd.absolutePath)
                 SmokeSetup(manager, buildVirtualMachineConfig(manager, context, customConfig))
             },
@@ -335,29 +341,6 @@ object AvfDiagnostics {
         val mgrCls = Class.forName(CLS_MANAGER)
         val m = Context::class.java.getMethod("getSystemService", Class::class.java)
         return m.invoke(context, mgrCls)
-    }
-
-    /**
-     * Mirrors AvfEngine.ensureRawKernel: crosvm requires the raw ARM64 Image
-     * (magic `ARM\x64` at 0x38), not the gzip-compressed vmlinuz. Decompress to
-     * the same sibling `.raw` file so the cache is shared with the real VM path.
-     * Returns the source untouched if it isn't gzip.
-     */
-    private fun ensureRawKernel(
-        source: File,
-        raw: File,
-        pathSecurity: VmPathSecurity,
-    ): File {
-        val magic = ByteArray(4)
-        source.inputStream().use { it.read(magic) }
-        if (magic[0] != 0x1f.toByte() || magic[1] != 0x8b.toByte()) return source
-        if (raw.exists() && raw.lastModified() >= source.lastModified()) return raw
-        VmAtomicFile.write(raw, pathSecurity) { output ->
-            java.util.zip.GZIPInputStream(source.inputStream().buffered()).use { gz ->
-                gz.copyTo(output)
-            }
-        }
-        return raw
     }
 
     private fun buildCustomImageConfig(kernelPath: String, initrdPath: String): Any {

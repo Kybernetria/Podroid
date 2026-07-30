@@ -76,8 +76,15 @@ class PreparedProfile internal constructor(
     val candidate: PreparedProfileCandidate,
     val dataCompatibility: DataCompatibilityId,
     artifactFiles: Map<ArtifactRole, File>,
+    artifactDigests: Map<ArtifactRole, Sha256Digest>,
 ) {
     val artifactFiles: Map<ArtifactRole, File> = Collections.unmodifiableMap(artifactFiles.toMap())
+    val artifactDigests: Map<ArtifactRole, Sha256Digest> = Collections.unmodifiableMap(artifactDigests.toMap())
+
+    init {
+        require(this.artifactFiles.keys == ArtifactRole.entries.toSet()) { "prepared profile files are incomplete" }
+        require(this.artifactDigests.keys == ArtifactRole.entries.toSet()) { "prepared profile digests are incomplete" }
+    }
 }
 
 data class ActivationState(
@@ -1706,6 +1713,7 @@ class ProfileRepository(
         candidate,
         dataCompatibility,
         artifacts.associate { it.role to blobPath(it.sha256).toFile() },
+        artifacts.associate { it.role to it.sha256 },
     )
 
     private fun profileKey(profileId: ProfileId): String = MessageDigest.getInstance("SHA-256")
