@@ -14,7 +14,7 @@ fun interface DirectoryDurability {
     fun force(directory: Path)
 }
 
-/** Pure Java default used by the repository and local unit tests. */
+/** Pure Java implementation used explicitly by local unit tests. */
 object FileChannelDirectoryDurability : DirectoryDurability {
     override fun force(directory: Path) {
         FileChannel.open(directory, StandardOpenOption.READ).use { it.force(true) }
@@ -23,13 +23,16 @@ object FileChannelDirectoryDurability : DirectoryDurability {
 
 /** Android-specific implementation available to a later composition root. */
 object AndroidDirectoryDurability : DirectoryDurability {
+    // Linux O_DIRECTORY (not exposed by every Android SDK's OsConstants stubs).
+    private const val O_DIRECTORY = 0x10000
+
     override fun force(directory: Path) {
         var descriptor: FileDescriptor? = null
         var failure: Throwable? = null
         try {
             descriptor = Os.open(
                 directory.toString(),
-                OsConstants.O_RDONLY or OsConstants.O_CLOEXEC,
+                OsConstants.O_RDONLY or OsConstants.O_CLOEXEC or O_DIRECTORY,
                 0,
             )
             Os.fsync(descriptor)

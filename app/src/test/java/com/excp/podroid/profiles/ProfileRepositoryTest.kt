@@ -166,7 +166,7 @@ class ProfileRepositoryTest {
     }
 
     @Test
-    fun `incompatible preserve is rejected while repository-issued delete token is exact and idempotent`() {
+    fun `incompatible preserve is rejected while repository-issued delete token is exact`() {
         val root = temporaryFolder.newFolder("delete")
         val storage = storageFor(root).also { it.writeText("must survive rejection") }
         val firstBytes = artifactBytes("delete-one")
@@ -190,8 +190,33 @@ class ProfileRepositoryTest {
         val activated = repository.activate(second.candidate, GuestDataPolicy.DELETE_DATA, confirmation)
         assertFalse(storage.exists())
         storage.writeText("new data after response loss")
-        assertEquals(activated, repository.activate(second.candidate, GuestDataPolicy.DELETE_DATA))
+        assertFailure<ProfileActivationException> {
+            repository.activate(second.candidate, GuestDataPolicy.DELETE_DATA, confirmation)
+        }
         assertTrue(storage.exists())
+        assertEquals(activated, repository.activate(second.candidate, GuestDataPolicy.PRESERVE_DATA))
+    }
+
+    @Test
+    fun `same-active delete is a new reset transaction and stale replay cannot delete recreated data`() {
+        val root = temporaryFolder.newFolder("same-active-reset")
+        val storage = storageFor(root).also { it.writeText("original data") }
+        val artifacts = artifactBytes("same-active-reset")
+        val repository = repository(root, RecordingFetcher(artifacts), storage = storage)
+        val candidate = repository.prepare(envelope(1, artifacts = artifacts)).candidate
+        val first = repository.activate(candidate, GuestDataPolicy.PRESERVE_DATA)
+        val confirmation = repository.issueDataDeletionConfirmation(candidate)
+
+        val reset = repository.activate(candidate, GuestDataPolicy.DELETE_DATA, confirmation)
+
+        assertEquals(first.activationSequence + 1L, reset.activationSequence)
+        assertEquals(candidate, reset.active)
+        assertFalse(storage.exists())
+        storage.writeText("recreated data")
+        assertFailure<ProfileActivationException> {
+            repository.activate(candidate, GuestDataPolicy.DELETE_DATA, confirmation)
+        }
+        assertEquals("recreated data", storage.readText())
     }
 
     @Test
@@ -256,38 +281,135 @@ class ProfileRepositoryTest {
     }
 
     @Test
-    fun `pending recovery revalidates replacement trust candidate floor and blobs before deletion`() {
-        listOf("replacement", "revocation", "blob").forEach { scenario ->
-            val root = temporaryFolder.newFolder("pending-$scenario")
-            val storage = storageFor(root).also { it.writeText("original") }
-            val artifacts = artifactBytes("pending-$scenario")
-            val armed = AtomicInteger(1)
-            val repository = repository(
-                root,
-                RecordingFetcher(artifacts),
-                storage = storage,
-                faultInjector = ProfileRepositoryFaultInjector { point ->
-                    if (point == ProfileRepositoryFaultPoint.AFTER_DELETION_INTENT && armed.getAndDecrement() > 0) {
-                        throw IOException("crash after intent")
-                    }
-                },
+    fun `pending recovery rejects a replacement without deleting it`() {
+        val root = temporaryFolder.newFolder("pending-replacement")
+        val storage = storageFor(root).also { it.writeText("original") }
+        val artifacts = artifactBytes("pending-replacement")
+        val repository = crashingRepositoryAfterIntent(root, storage, artifacts)
+        val candidate = repository.prepare(envelope(1, artifacts = artifacts)).candidate
+        assertFailure<IOException> {
+            repository.activate(
+                candidate,
+                GuestDataPolicy.DELETE_DATA,
+                repository.issueDataDeletionConfirmation(candidate),
             )
-            val candidate = repository.prepare(envelope(1, artifacts = artifacts)).candidate
-            val confirmation = repository.issueDataDeletionConfirmation(candidate)
-            assertFailure<IOException> {
-                repository.activate(candidate, GuestDataPolicy.DELETE_DATA, confirmation)
-            }
-            when (scenario) {
-                "replacement" -> { assertTrue(storage.delete()); storage.writeText("replacement") }
-                "revocation" -> trust.revoke(KEY_ID)
-                "blob" -> File(root, "blobs").listFiles()!!.first().writeText("corrupt")
-            }
-
-            assertFailure<ProfileRepositoryException> { repository.recover() }
-            assertTrue(storage.exists())
-            if (scenario == "replacement") assertEquals("replacement", storage.readText())
-            trust.trust(KEY_ID, firstKey)
         }
+        assertTrue(storage.delete())
+        storage.writeText("replacement")
+
+        assertFailure<ProfileRepositoryException> { repository.recover() }
+        assertEquals("replacement", storage.readText())
+    }
+
+    @Test
+    fun `revoked pending activation restores a matching tombstone and records terminal failure`() {
+        val root = temporaryFolder.newFolder("pending-revoked-tombstone")
+        val storage = storageFor(root).also { it.writeText("original") }
+        val artifacts = artifactBytes("pending-revoked-tombstone")
+        val repository = crashingRepositoryAfterIntent(root, storage, artifacts)
+        val candidate = repository.prepare(envelope(1, artifacts = artifacts)).candidate
+        assertFailure<IOException> {
+            repository.activate(
+                candidate,
+                GuestDataPolicy.DELETE_DATA,
+                repository.issueDataDeletionConfirmation(candidate),
+            )
+        }
+        val tombstone = storageTombstone(storage)
+        Files.move(storage.toPath(), tombstone.toPath())
+        trust.revoke(KEY_ID)
+
+        repository.recover()
+
+        assertEquals("original", storage.readText())
+        assertFalse(tombstone.exists())
+        val failure = repository.lastActivationFailure()!!
+        assertEquals(candidate, failure.candidate)
+        assertFalse(failure.storageDeletionIrreversible)
+        assertFalse(File(root, "state/activation.pending").exists())
+    }
+
+    @Test
+    fun `revoked pending activation preserves recreated storage and quarantines matching tombstone`() {
+        val root = temporaryFolder.newFolder("pending-revoked-recreated")
+        val storage = storageFor(root).also { it.writeText("original") }
+        val artifacts = artifactBytes("pending-revoked-recreated")
+        val repository = crashingRepositoryAfterIntent(root, storage, artifacts)
+        val candidate = repository.prepare(envelope(1, artifacts = artifacts)).candidate
+        assertFailure<IOException> {
+            repository.activate(
+                candidate,
+                GuestDataPolicy.DELETE_DATA,
+                repository.issueDataDeletionConfirmation(candidate),
+            )
+        }
+        Files.move(storage.toPath(), storageTombstone(storage).toPath())
+        storage.writeText("recreated")
+        trust.revoke(KEY_ID)
+
+        repository.recover()
+
+        assertEquals("recreated", storage.readText())
+        assertEquals("original", storageQuarantine(storage).readText())
+        assertFalse(storageTombstone(storage).exists())
+        assertFalse(File(root, "state/activation.pending").exists())
+    }
+
+    @Test
+    fun `revoked pending activation after irreversible deletion clears pending without activation`() {
+        val root = temporaryFolder.newFolder("pending-revoked-deleted")
+        val storage = storageFor(root).also { it.writeText("original") }
+        val artifacts = artifactBytes("pending-revoked-deleted")
+        val armed = AtomicInteger(1)
+        val repository = repository(
+            root,
+            RecordingFetcher(artifacts),
+            storage = storage,
+            faultInjector = ProfileRepositoryFaultInjector { point ->
+                if (point == ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION && armed.getAndDecrement() > 0) {
+                    throw IOException("crash after deletion")
+                }
+            },
+        )
+        val candidate = repository.prepare(envelope(1, artifacts = artifacts)).candidate
+        assertFailure<IOException> {
+            repository.activate(
+                candidate,
+                GuestDataPolicy.DELETE_DATA,
+                repository.issueDataDeletionConfirmation(candidate),
+            )
+        }
+        trust.revoke(KEY_ID)
+
+        repository.recover()
+
+        assertFalse(storage.exists())
+        assertNull(repository.activationState())
+        assertTrue(repository.lastActivationFailure()!!.storageDeletionIrreversible)
+        assertFalse(File(root, "state/activation.pending").exists())
+    }
+
+    @Test
+    fun `corrupt pending candidate is quarantined before deletion`() {
+        val root = temporaryFolder.newFolder("pending-corrupt")
+        val storage = storageFor(root).also { it.writeText("original") }
+        val artifacts = artifactBytes("pending-corrupt")
+        val repository = crashingRepositoryAfterIntent(root, storage, artifacts)
+        val candidate = repository.prepare(envelope(1, artifacts = artifacts)).candidate
+        assertFailure<IOException> {
+            repository.activate(
+                candidate,
+                GuestDataPolicy.DELETE_DATA,
+                repository.issueDataDeletionConfirmation(candidate),
+            )
+        }
+        File(root, "blobs").listFiles()!!.first().writeText("corrupt")
+
+        repository.recover()
+
+        assertEquals("original", storage.readText())
+        assertEquals(candidate, repository.lastActivationFailure()!!.candidate)
+        assertFalse(File(root, "state/activation.pending").exists())
     }
 
     @Test
@@ -321,6 +443,39 @@ class ProfileRepositoryTest {
     }
 
     @Test
+    fun `trust revocation after durable intent aborts before deletion`() {
+        val root = temporaryFolder.newFolder("intent-revocation")
+        val storage = storageFor(root).also { it.writeText("data") }
+        val artifacts = artifactBytes("intent-revocation")
+        var revokeOnIntentSync = true
+        val durability = DirectoryDurability { directory ->
+            FileChannelDirectoryDurability.force(directory)
+            if (revokeOnIntentSync && directory == File(root, "state").toPath() &&
+                File(root, "state/activation.pending").exists()
+            ) {
+                revokeOnIntentSync = false
+                trust.revoke(KEY_ID)
+            }
+        }
+        val repository = repository(
+            root,
+            RecordingFetcher(artifacts),
+            storage = storage,
+            durability = durability,
+        )
+        val candidate = repository.prepare(envelope(1, artifacts = artifacts)).candidate
+        val confirmation = repository.issueDataDeletionConfirmation(candidate)
+
+        assertFailure<ProfileActivationException> {
+            repository.activate(candidate, GuestDataPolicy.DELETE_DATA, confirmation)
+        }
+
+        assertEquals("data", storage.readText())
+        assertEquals(candidate, repository.lastActivationFailure()!!.candidate)
+        assertFalse(File(root, "state/activation.pending").exists())
+    }
+
+    @Test
     fun `pending intent directory sync failure aborts before destructive effect`() {
         val root = temporaryFolder.newFolder("durability")
         val storage = storageFor(root).also { it.writeText("data") }
@@ -340,6 +495,78 @@ class ProfileRepositoryTest {
         }
         assertTrue(storage.exists())
         assertEquals("data", storage.readText())
+    }
+
+    @Test
+    fun `committed pending activation clears after revocation but active resolution rejects it`() {
+        val root = temporaryFolder.newFolder("committed-pending-revoked")
+        val storage = storageFor(root).also { it.writeText("data") }
+        val artifacts = artifactBytes("committed-pending-revoked")
+        var failActivationSync = true
+        val durability = DirectoryDurability { directory ->
+            FileChannelDirectoryDurability.force(directory)
+            if (failActivationSync && directory == File(root, "state").toPath() &&
+                File(root, "state/activation.pending").exists() && File(root, "state/activation.record").exists()
+            ) {
+                failActivationSync = false
+                throw IOException("crash after activation publication")
+            }
+        }
+        val repository = repository(
+            root,
+            RecordingFetcher(artifacts),
+            storage = storage,
+            durability = durability,
+        )
+        val candidate = repository.prepare(envelope(1, artifacts = artifacts)).candidate
+        assertFailure<ProfileRepositoryException> {
+            repository.activate(
+                candidate,
+                GuestDataPolicy.DELETE_DATA,
+                repository.issueDataDeletionConfirmation(candidate),
+            )
+        }
+        trust.revoke(KEY_ID)
+
+        val restarted = repository(root, RecordingFetcher(artifacts), storage = storage)
+        restarted.recover()
+
+        assertEquals(candidate, restarted.activationState()!!.active)
+        assertFalse(File(root, "state/activation.pending").exists())
+        assertFailure<ProfileActivationException> { restarted.resolveActiveProfile() }
+    }
+
+    @Test
+    fun `same-active reset pending transaction recovers and advances its sequence`() {
+        val root = temporaryFolder.newFolder("same-active-reset-recovery")
+        val storage = storageFor(root).also { it.writeText("data") }
+        val artifacts = artifactBytes("same-active-reset-recovery")
+        val armed = AtomicInteger(1)
+        val repository = repository(
+            root,
+            RecordingFetcher(artifacts),
+            storage = storage,
+            faultInjector = ProfileRepositoryFaultInjector { point ->
+                if (point == ProfileRepositoryFaultPoint.AFTER_DELETION_INTENT && armed.getAndDecrement() > 0) {
+                    throw IOException("crash after reset intent")
+                }
+            },
+        )
+        val candidate = repository.prepare(envelope(1, artifacts = artifacts)).candidate
+        val active = repository.activate(candidate, GuestDataPolicy.PRESERVE_DATA)
+        assertFailure<IOException> {
+            repository.activate(
+                candidate,
+                GuestDataPolicy.DELETE_DATA,
+                repository.issueDataDeletionConfirmation(candidate),
+            )
+        }
+
+        val restarted = repository(root, RecordingFetcher(artifacts), storage = storage)
+        restarted.recover()
+
+        assertEquals(active.activationSequence + 1L, restarted.activationState()!!.activationSequence)
+        assertFalse(storage.exists())
     }
 
     @Test
@@ -372,6 +599,73 @@ class ProfileRepositoryTest {
             assertEquals(candidate, restarted.activationState()!!.active)
             assertFalse(storage.exists())
         }
+    }
+
+    @Test
+    fun `active and candidate resolvers revalidate trust and blobs after restart`() {
+        val root = temporaryFolder.newFolder("resolve")
+        val storage = storageFor(root)
+        val artifacts = artifactBytes("resolve")
+        val candidate = repository(root, RecordingFetcher(artifacts), storage = storage)
+            .prepare(envelope(1, artifacts = artifacts)).candidate
+        repository(root, RecordingFetcher(artifacts), storage = storage)
+            .activate(candidate, GuestDataPolicy.PRESERVE_DATA)
+
+        val restarted = repository(root, RecordingFetcher(artifacts), storage = storage)
+        assertEquals(candidate, restarted.resolveActiveProfile()!!.candidate)
+        assertEquals(candidate, restarted.resolveCandidate(candidate).candidate)
+
+        trust.revoke(KEY_ID)
+        assertFailure<ProfileActivationException> { restarted.resolveActiveProfile() }
+        assertFailure<ProfileActivationException> { restarted.resolveCandidate(candidate) }
+        trust.trust(KEY_ID, firstKey)
+        File(root, "blobs").listFiles()!!.first().writeText("corrupt")
+        assertFailure<ProfileRepositoryCorruptException> { restarted.resolveActiveProfile() }
+        assertFailure<ProfileRepositoryCorruptException> { restarted.resolveCandidate(candidate) }
+    }
+
+    @Test
+    fun `prepared generation pruning recovers the retention bound`() {
+        val root = temporaryFolder.newFolder("generation-pruning")
+        var artifacts = artifactBytes("generation-1")
+        val fetcher = RecordingFetcher(artifacts)
+        val repository = repository(root, fetcher)
+
+        for (generation in 1L..70L) {
+            artifacts = artifactBytes("generation-$generation")
+            fetcher.replace(artifacts)
+            repository.prepare(envelope(generation, artifacts = artifacts))
+        }
+
+        assertEquals(1, File(root, "prepared").walkTopDown().count { it.isFile })
+        assertEquals(3, File(root, "blobs").listFiles()!!.size)
+    }
+
+    @Test
+    fun `revoked epoch pruning recovers CAS generation and byte quota for a newer epoch`() {
+        val root = temporaryFolder.newFolder("epoch-quota-recovery")
+        val oldArtifacts = artifactBytes("epoch-quota-old")
+        val totalBytes = oldArtifacts.values.sumOf { it.size.toLong() }
+        val fetcher = RecordingFetcher(oldArtifacts)
+        val repository = repository(
+            root,
+            fetcher,
+            limits = ProfileStoreLimits(totalBytes, ArtifactRole.entries.size, 0),
+        )
+        repository.prepare(envelope(1, artifacts = oldArtifacts))
+
+        trust.epoch = TrustEpoch(2)
+        trust.revoke(KEY_ID)
+        trust.trust(SECOND_KEY_ID, secondKey)
+        val newArtifacts = artifactBytes("epoch-quota-new")
+        fetcher.replace(newArtifacts)
+        val prepared = repository.prepare(
+            envelope(1, keyId = SECOND_KEY_ID, keyPair = secondKey, artifacts = newArtifacts),
+        )
+
+        assertEquals(TrustEpoch(2), prepared.candidate.trustEpoch)
+        assertEquals(3, File(root, "blobs").listFiles()!!.size)
+        prepared.artifactFiles.values.forEach { assertTrue(it.exists()) }
     }
 
     @Test
@@ -492,6 +786,34 @@ class ProfileRepositoryTest {
         }
         assertEquals(1, maximumFetches.get())
     }
+
+    private fun crashingRepositoryAfterIntent(
+        root: File,
+        storage: File,
+        artifacts: Map<ArtifactRole, ByteArray>,
+    ): ProfileRepository {
+        val armed = AtomicInteger(1)
+        return repository(
+            root,
+            RecordingFetcher(artifacts),
+            storage = storage,
+            faultInjector = ProfileRepositoryFaultInjector { point ->
+                if (point == ProfileRepositoryFaultPoint.AFTER_DELETION_INTENT && armed.getAndDecrement() > 0) {
+                    throw IOException("crash after intent")
+                }
+            },
+        )
+    }
+
+    private fun storageTombstone(storage: File): File =
+        File(storage.parentFile, ".podroid-profile-delete-${storagePathDigest(storage)}")
+
+    private fun storageQuarantine(storage: File): File =
+        File(storage.parentFile, ".podroid-profile-preserved-${storagePathDigest(storage)}")
+
+    private fun storagePathDigest(storage: File): String = MessageDigest.getInstance("SHA-256")
+        .digest(storage.toPath().toAbsolutePath().normalize().toString().toByteArray())
+        .joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
 
     private fun repository(
         root: File,

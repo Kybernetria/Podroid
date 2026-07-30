@@ -86,6 +86,17 @@ data class ActivationState(
     val rollback: PreparedProfileCandidate?,
 )
 
+enum class ActivationFailureReason {
+    CANDIDATE_NO_LONGER_USABLE,
+}
+
+data class ActivationFailureState(
+    val attemptedActivationSequence: Long,
+    val candidate: PreparedProfileCandidate,
+    val reason: ActivationFailureReason,
+    val storageDeletionIrreversible: Boolean,
+)
+
 /** Opaque destructive authority issued only after this repository validates its fixed storage target. */
 class DataDeletionConfirmation private constructor(
     internal val owner: Any,
@@ -147,8 +158,8 @@ class ProfileRepository(
     private val approvedOrigins: ApprovedArtifactOrigins,
     private val trustResolver: ProfileTrustResolver,
     private val artifactFetcher: ProfileArtifactFetcher,
+    private val directoryDurability: DirectoryDurability,
     private val verifier: Ed25519Verifier = TinkEd25519Verifier,
-    private val directoryDurability: DirectoryDurability = FileChannelDirectoryDurability,
     private val storeLimits: ProfileStoreLimits = ProfileStoreLimits(),
     private val fetchTimeoutMillis: Long = DEFAULT_FETCH_TIMEOUT_MILLIS,
     private val lockTimeoutMillis: Long = DEFAULT_LOCK_TIMEOUT_MILLIS,
@@ -166,6 +177,9 @@ class ProfileRepository(
     private val fixedStorage = storageFile.toPath().toAbsolutePath().normalize()
     private val storageTombstone = fixedStorage.parent?.resolve(
         ".podroid-profile-delete-${fixedStorage.toString().sha256Hex()}",
+    ) ?: throw IllegalArgumentException("fixed storage file has no parent")
+    private val storageRecoveryQuarantine = fixedStorage.parent?.resolve(
+        ".podroid-profile-preserved-${fixedStorage.toString().sha256Hex()}",
     ) ?: throw IllegalArgumentException("fixed storage file has no parent")
     private val confirmationOwner = Any()
 
@@ -201,10 +215,11 @@ class ProfileRepository(
     fun recover() {
         withRepositoryLock {
             recoverLocked()
-            readPendingActivationLocked()?.let(::completePendingActivationLocked)
+            recoverPendingActivationLocked()
         }
     }
 
+    /** Diagnostic lifecycle metadata only. Launches must use [resolveActiveProfile]. */
     @Throws(IOException::class)
     fun activationState(): ActivationState? = withRepositoryLock {
         recoverLocked()
@@ -212,6 +227,40 @@ class ProfileRepository(
             throw ProfileActivationException("a confirmed data-deletion activation requires recovery")
         }
         readActivationStateLocked()
+    }
+
+    /** Resolves the active profile only after current trust and every artifact blob are revalidated. */
+    @Throws(IOException::class)
+    fun resolveActiveProfile(): PreparedProfile? = withRepositoryLock {
+        recoverLocked()
+        recoverPendingActivationLocked()
+        readActivationStateLocked()?.let { activation ->
+            requireUsableCandidateLocked(
+                activation.active,
+                requireCurrentFloor = false,
+                requireCurrentTrust = true,
+            ).toPublic()
+        }
+    }
+
+    /** Resolves retained candidate artifacts only after current trust and every blob are revalidated. */
+    @Throws(IOException::class)
+    fun resolveCandidate(candidate: PreparedProfileCandidate): PreparedProfile = withRepositoryLock {
+        recoverLocked()
+        recoverPendingActivationLocked()
+        requireUsableCandidateLocked(
+            candidate,
+            requireCurrentFloor = false,
+            requireCurrentTrust = true,
+        ).toPublic()
+    }
+
+    /** Returns the latest bounded terminal failure recorded while recovering a destructive activation. */
+    @Throws(IOException::class)
+    fun lastActivationFailure(): ActivationFailureState? = withRepositoryLock {
+        recoverLocked()
+        recoverPendingActivationLocked()
+        readActivationFailureLocked()
     }
 
     /** Issues destructive authority for the current sequence, candidate, and fixed file identity. */
@@ -222,10 +271,15 @@ class ProfileRepository(
             if (readPendingActivationLocked() != null) {
                 throw ProfileActivationException("a confirmed data-deletion activation requires recovery")
             }
-            requireUsableCandidateLocked(candidate, requireCurrentFloor = true, requireCurrentTrust = true)
+            val activation = readActivationStateLocked()
+            requireUsableCandidateLocked(
+                candidate,
+                requireCurrentFloor = activation?.active != candidate,
+                requireCurrentTrust = true,
+            )
             DataDeletionConfirmation.issue(
                 confirmationOwner,
-                readActivationStateLocked()?.activationSequence ?: 0L,
+                activation?.activationSequence ?: 0L,
                 candidate,
                 captureStorageIdentity(requireStableKeys = true),
             )
@@ -243,30 +297,17 @@ class ProfileRepository(
             if (dataPolicy != GuestDataPolicy.DELETE_DATA || pending.desired.active != candidate) {
                 throw ProfileActivationException("a different confirmed data-deletion activation requires recovery")
             }
-            completePendingActivationLocked(pending)
+            if (completePendingActivationLocked(pending) == PendingRecoveryResult.ABORTED) {
+                throw ProfileActivationException("the pending data-deletion activation was aborted during recovery")
+            }
             return@withRepositoryLock pending.desired
         }
 
         val current = readActivationStateLocked()
-        if (current?.active == candidate) {
-            requireUsableCandidateLocked(candidate, requireCurrentFloor = false, requireCurrentTrust = true)
-            captureStorageIdentity(requireStableKeys = false)
-            when (dataPolicy) {
-                GuestDataPolicy.PRESERVE_DATA -> if (deletionConfirmation != null) {
-                    throw ProfileActivationException("deletion confirmation is invalid for PRESERVE_DATA")
-                }
-                GuestDataPolicy.DELETE_DATA -> if (deletionConfirmation != null &&
-                    (deletionConfirmation.owner !== confirmationOwner || deletionConfirmation.candidate != candidate)
-                ) {
-                    throw ProfileActivationException("deletion confirmation was not issued for this repository and candidate")
-                }
-            }
-            return@withRepositoryLock current
-        }
-
+        val sameActive = current?.active == candidate
         val preparedRecord = requireUsableCandidateLocked(
             candidate,
-            requireCurrentFloor = true,
+            requireCurrentFloor = !sameActive,
             requireCurrentTrust = true,
         )
         when (dataPolicy) {
@@ -275,6 +316,7 @@ class ProfileRepository(
                     throw ProfileActivationException("deletion confirmation is invalid for PRESERVE_DATA")
                 }
                 captureStorageIdentity(requireStableKeys = false)
+                if (sameActive) return@withRepositoryLock current
                 current?.let { activation ->
                     val activeRecord = requireUsableCandidateLocked(
                         activation.active,
@@ -300,16 +342,18 @@ class ProfileRepository(
             }
         }
 
-        val next = ActivationState(nextActivationSequence(current?.activationSequence ?: 0L), candidate, current?.active)
+        val rollback = if (sameActive) current?.rollback else current?.active
+        val next = ActivationState(nextActivationSequence(current?.activationSequence ?: 0L), candidate, rollback)
         if (dataPolicy == GuestDataPolicy.DELETE_DATA) {
             val pending = PendingActivation(next, deletionConfirmation!!.storageIdentity)
             writeImmutableRecord(pendingActivationPath, encodePendingActivation(pending))
             faultInjector.check(ProfileRepositoryFaultPoint.AFTER_DELETION_INTENT)
-            deleteFixedStorage(pending.storageIdentity)
-            faultInjector.check(ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION)
+            if (completePendingActivationLocked(pending) == PendingRecoveryResult.ABORTED) {
+                throw ProfileActivationException("data-deletion activation was aborted after trust changed")
+            }
+        } else {
+            writeReplaceRecord(activationPath(), encodeActivation(next))
         }
-        writeReplaceRecord(activationPath(), encodeActivation(next))
-        if (dataPolicy == GuestDataPolicy.DELETE_DATA) clearPendingActivation()
         val published = readActivationStateLocked()
             ?: throw ProfileRepositoryCorruptException("published activation record is missing")
         if (published != next || preparedRecord.candidate != candidate) {
@@ -424,6 +468,7 @@ class ProfileRepository(
             validatePreparedBlobs(existing)
             revalidateVerifiedTrust(verified)
             publishFloorIfNeeded(profileKey, existing)
+            prunePreparedRecordsAndBlobsLocked()
             return existing.toPublic()
         }
 
@@ -438,6 +483,7 @@ class ProfileRepository(
             publishPrepared(profileKey, expectedRecord)
             validatePreparedBlobs(expectedRecord)
             publishFloorIfNeeded(profileKey, expectedRecord)
+            prunePreparedRecordsAndBlobsLocked()
             return expectedRecord.toPublic()
         } catch (failure: Throwable) {
             cleanupNewUnreferencedBlobs(newlyPublished, failure)
@@ -553,6 +599,56 @@ class ProfileRepository(
             }
         }
         return count to bytes
+    }
+
+    private fun prunePreparedRecordsAndBlobsLocked() {
+        val currentEpoch = trustResolver.currentTrustEpoch
+        val activation = readActivationStateLocked()
+        val pending = readPendingActivationLocked()
+        val retainedCandidates = buildSet {
+            activation?.let { add(it.active); it.rollback?.let(::add) }
+            pending?.desired?.let { add(it.active); it.rollback?.let(::add) }
+        }.toMutableSet()
+
+        var prunedRecord = false
+        val floors = readAllFloors()
+        floors.forEach { (profileKey, floor) ->
+            if (floor.candidate.trustEpoch == currentEpoch) {
+                retainedCandidates.add(floor.candidate)
+            } else {
+                val path = floorPath(profileKey)
+                requireRegularFile(path, "obsolete generation floor")
+                Files.delete(path)
+                forceDirectory(state)
+                prunedRecord = true
+            }
+        }
+
+        val emptiedProfileDirectories = ArrayList<Path>()
+        Files.newDirectoryStream(prepared).use { profileDirectories ->
+            for (profileDirectory in profileDirectories) {
+                var deletedRecord = false
+                Files.newDirectoryStream(profileDirectory).use { records ->
+                    for (path in records) {
+                        val profileKey = profileDirectory.fileName.toString()
+                        val record = decodePrepared(readBoundedRecord(path), profileKey, path.fileName.toString())
+                        if (record.candidate !in retainedCandidates) {
+                            Files.delete(path)
+                            deletedRecord = true
+                            prunedRecord = true
+                        }
+                    }
+                }
+                if (deletedRecord) forceDirectory(profileDirectory)
+                if (Files.newDirectoryStream(profileDirectory).use { !it.iterator().hasNext() }) {
+                    emptiedProfileDirectories.add(profileDirectory)
+                }
+            }
+        }
+        emptiedProfileDirectories.forEach(Files::delete)
+        if (emptiedProfileDirectories.isNotEmpty()) forceDirectory(prepared)
+
+        if (prunedRecord) collectGarbageLocked()
     }
 
     private fun collectGarbageLocked(): ProfileGarbageCollectionResult {
@@ -874,24 +970,80 @@ class ProfileRepository(
         }
     }
 
-    private fun completePendingActivationLocked(pending: PendingActivation) {
+    private fun recoverPendingActivationLocked() {
+        readPendingActivationLocked()?.let(::completePendingActivationLocked)
+    }
+
+    private fun completePendingActivationLocked(pending: PendingActivation): PendingRecoveryResult {
         val activation = readActivationStateLocked()
         validatePendingSequence(pending, activation)
-        requireUsableCandidateLocked(
-            pending.desired.active,
-            requireCurrentFloor = true,
-            requireCurrentTrust = true,
-        )
-        pending.desired.rollback?.let {
-            requireUsableCandidateLocked(it, requireCurrentFloor = false, requireCurrentTrust = false)
+        if (activation == pending.desired) {
+            clearPendingActivation()
+            return PendingRecoveryResult.COMPLETED
         }
+
+        try {
+            val desiredRecord = requireUsableCandidateLocked(
+                pending.desired.active,
+                requireCurrentFloor = activation?.active != pending.desired.active,
+                requireCurrentTrust = true,
+            )
+            pending.desired.rollback?.let {
+                requireUsableCandidateLocked(it, requireCurrentFloor = false, requireCurrentTrust = false)
+            }
+            revalidateTrust(desiredRecord)
+        } catch (_: ProfileRepositoryException) {
+            abortPendingActivationLocked(pending)
+            return PendingRecoveryResult.ABORTED
+        }
+
         requireStorageIdentity(pending.storageIdentity, allowCompletedDeletion = true)
-        if (activation != pending.desired) {
-            deleteFixedStorage(pending.storageIdentity)
-            faultInjector.check(ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION)
-            writeReplaceRecord(activationPath(), encodeActivation(pending.desired))
-        }
+        deleteFixedStorage(pending.storageIdentity)
+        faultInjector.check(ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION)
+        writeReplaceRecord(activationPath(), encodeActivation(pending.desired))
         clearPendingActivation()
+        return PendingRecoveryResult.COMPLETED
+    }
+
+    private fun abortPendingActivationLocked(pending: PendingActivation) {
+        val expected = pending.storageIdentity
+        val actual = captureStorageIdentity(requireStableKeys = true)
+        if (actual.parentFileKey != expected.parentFileKey ||
+            actual.parentCreationTime != expected.parentCreationTime
+        ) {
+            throw ProfileActivationException("fixed storage parent was replaced while aborting activation")
+        }
+
+        val irreversible = if (existsNoFollow(storageTombstone)) {
+            if (!expected.existed) {
+                throw ProfileActivationException("unexpected fixed storage tombstone while aborting activation")
+            }
+            requireRegularFile(storageTombstone, "fixed storage deletion tombstone")
+            if (!attributesNoFollow(storageTombstone).matches(expected)) {
+                throw ProfileActivationException("fixed storage deletion tombstone was replaced")
+            }
+            val restoreDestination = if (actual.existed) {
+                ensureNoPath(storageRecoveryQuarantine)
+                storageRecoveryQuarantine
+            } else {
+                fixedStorage
+            }
+            Files.move(storageTombstone, restoreDestination, StandardCopyOption.ATOMIC_MOVE)
+            forceDirectory(fixedStorage.parent)
+            false
+        } else {
+            expected.existed && !actual.existed
+        }
+
+        val failure = ActivationFailureState(
+            pending.desired.activationSequence,
+            pending.desired.active,
+            ActivationFailureReason.CANDIDATE_NO_LONGER_USABLE,
+            irreversible,
+        )
+        writeReplaceRecord(activationFailurePath(), encodeActivationFailure(failure))
+        clearPendingActivation()
+        prunePreparedRecordsAndBlobsLocked()
     }
 
     private fun validatePendingSequence(pending: PendingActivation, activation: ActivationState?) {
@@ -902,7 +1054,8 @@ class ProfileRepository(
             activation != null &&
                 (pending.desired.activationSequence <= activation.activationSequence ||
                     pending.desired.activationSequence - activation.activationSequence != 1L ||
-                    pending.desired.rollback != activation.active) ->
+                    (pending.desired.active == activation.active && pending.desired.rollback != activation.rollback) ||
+                    (pending.desired.active != activation.active && pending.desired.rollback != activation.active)) ->
                 throw ProfileRepositoryCorruptException("pending activation does not follow current state")
         }
     }
@@ -949,6 +1102,7 @@ class ProfileRepository(
             val record = decodePrepared(readBoundedRecord(path), key, path.fileName.toString())
             if (record.candidate != candidate) throw ProfileRepositoryCorruptException("activation candidate conflicts with local state")
         }
+        prunePreparedRecordsAndBlobsLocked()
     }
 
     private fun validateTreeAndCleanTemps() {
@@ -1013,7 +1167,9 @@ class ProfileRepository(
                 stateCount++
                 if (stateCount > MAX_STATE_RECORDS) throw ProfileRepositoryCorruptException("state entry bound exceeded")
                 val name = entry.fileName.toString()
-                if (name != ACTIVATION_FILE && name != PENDING_ACTIVATION_FILE && !FLOOR_NAME.matches(name)) {
+                if (name != ACTIVATION_FILE && name != PENDING_ACTIVATION_FILE &&
+                    name != ACTIVATION_FAILURE_FILE && !FLOOR_NAME.matches(name)
+                ) {
                     throw ProfileRepositoryCorruptException("unknown repository state entry")
                 }
                 requireRegularFile(entry, "repository state record")
@@ -1083,6 +1239,11 @@ class ProfileRepository(
         } else {
             null
         }
+
+    private fun readActivationFailureLocked(): ActivationFailureState? {
+        val path = activationFailurePath()
+        return if (existsNoFollow(path)) decodeActivationFailure(readBoundedRecord(path)) else null
+    }
 
     private fun clearPendingActivation() {
         if (existsNoFollow(pendingActivationPath)) {
@@ -1240,6 +1401,27 @@ class ProfileRepository(
             }
         }
 
+    private fun encodeActivationFailure(record: ActivationFailureState): ByteArray =
+        encodeRecord(ACTIVATION_FAILURE_MAGIC) { output ->
+            output.writeLong(record.attemptedActivationSequence)
+            writeCandidate(output, record.candidate)
+            output.writeUTF(record.reason.name)
+            output.writeBoolean(record.storageDeletionIrreversible)
+        }
+
+    private fun decodeActivationFailure(bytes: ByteArray): ActivationFailureState =
+        decodeRecord(bytes, ACTIVATION_FAILURE_MAGIC) { input ->
+            val sequence = input.readLong()
+            if (sequence <= 0) throw ProfileRepositoryCorruptException("failure activation sequence is invalid")
+            val candidate = readCandidate(input)
+            val reason = try {
+                ActivationFailureReason.valueOf(input.readUTF())
+            } catch (failure: IllegalArgumentException) {
+                throw ProfileRepositoryCorruptException("activation failure reason is invalid", failure)
+            }
+            ActivationFailureState(sequence, candidate, reason, input.readBoolean())
+        }
+
     private fun decodePendingActivation(bytes: ByteArray): PendingActivation =
         decodeRecord(bytes, PENDING_ACTIVATION_MAGIC) { input ->
             val desired = readActivation(input)
@@ -1369,6 +1551,7 @@ class ProfileRepository(
         prepared.resolve(profileKey).resolve("${epoch.value}-${generation.value}$PREPARED_SUFFIX")
     private fun floorPath(profileKey: String): Path = state.resolve("$profileKey$FLOOR_SUFFIX")
     private fun activationPath(): Path = state.resolve(ACTIVATION_FILE)
+    private fun activationFailurePath(): Path = state.resolve(ACTIVATION_FAILURE_FILE)
 
     private fun <T> withRepositoryLock(block: () -> T): T {
         prepareLayoutForLock()
@@ -1522,6 +1705,11 @@ class ProfileRepository(
         val storageIdentity: StorageIdentity,
     )
 
+    private enum class PendingRecoveryResult {
+        COMPLETED,
+        ABORTED,
+    }
+
     private companion object {
         const val BLOBS_DIRECTORY = "blobs"
         const val PREPARED_DIRECTORY = "prepared"
@@ -1532,6 +1720,7 @@ class ProfileRepository(
         const val RECORD_TEMP_FILE = "record.tmp"
         const val ACTIVATION_FILE = "activation.record"
         const val PENDING_ACTIVATION_FILE = "activation.pending"
+        const val ACTIVATION_FAILURE_FILE = "activation.failure"
         const val BLOB_SUFFIX = ".blob"
         const val PREPARED_SUFFIX = ".prepared"
         const val FLOOR_SUFFIX = ".floor"
@@ -1541,13 +1730,14 @@ class ProfileRepository(
         const val FLOOR_MAGIC = 0x5052464c
         const val ACTIVATION_MAGIC = 0x50524143
         const val PENDING_ACTIVATION_MAGIC = 0x5052504e
+        const val ACTIVATION_FAILURE_MAGIC = 0x50524641
         const val MAX_RECORD_BYTES = 16 * 1024
         const val RECORD_BUFFER_BYTES = 4 * 1024
         const val STREAM_BUFFER_BYTES = 64 * 1024
         const val MAX_ZERO_READS = 16
         const val MAX_PROFILES = 32
         const val MAX_GENERATIONS_PER_PROFILE = 64
-        const val MAX_STATE_RECORDS = MAX_PROFILES + 2
+        const val MAX_STATE_RECORDS = MAX_PROFILES + 3
         const val MAX_FILE_KEY_CHARS = 512
         const val MAX_FILE_TIMESTAMP_CHARS = 64
         const val DEFAULT_FETCH_TIMEOUT_MILLIS = 5L * 60 * 1000
