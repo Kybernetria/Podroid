@@ -7,15 +7,15 @@ import org.junit.Test
 
 class HostSupervisorBackupRulesTest {
     @Test
-    fun `supervisor datastore is excluded from legacy cloud and device transfer`() {
+    fun `supervisor and Host identity state are excluded from backup and device transfer`() {
         val legacy = exclusions("backup_rules.xml", "full-backup-content")
         val extraction = parse("data_extraction_rules.xml")
         val cloud = exclusions(extraction, "cloud-backup")
         val transfer = exclusions(extraction, "device-transfer")
 
-        assertEquals(setOf(EXCLUSION), legacy)
-        assertEquals(setOf(EXCLUSION), cloud)
-        assertEquals(setOf(EXCLUSION), transfer)
+        assertEquals(EXCLUSIONS, legacy)
+        assertEquals(EXCLUSIONS, cloud)
+        assertEquals(EXCLUSIONS, transfer)
     }
 
     private fun exclusions(fileName: String, section: String): Set<Pair<String, String>> =
@@ -46,7 +46,9 @@ class HostSupervisorBackupRulesTest {
     }
 
     companion object {
-        private val EXCLUSION =
-            "file" to "datastore/host_supervisor_state.preferences_pb"
+        private val EXCLUSIONS = setOf(
+            "file" to "datastore/host_supervisor_state.preferences_pb",
+            "file" to "host-transport/",
+        )
     }
 }

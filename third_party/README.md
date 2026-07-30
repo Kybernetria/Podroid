@@ -11,7 +11,7 @@ distrobox enter android-dev -- bash -lc '
 '
 ```
 
-[`libtailscale-pin.json`](libtailscale-pin.json) is the reviewed source, license, module, toolchain, ABI, and packaging contract. Debug builds compile that exact tree as an Android `arm64-v8a` Go `c-shared` library with Go 1.25.5, NDK 28.2.13676358's API 26 AArch64 clang, and 16 KiB `PT_LOAD` alignment. The build also links Podroid's project-owned JNI shim against the official C API. Both libraries and their generated provenance stay under `app/build/generated/libtailscale/debug`; generated binaries are never committed.
+[`libtailscale-pin.json`](libtailscale-pin.json) is the reviewed source, license, module, toolchain, ABI, packaging, and missing-capability contract. Debug builds compile that exact tree as an Android `arm64-v8a` Go `c-shared` library with Go 1.25.5, NDK 28.2.13676358's API 26 AArch64 clang, and 16 KiB `PT_LOAD` alignment. The build also links Podroid's project-owned JNI probe against the official C API. Generated binaries and provenance stay under `app/build/generated/libtailscale/debug` and are never committed.
 
 Supply the exact toolchains and run the ordinary debug build:
 
@@ -24,8 +24,6 @@ distrobox enter android-dev -- bash -lc '
 '
 ```
 
-The build fails closed if the parent gitlink, submodule commit/tree/cleanliness, license hash, `go.mod` versions, Go executable, NDK revision, compiler target, or manifest policy differs. After packaging, a static verifier checks every APK native library is AArch64 under only `arm64-v8a` and has 16 KiB-compatible `PT_LOAD` segments. It also checks the official/shim `DT_NEEDED` contracts, artifact hashes and provenance, and absence of `VpnService` manifest declarations.
+The build fails closed if the gitlink, submodule commit/tree/cleanliness, license hash, `go.mod` versions, Go executable, NDK revision, compiler target, or manifest policy differs. Final-APK verification checks the sole ABI, AArch64 identity, 16 KiB alignment, `DT_NEEDED`, artifact hashes/provenance, and absence of `VpnService`. Packaging is debug-only; release variants exclude these artifacts.
 
-This packaging is intentionally **debug-only**. Release source sets and release task wiring do not include these generated files.
-
-The pinned public C API wraps `tsnet` and provides lifecycle, `listen`, `dial`, `ControlURL`, auth-key, state-directory, and remote-address operations. It does **not** itself provide Android `ConnectivityManager`/DNS/active-network hooks or authenticated peer identity. Those runtime requirements remain to be implemented and verified behind `transport/api` before remote host mutations are enabled. The guest continues to use a separate ordinary Linux `tailscaled` identity.
+The public C API provides lifecycle, `listen`, `accept`, `dial`, loopback credentials, `ControlURL`, auth key, state directory, and remote address. It does **not** expose injection seams for Android default-network events, per-`Network` DNS/socket selection, deterministic cancellation, or authenticated per-connection node/user identity. Project-owned Kotlin contracts and Android hook boundaries exist, but the provider remains unavailable and deny-all because adjacent hooks do not prove internal libtailscale sockets use them. Physical loading, networking, identity, lifecycle, and reboot tests remain deferred. The Host identity remains separate from ordinary guest Linux `tailscaled` state.

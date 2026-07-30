@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
-    <!-- Runtime intent is device-local and must never be restored elsewhere. -->
+    <!-- Runtime intent and embedded Host identity are device-local. -->
     <exclude domain="file" path="datastore/host_supervisor_state.preferences_pb" />
+    <exclude domain="file" path="host-transport/" />
 </full-backup-content>
