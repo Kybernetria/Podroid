@@ -174,6 +174,18 @@ val testProfileIntegrationVerifiers by tasks.registering(Exec::class) {
     )
 }
 
+val testCloudProfileTooling by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Runs signed profile v2, deterministic NoCloud seed, and Debian provenance tooling tests."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", "-m", "unittest", "-v", "tests/test_cloud_profile_tooling.py")
+    inputs.files(
+        rootProject.file("tests/test_cloud_profile_tooling.py"),
+        rootProject.fileTree("profiles/debian-cloud"),
+        rootProject.file("profiles/schemas/profile-payload-v2.schema.json"),
+    )
+}
+
 val verifyReleaseProfileConfiguration by tasks.registering(Exec::class) {
     group = "verification"
     description = "Fails release builds without a complete valid downloadable-profile trust snapshot."
@@ -463,7 +475,8 @@ tasks.named("check") {
         verifyHostTransportBoundary,
         verifyHostManagementBoundary,
         verifyProfileLifecycleBoundary,
-        testProfileIntegrationVerifiers
+        testProfileIntegrationVerifiers,
+        testCloudProfileTooling
     )
 }
 
@@ -479,7 +492,8 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
         verifyHostTransportBoundary,
         verifyHostManagementBoundary,
         verifyProfileLifecycleBoundary,
-        testProfileIntegrationVerifiers
+        testProfileIntegrationVerifiers,
+        testCloudProfileTooling
     )
 }
 

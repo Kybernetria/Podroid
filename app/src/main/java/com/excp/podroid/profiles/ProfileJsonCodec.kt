@@ -130,6 +130,140 @@ object ProfilePayloadJsonCodec {
     private val ARTIFACT_FIELDS = setOf("role", "url", "sha256", "size_bytes")
 }
 
+object ProfileSigningV2 {
+    const val DOMAIN_SEPARATOR = "com.excp.podroid.vm-profile.v2\u0000"
+
+    fun messageFor(payloadBytes: ByteArray): ByteArray {
+        require(payloadBytes.size in 1..ProfileLimits.MAX_PAYLOAD_BYTES) {
+            "profile v2 payload is outside the supported byte bound"
+        }
+        val domain = DOMAIN_SEPARATOR.toByteArray(Charsets.US_ASCII)
+        return ByteArray(domain.size + payloadBytes.size).also { message ->
+            domain.copyInto(message)
+            payloadBytes.copyInto(message, domain.size)
+        }
+    }
+}
+
+/** Strict codec for the separate QEMU UEFI/NoCloud payload v2 contract. */
+object ProfilePayloadV2JsonCodec {
+    fun decode(payloadBytes: ByteArray, approvedOrigins: ApprovedArtifactOrigins): VmProfileV2 {
+        val root = parseObject(payloadBytes, ProfileLimits.MAX_PAYLOAD_BYTES, "profile v2 payload")
+        requireExactFields(root, PAYLOAD_FIELDS, "profile v2 payload")
+        requireVersion(root, ProfileV2Limits.PAYLOAD_VERSION, "profile v2 payload")
+
+        val backendNames = root.requiredStringArray("supported_backends", "profile v2 payload")
+        if (backendNames.distinct().size != backendNames.size) {
+            throw ProfileCodecException("profile v2 supported_backends must be a set")
+        }
+        val capabilitiesObject = (root["capabilities"] as? JsonValue.ObjectValue)?.value
+            ?: throw ProfileCodecException("profile v2 capabilities must be an object")
+        requireExactFields(capabilitiesObject, CAPABILITIES_FIELDS, "profile v2 capabilities")
+        val integrationNames = capabilitiesObject.requiredStringArray(
+            "guest_integrations",
+            "profile v2 capabilities",
+        )
+        if (integrationNames.distinct().size != integrationNames.size) {
+            throw ProfileCodecException("profile v2 guest_integrations must be a set")
+        }
+        val artifactsValue = root["artifacts"] as? JsonValue.ArrayValue
+            ?: throw ProfileCodecException("profile v2 artifacts must be an array")
+        if (artifactsValue.value.size != ProfileV2ArtifactRole.entries.size) {
+            throw ProfileCodecException(
+                "profile v2 artifacts must contain exactly ${ProfileV2ArtifactRole.entries.size} entries",
+            )
+        }
+
+        return codecBoundary {
+            val artifacts = artifactsValue.value.mapIndexed { index, value ->
+                val artifact = (value as? JsonValue.ObjectValue)?.value
+                    ?: throw ProfileCodecException("profile v2 artifact[$index] must be an object")
+                requireExactFields(artifact, ARTIFACT_FIELDS, "profile v2 artifact[$index]")
+                val role = ProfileV2ArtifactRole.fromWireName(
+                    artifact.requiredString("role", "profile v2 artifact[$index]"),
+                ) ?: throw ProfileCodecException("profile v2 artifact[$index] has an unknown role")
+                val format = ProfileV2ArtifactFormat.fromWireName(
+                    artifact.requiredString("format", "profile v2 artifact[$index]"),
+                ) ?: throw ProfileCodecException("profile v2 artifact[$index] has an unknown format")
+                ProfileV2Artifact(
+                    role = role,
+                    format = format,
+                    url = approvedOrigins.parseUrl(
+                        artifact.requiredString("url", "profile v2 artifact[$index]"),
+                    ),
+                    sha256 = Sha256Digest(
+                        artifact.requiredString("sha256", "profile v2 artifact[$index]"),
+                    ),
+                    sizeBytes = artifact.requiredLong("size_bytes", "profile v2 artifact[$index]"),
+                )
+            }
+            VmProfileV2(
+                id = ProfileId(root.requiredString("profile_id", "profile v2 payload")),
+                generation = ProfileGeneration(root.requiredLong("generation", "profile v2 payload")),
+                dataCompatibility = DataCompatibilityId(
+                    root.requiredString("data_compatibility", "profile v2 payload"),
+                ),
+                architecture = ProfileArchitecture.fromWireName(
+                    root.requiredString("architecture", "profile v2 payload"),
+                ) ?: throw ProfileCodecException("profile v2 architecture is unsupported"),
+                bootContract = root.requiredString("boot_contract", "profile v2 payload"),
+                storageContract = root.requiredString("storage_contract", "profile v2 payload"),
+                healthContract = root.requiredString("health_contract", "profile v2 payload"),
+                readinessMarker = root.requiredString("readiness_marker", "profile v2 payload"),
+                supportedBackends = backendNames.map { backend ->
+                    ProfileBackend.fromWireName(backend)
+                        ?: throw ProfileCodecException("profile v2 supported_backends contains an unknown backend")
+                }.toSet(),
+                capabilities = ProfileV2Capabilities(integrationNames.map { integration ->
+                    ProfileV2GuestIntegration.fromWireName(integration)
+                        ?: throw ProfileCodecException("profile v2 capabilities contains an unknown guest integration")
+                }.toSet()),
+                artifacts = artifacts,
+            )
+        }
+    }
+
+    fun encode(profile: VmProfileV2): ByteArray {
+        val artifacts = profile.artifacts.sortedBy { it.role.ordinal }.joinToString(",") { artifact ->
+            "{" +
+                "\"role\":${jsonString(artifact.role.wireName)}," +
+                "\"format\":${jsonString(artifact.format.wireName)}," +
+                "\"url\":${jsonString(artifact.url.value)}," +
+                "\"sha256\":${jsonString(artifact.sha256.value)}," +
+                "\"size_bytes\":${artifact.sizeBytes}" +
+                "}"
+        }
+        val integrations = profile.capabilities.guestIntegrations.sortedBy { it.ordinal }
+            .joinToString(",") { jsonString(it.wireName) }
+        val encoded = ("{" +
+            "\"version\":${ProfileV2Limits.PAYLOAD_VERSION}," +
+            "\"profile_id\":${jsonString(profile.id.value)}," +
+            "\"generation\":${profile.generation.value}," +
+            "\"data_compatibility\":${jsonString(profile.dataCompatibility.value)}," +
+            "\"architecture\":${jsonString(profile.architecture.wireName)}," +
+            "\"boot_contract\":${jsonString(profile.bootContract)}," +
+            "\"storage_contract\":${jsonString(profile.storageContract)}," +
+            "\"health_contract\":${jsonString(profile.healthContract)}," +
+            "\"readiness_marker\":${jsonString(profile.readinessMarker)}," +
+            "\"supported_backends\":[${profile.supportedBackends.sortedBy { it.ordinal }.joinToString(",") { jsonString(it.wireName) }}]," +
+            "\"capabilities\":{\"guest_integrations\":[$integrations]}," +
+            "\"artifacts\":[$artifacts]" +
+            "}").toByteArray(Charsets.UTF_8)
+        require(encoded.size <= ProfileLimits.MAX_PAYLOAD_BYTES) {
+            "encoded profile v2 payload exceeds the byte bound"
+        }
+        return encoded
+    }
+
+    private val PAYLOAD_FIELDS = setOf(
+        "version", "profile_id", "generation", "data_compatibility", "architecture",
+        "boot_contract", "storage_contract", "health_contract", "readiness_marker",
+        "supported_backends", "capabilities", "artifacts",
+    )
+    private val CAPABILITIES_FIELDS = setOf("guest_integrations")
+    private val ARTIFACT_FIELDS = setOf("role", "format", "url", "sha256", "size_bytes")
+}
+
 object SignedProfileEnvelopeJsonCodec {
     fun decode(envelopeBytes: ByteArray): SignedProfileEnvelope {
         val root = parseObject(envelopeBytes, ProfileLimits.MAX_ENVELOPE_BYTES, "signed profile envelope")
@@ -218,6 +352,57 @@ object VerifiedProfileJsonCodec {
         if (!verified) throw InvalidProfileSignatureException("profile signature is invalid")
         return VerifiedProfileManifest(
             profile = ProfilePayloadJsonCodec.decode(payload, approvedOrigins),
+            manifestSha256 = Sha256Digest(
+                MessageDigest.getInstance("SHA-256").digest(payload).joinToString("") {
+                    (it.toInt() and 0xff).toString(16).padStart(2, '0')
+                },
+            ),
+            signingKeyId = envelope.keyId,
+            signingKeyFingerprint = publicKey.fingerprint,
+            trustEpoch = trustPolicy.trustEpoch,
+        )
+    }
+}
+
+data class VerifiedProfileV2Manifest(
+    val profile: VmProfileV2,
+    /** SHA-256 of the exact v2 signed payload bytes, used as the manifest identity. */
+    val manifestSha256: Sha256Digest,
+    val signingKeyId: SigningKeyId,
+    val signingKeyFingerprint: Sha256Digest,
+    val trustEpoch: TrustEpoch,
+)
+
+/** V2 verification is deliberately separate so untrusted bytes cannot select their signing domain. */
+object VerifiedProfileV2JsonCodec {
+    fun decode(
+        envelopeBytes: ByteArray,
+        approvedOrigins: ApprovedArtifactOrigins,
+        trustPolicy: ProfileTrustPolicy,
+        verifier: Ed25519Verifier = TinkEd25519Verifier,
+    ): VmProfileV2 = decodeManifest(envelopeBytes, approvedOrigins, trustPolicy, verifier).profile
+
+    fun decodeManifest(
+        envelopeBytes: ByteArray,
+        approvedOrigins: ApprovedArtifactOrigins,
+        trustPolicy: ProfileTrustPolicy,
+        verifier: Ed25519Verifier = TinkEd25519Verifier,
+    ): VerifiedProfileV2Manifest {
+        val envelope = SignedProfileEnvelopeJsonCodec.decode(envelopeBytes)
+        val trustedKey = trustPolicy.resolve(envelope.keyId)
+            ?: throw InvalidProfileSignatureException("profile v2 signing key is not trusted")
+        val publicKey = trustedKey.publicKey
+        val payload = envelope.payloadBytes()
+        val verified = try {
+            verifier.verify(publicKey, ProfileSigningV2.messageFor(payload), envelope.signatureBytes())
+        } catch (failure: ProfileVerificationException) {
+            throw failure
+        } catch (failure: RuntimeException) {
+            throw ProfileVerificationException("profile v2 signature verification failed", failure)
+        }
+        if (!verified) throw InvalidProfileSignatureException("profile v2 signature is invalid")
+        return VerifiedProfileV2Manifest(
+            profile = ProfilePayloadV2JsonCodec.decode(payload, approvedOrigins),
             manifestSha256 = Sha256Digest(
                 MessageDigest.getInstance("SHA-256").digest(payload).joinToString("") {
                     (it.toInt() and 0xff).toString(16).padStart(2, '0')

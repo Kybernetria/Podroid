@@ -1,0 +1,6 @@
+version: 2
+ethernets:
+  podroid:
+    match:
+      name: "e*"
+    dhcp4: true

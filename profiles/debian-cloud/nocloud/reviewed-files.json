@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "readiness_marker": "PODROID_CLOUD_READY_V1",
+  "files": {
+    "meta-data": "4a76e1a7a119bc6277a63a5a6e52b4a44cfffa9fd57fcc9c49aa950ba530b7ed",
+    "user-data": "a3b5ff22e9fe2ff7583e33414b306f10bf7fd033b2d5b59ffe93859e66ed41fe",
+    "vendor-data": "d586e217efee7efe1aa1bf9486fbab456c228950cb25a9a435181b20efbddac5",
+    "network-config": "3da23a6822b7c753d3ec6a1f3e16d9e4c427b1f5e5cf688934dab5f6349a4208"
+  }
+}

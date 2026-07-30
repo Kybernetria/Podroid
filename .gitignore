@@ -49,6 +49,8 @@ docs/superpowers/
 
 # Misc
 *.tmp
+__pycache__/
+*.py[cod]
 /captures/
 app/src/main/jniLibs/
 

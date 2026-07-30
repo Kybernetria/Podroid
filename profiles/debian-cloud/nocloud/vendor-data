@@ -1,0 +1,4 @@
+#cloud-config
+final_message: "PODROID_CLOUD_READY_V1"
+runcmd:
+  - ["/bin/sh", "-c", "printf 'PODROID_CLOUD_READY_V1\\n' >/dev/ttyAMA0"]

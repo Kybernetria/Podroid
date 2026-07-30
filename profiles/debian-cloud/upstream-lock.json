@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "distribution": "debian",
+  "release": "12",
+  "codename": "bookworm",
+  "architecture": "arm64",
+  "build_id": "20250210-2019",
+  "image": {
+    "filename": "debian-12-genericcloud-arm64-20250210-2019.raw",
+    "format": "raw",
+    "official_url": "https://cloud.debian.org/images/cloud/bookworm/20250210-2019/debian-12-genericcloud-arm64-20250210-2019.raw",
+    "publisher_sha512": "102b6205ce89615c3cb652d5e3aaca994ddce573266f2c63492ca6da835ab75bbff747b5674c85ce6a68c7e941cac4f368fae188fcc8b02ca5ce97900f61d38f",
+    "downloaded_sha256": null,
+    "downloaded_size_bytes": null
+  },
+  "publisher_metadata": {
+    "filename": "SHA512SUMS",
+    "official_url": "https://cloud.debian.org/images/cloud/bookworm/20250210-2019/SHA512SUMS",
+    "downloaded_sha256": "0780f7aa2553f87b5fb6f11e28c47ca59930075f2977c143ce6d31c1594eda7e",
+    "detached_signature_url": null
+  }
+}

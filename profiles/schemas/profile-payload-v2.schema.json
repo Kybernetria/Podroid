@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://podroid.invalid/schemas/profile-payload-v2.schema.json",
+  "title": "Podroid signed QEMU UEFI/NoCloud VM profile payload v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version", "profile_id", "generation", "data_compatibility", "architecture",
+    "boot_contract", "storage_contract", "health_contract", "readiness_marker",
+    "supported_backends", "capabilities", "artifacts"
+  ],
+  "properties": {
+    "version": { "const": 2 },
+    "profile_id": { "$ref": "#/$defs/safeId" },
+    "generation": { "type": "integer", "minimum": 1, "maximum": 9223372036854775806 },
+    "data_compatibility": { "$ref": "#/$defs/safeId" },
+    "architecture": { "const": "aarch64" },
+    "boot_contract": { "const": "podroid-uefi-nocloud-v1" },
+    "storage_contract": { "const": "podroid-cloud-disk-v1" },
+    "health_contract": { "const": "podroid-cloud-ready-v1" },
+    "readiness_marker": { "const": "PODROID_CLOUD_READY_V1" },
+    "supported_backends": {
+      "type": "array",
+      "prefixItems": [{ "const": "qemu" }],
+      "items": false,
+      "minItems": 1,
+      "maxItems": 1
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["guest_integrations"],
+      "properties": {
+        "guest_integrations": {
+          "type": "array",
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "podroid-terminal-v1",
+              "podroid-resize-v1",
+              "podroid-host-bridge-v1",
+              "podroid-downloads-v1"
+            ]
+          }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "allOf": [
+        { "contains": { "type": "object", "required": ["role"], "properties": { "role": { "const": "cloud-disk" } } }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "type": "object", "required": ["role"], "properties": { "role": { "const": "uefi-code" } } }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "type": "object", "required": ["role"], "properties": { "role": { "const": "uefi-vars-template" } } }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "type": "object", "required": ["role"], "properties": { "role": { "const": "nocloud-seed" } } }, "minContains": 1, "maxContains": 1 }
+      ],
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/cloudDisk" },
+          { "$ref": "#/$defs/uefiCode" },
+          { "$ref": "#/$defs/uefiVars" },
+          { "$ref": "#/$defs/nocloudSeed" }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "safeId": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "url": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "cloudDisk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "format", "url", "sha256", "size_bytes"],
+      "properties": {
+        "role": { "const": "cloud-disk" },
+        "format": { "const": "raw" },
+        "url": { "$ref": "#/$defs/url" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 4294967296 }
+      }
+    },
+    "uefiCode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "format", "url", "sha256", "size_bytes"],
+      "properties": {
+        "role": { "const": "uefi-code" },
+        "format": { "const": "raw-pflash" },
+        "url": { "$ref": "#/$defs/url" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 67108864 }
+      }
+    },
+    "uefiVars": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "format", "url", "sha256", "size_bytes"],
+      "properties": {
+        "role": { "const": "uefi-vars-template" },
+        "format": { "const": "raw-pflash" },
+        "url": { "$ref": "#/$defs/url" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 67108864 }
+      }
+    },
+    "nocloudSeed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "format", "url", "sha256", "size_bytes"],
+      "properties": {
+        "role": { "const": "nocloud-seed" },
+        "format": { "const": "iso9660-cidata" },
+        "url": { "$ref": "#/$defs/url" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 }
+      }
+    }
+  }
+}
