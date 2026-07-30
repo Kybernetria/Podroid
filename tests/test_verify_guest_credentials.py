@@ -151,7 +151,14 @@ class GuestCredentialVerifierTest(unittest.TestCase):
             assets = repo_root / "app/src/main/assets"
             assets.mkdir(parents=True)
             (assets / "alpine-rootfs.squashfs").write_bytes(b"stale, not a squashfs")
+            (assets / "vmlinuz-virt").write_bytes(b"kernel" * 3_000_000)
+            (assets / "initrd.img").write_bytes(b"initrd" * 3_000_000)
             verifier.scan_packaged_sources(repo_root)
+            disguised_source = sources / "initrd.img"
+            disguised_source.write_bytes(sha512_crypt("not-a-default", "fixedsalt"))
+            with self.assertRaisesRegex(verifier.VerificationError, "fixed SHA-512 crypt hash"):
+                verifier.scan_packaged_sources(repo_root)
+            disguised_source.unlink()
             (sources / "fixed-hash").write_bytes(sha512_crypt("not-a-default", "fixedsalt"))
             with self.assertRaisesRegex(verifier.VerificationError, "fixed SHA-512 crypt hash"):
                 verifier.scan_packaged_sources(repo_root)

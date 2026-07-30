@@ -35,6 +35,11 @@ CAT_TIMEOUT_SECONDS = 20.0
 APK_STREAM_TIMEOUT_SECONDS = 120.0
 APK_ROOTFS_ENTRY = "assets/alpine-rootfs.squashfs"
 APK_ROOTFS_BASENAME = "alpine-rootfs.squashfs"
+GENERATED_GUEST_ARTIFACTS = frozenset({
+    "app/src/main/assets/alpine-rootfs.squashfs",
+    "app/src/main/assets/vmlinuz-virt",
+    "app/src/main/assets/initrd.img",
+})
 ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
 ZIP_EOCD_SIZE = 22
 ZIP_MAX_COMMENT_BYTES = 65_535
@@ -141,8 +146,12 @@ def scan_packaged_sources(repo_root: Path) -> None:
         name = os.fsencode(path.name)
         if CREDENTIAL_NAMES.fullmatch(name):
             fail(f"bundled SSH credential file: {path!r}")
-        if path.name == "alpine-rootfs.squashfs":
-            continue  # Artifacts are inspected only when explicitly requested.
+        relative_path = path.relative_to(repo_root).as_posix()
+        if relative_path in GENERATED_GUEST_ARTIFACTS:
+            # Generated binary guest artifacts are not source text. The rootfs
+            # receives explicit semantic inspection; kernel/initramfs inputs
+            # are reproducibly built from the source trees scanned above.
+            continue
         if not stat.S_ISREG(metadata.st_mode):
             continue
         if metadata.st_size > MAX_SOURCE_FILE_BYTES:
