@@ -6,6 +6,7 @@ import java.security.KeyFactory
 import java.security.MessageDigest
 import java.security.Signature
 import java.security.spec.X509EncodedKeySpec
+import java.util.Collections
 
 class ProfileVerificationException(message: String, cause: Throwable? = null) :
     IllegalArgumentException(message, cause)
@@ -39,10 +40,28 @@ class Ed25519PublicKey private constructor(rawBytes: ByteArray) {
 
 data class TrustedProfileSigningKey(val publicKey: Ed25519PublicKey)
 
-/** APK-owned trust policy. Raising [currentTrustEpoch] explicitly resets generation floors. */
-interface ProfileTrustResolver {
-    val currentTrustEpoch: TrustEpoch
-    fun resolve(keyId: SigningKeyId): TrustedProfileSigningKey?
+/**
+ * One closed APK-owned trust snapshot. Raising [trustEpoch] explicitly resets generation floors.
+ * The constructor defensively copies the key map so one repository process cannot observe a
+ * partial or later trust-policy update; an APK update/process restart must construct a new policy.
+ */
+class ProfileTrustPolicy(
+    val trustEpoch: TrustEpoch,
+    trustedSigningKeys: Map<SigningKeyId, TrustedProfileSigningKey>,
+) {
+    private val trustedSigningKeys = Collections.unmodifiableMap(LinkedHashMap(trustedSigningKeys))
+
+    init {
+        require(this.trustedSigningKeys.size <= MAX_TRUSTED_SIGNING_KEYS) {
+            "trusted profile signing key count exceeds the supported bound"
+        }
+    }
+
+    fun resolve(keyId: SigningKeyId): TrustedProfileSigningKey? = trustedSigningKeys[keyId]
+
+    private companion object {
+        const val MAX_TRUSTED_SIGNING_KEYS = 32
+    }
 }
 
 fun interface Ed25519Verifier {

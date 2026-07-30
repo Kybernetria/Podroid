@@ -86,6 +86,31 @@ data class ActivationState(
     val rollback: PreparedProfileCandidate?,
 )
 
+enum class QuarantinedCandidateRole {
+    ACTIVE,
+    ROLLBACK,
+}
+
+enum class TrustQuarantineReason {
+    TRUST_EPOCH_OBSOLETE,
+    SIGNING_KEY_NOT_TRUSTED,
+    SIGNING_KEY_CHANGED,
+    NOT_SELECTED_AS_AUTOMATIC_FALLBACK,
+}
+
+data class QuarantinedProfileCandidate(
+    val role: QuarantinedCandidateRole,
+    val candidate: PreparedProfileCandidate,
+    val reason: TrustQuarantineReason,
+)
+
+class TrustQuarantineState internal constructor(
+    val activationSequence: Long,
+    candidates: List<QuarantinedProfileCandidate>,
+) {
+    val candidates: List<QuarantinedProfileCandidate> = Collections.unmodifiableList(candidates.toList())
+}
+
 enum class ActivationFailureReason {
     CANDIDATE_NO_LONGER_USABLE,
 }
@@ -156,7 +181,7 @@ class ProfileRepository(
     repositoryDirectory: File,
     storageFile: File,
     private val approvedOrigins: ApprovedArtifactOrigins,
-    private val trustResolver: ProfileTrustResolver,
+    private val trustPolicy: ProfileTrustPolicy,
     private val artifactFetcher: ProfileArtifactFetcher,
     private val directoryDurability: DirectoryDurability,
     private val verifier: Ed25519Verifier = TinkEd25519Verifier,
@@ -174,6 +199,7 @@ class ProfileRepository(
     private val artifactTemporary = temporary.resolve(ARTIFACT_TEMP_FILE)
     private val recordTemporary = temporary.resolve(RECORD_TEMP_FILE)
     private val pendingActivationPath = state.resolve(PENDING_ACTIVATION_FILE)
+    private val trustQuarantinePath = state.resolve(TRUST_QUARANTINE_FILE)
     private val fixedStorage = storageFile.toPath().toAbsolutePath().normalize()
     private val storageTombstone = fixedStorage.parent?.resolve(
         ".podroid-profile-delete-${fixedStorage.toString().sha256Hex()}",
@@ -195,7 +221,7 @@ class ProfileRepository(
         val verified = VerifiedProfileJsonCodec.decodeManifest(
             signedEnvelopeBytes,
             approvedOrigins,
-            trustResolver,
+            trustPolicy,
             verifier,
         )
         return withRepositoryLock {
@@ -203,7 +229,7 @@ class ProfileRepository(
             if (readPendingActivationLocked() != null) {
                 throw ProfileActivationException("prepare is blocked while confirmed data deletion is pending")
             }
-            if (verified.trustEpoch != trustResolver.currentTrustEpoch) {
+            if (verified.trustEpoch != trustPolicy.trustEpoch) {
                 throw InvalidProfileSignatureException("profile trust policy changed during verification")
             }
             prepareLocked(verified)
@@ -263,6 +289,14 @@ class ProfileRepository(
         readActivationFailureLocked()
     }
 
+    /** Returns the latest bounded diagnostic record for lifecycle references rejected by this policy. */
+    @Throws(IOException::class)
+    fun lastTrustQuarantine(): TrustQuarantineState? = withRepositoryLock {
+        recoverLocked()
+        recoverPendingActivationLocked()
+        readTrustQuarantineLocked()
+    }
+
     /** Issues destructive authority for the current sequence, candidate, and fixed file identity. */
     @Throws(IOException::class)
     fun issueDataDeletionConfirmation(candidate: PreparedProfileCandidate): DataDeletionConfirmation =
@@ -279,7 +313,7 @@ class ProfileRepository(
             )
             DataDeletionConfirmation.issue(
                 confirmationOwner,
-                activation?.activationSequence ?: 0L,
+                latestActivationSequenceLocked(),
                 candidate,
                 captureStorageIdentity(requireStableKeys = true),
             )
@@ -300,7 +334,8 @@ class ProfileRepository(
             if (completePendingActivationLocked(pending) == PendingRecoveryResult.ABORTED) {
                 throw ProfileActivationException("the pending data-deletion activation was aborted during recovery")
             }
-            return@withRepositoryLock pending.desired
+            return@withRepositoryLock readActivationStateLocked()
+                ?: throw ProfileActivationException("the recovered activation is no longer launchable")
         }
 
         val current = readActivationStateLocked()
@@ -329,7 +364,7 @@ class ProfileRepository(
                 }
             }
             GuestDataPolicy.DELETE_DATA -> {
-                val expectedSequence = current?.activationSequence ?: 0L
+                val expectedSequence = latestActivationSequenceLocked()
                 if (deletionConfirmation?.owner !== confirmationOwner ||
                     deletionConfirmation.expectedActivationSequence != expectedSequence ||
                     deletionConfirmation.candidate != candidate
@@ -343,7 +378,7 @@ class ProfileRepository(
         }
 
         val rollback = if (sameActive) current?.rollback else current?.active
-        val next = ActivationState(nextActivationSequence(current?.activationSequence ?: 0L), candidate, rollback)
+        val next = ActivationState(nextActivationSequence(latestActivationSequenceLocked()), candidate, rollback)
         if (dataPolicy == GuestDataPolicy.DELETE_DATA) {
             val pending = PendingActivation(next, deletionConfirmation!!.storageIdentity)
             writeImmutableRecord(pendingActivationPath, encodePendingActivation(pending))
@@ -397,7 +432,7 @@ class ProfileRepository(
             throw ProfileActivationException("rollback profile is not storage-compatible with the active profile")
         }
 
-        val next = ActivationState(nextActivationSequence(current.activationSequence), rollbackCandidate, current.active)
+        val next = ActivationState(nextActivationSequence(latestActivationSequenceLocked()), rollbackCandidate, current.active)
         writeReplaceRecord(activationPath(), encodeActivation(next))
         readActivationStateLocked()?.also {
             if (it != next) throw ProfileRepositoryCorruptException("published rollback record changed unexpectedly")
@@ -414,7 +449,7 @@ class ProfileRepository(
     private fun prepareLocked(verified: VerifiedProfileManifest): PreparedProfile {
         val profile = verified.profile
         val profileKey = profileKey(profile.id)
-        val currentEpoch = trustResolver.currentTrustEpoch
+        val currentEpoch = trustPolicy.trustEpoch
         revalidateVerifiedTrust(verified)
 
         val floor = readFloor(profileKey)
@@ -492,10 +527,10 @@ class ProfileRepository(
     }
 
     private fun revalidateVerifiedTrust(verified: VerifiedProfileManifest) {
-        if (verified.trustEpoch != trustResolver.currentTrustEpoch) {
+        if (verified.trustEpoch != trustPolicy.trustEpoch) {
             throw InvalidProfileSignatureException("profile trust policy changed during preparation")
         }
-        val resolved = trustResolver.resolve(verified.signingKeyId)
+        val resolved = trustPolicy.resolve(verified.signingKeyId)
             ?: throw InvalidProfileSignatureException("profile signing key was revoked during preparation")
         if (resolved.publicKey.fingerprint != verified.signingKeyFingerprint) {
             throw InvalidProfileSignatureException("profile signing key changed during preparation")
@@ -602,7 +637,7 @@ class ProfileRepository(
     }
 
     private fun prunePreparedRecordsAndBlobsLocked() {
-        val currentEpoch = trustResolver.currentTrustEpoch
+        val currentEpoch = trustPolicy.trustEpoch
         val activation = readActivationStateLocked()
         val pending = readPendingActivationLocked()
         val retainedCandidates = buildSet {
@@ -855,10 +890,10 @@ class ProfileRepository(
 
     private fun revalidateTrust(record: PreparedRecord) {
         val candidate = record.candidate
-        if (candidate.trustEpoch != trustResolver.currentTrustEpoch) {
+        if (candidate.trustEpoch != trustPolicy.trustEpoch) {
             throw ProfileActivationException("prepared candidate trust epoch is no longer current")
         }
-        val resolved = trustResolver.resolve(candidate.signingKeyId)
+        val resolved = trustPolicy.resolve(candidate.signingKeyId)
             ?: throw ProfileActivationException("prepared candidate signing key is no longer trusted")
         if (resolved.publicKey.fingerprint != candidate.signingKeyFingerprint) {
             throw ProfileActivationException("prepared candidate signing key fingerprint changed")
@@ -979,6 +1014,8 @@ class ProfileRepository(
         validatePendingSequence(pending, activation)
         if (activation == pending.desired) {
             clearPendingActivation()
+            reconcileActivationTrustLocked()
+            prunePreparedRecordsAndBlobsLocked()
             return PendingRecoveryResult.COMPLETED
         }
 
@@ -1002,6 +1039,8 @@ class ProfileRepository(
         faultInjector.check(ProfileRepositoryFaultPoint.AFTER_STORAGE_DELETION)
         writeReplaceRecord(activationPath(), encodeActivation(pending.desired))
         clearPendingActivation()
+        reconcileActivationTrustLocked()
+        prunePreparedRecordsAndBlobsLocked()
         return PendingRecoveryResult.COMPLETED
     }
 
@@ -1043,28 +1082,89 @@ class ProfileRepository(
         )
         writeReplaceRecord(activationFailurePath(), encodeActivationFailure(failure))
         clearPendingActivation()
+        reconcileActivationTrustLocked()
         prunePreparedRecordsAndBlobsLocked()
     }
 
     private fun validatePendingSequence(pending: PendingActivation, activation: ActivationState?) {
-        when {
-            activation == pending.desired -> Unit
-            activation == null && pending.desired.activationSequence != 1L ->
-                throw ProfileRepositoryCorruptException("pending activation sequence has no predecessor")
-            activation != null &&
-                (pending.desired.activationSequence <= activation.activationSequence ||
-                    pending.desired.activationSequence - activation.activationSequence != 1L ||
-                    (pending.desired.active == activation.active && pending.desired.rollback != activation.rollback) ||
-                    (pending.desired.active != activation.active && pending.desired.rollback != activation.active)) ->
-                throw ProfileRepositoryCorruptException("pending activation does not follow current state")
+        if (activation == pending.desired) return
+        val predecessorSequence = maxOf(
+            activation?.activationSequence ?: 0L,
+            latestTerminalActivationSequenceLocked(),
+        )
+        val sequenceFollows = pending.desired.activationSequence == nextActivationSequence(predecessorSequence)
+        val candidatesFollow = if (activation == null) {
+            pending.desired.rollback == null
+        } else {
+            (pending.desired.active == activation.active && pending.desired.rollback == activation.rollback) ||
+                (pending.desired.active != activation.active && pending.desired.rollback == activation.active)
         }
+        if (!sequenceFollows || !candidatesFollow) {
+            throw ProfileRepositoryCorruptException("pending activation does not follow current state")
+        }
+    }
+
+    private fun reconcileActivationTrustLocked() {
+        if (readPendingActivationLocked() != null) return
+        val activation = readActivationStateLocked() ?: return
+        val activeReason = trustRejectionReason(activation.active)
+        val rollbackReason = activation.rollback?.let(::trustRejectionReason)
+        if (activeReason == null && rollbackReason == null) return
+
+        val quarantined = ArrayList<QuarantinedProfileCandidate>(2)
+        if (activeReason != null) {
+            quarantined += QuarantinedProfileCandidate(
+                QuarantinedCandidateRole.ACTIVE,
+                activation.active,
+                activeReason,
+            )
+            activation.rollback?.let { rollback ->
+                quarantined += QuarantinedProfileCandidate(
+                    QuarantinedCandidateRole.ROLLBACK,
+                    rollback,
+                    rollbackReason ?: TrustQuarantineReason.NOT_SELECTED_AS_AUTOMATIC_FALLBACK,
+                )
+            }
+        } else {
+            quarantined += QuarantinedProfileCandidate(
+                QuarantinedCandidateRole.ROLLBACK,
+                activation.rollback!!,
+                rollbackReason!!,
+            )
+        }
+        writeReplaceRecord(
+            trustQuarantinePath,
+            encodeTrustQuarantine(TrustQuarantineState(activation.activationSequence, quarantined)),
+        )
+        if (activeReason != null) {
+            requireRegularFile(activationPath(), "nonlaunchable activation record")
+            Files.delete(activationPath())
+            forceDirectory(state)
+        } else {
+            writeReplaceRecord(
+                activationPath(),
+                encodeActivation(ActivationState(activation.activationSequence, activation.active, null)),
+            )
+        }
+    }
+
+    private fun trustRejectionReason(candidate: PreparedProfileCandidate): TrustQuarantineReason? {
+        if (candidate.trustEpoch != trustPolicy.trustEpoch) {
+            return TrustQuarantineReason.TRUST_EPOCH_OBSOLETE
+        }
+        val trustedKey = trustPolicy.resolve(candidate.signingKeyId)
+            ?: return TrustQuarantineReason.SIGNING_KEY_NOT_TRUSTED
+        if (trustedKey.publicKey.fingerprint != candidate.signingKeyFingerprint) {
+            return TrustQuarantineReason.SIGNING_KEY_CHANGED
+        }
+        return null
     }
 
     private fun recoverLocked() {
         validateTreeAndCleanTemps()
         val preparedByKey = readAllPreparedRecords()
         val floorsByKey = readAllFloors()
-        val currentEpoch = trustResolver.currentTrustEpoch
+        val currentEpoch = trustPolicy.trustEpoch
         for ((profileKey, records) in preparedByKey) {
             if (records.any { it.candidate.trustEpoch.value > currentEpoch.value }) {
                 throw ProfileRepositoryCorruptException("prepared state is from a future trust epoch")
@@ -1072,6 +1172,9 @@ class ProfileRepository(
             val floor = floorsByKey[profileKey]
             if (floor != null && floor.candidate.trustEpoch.value > currentEpoch.value) {
                 throw ProfileRepositoryCorruptException("generation floor is from a future trust epoch")
+            }
+            if (floor != null && records.none { it.candidate == floor.candidate }) {
+                throw ProfileRepositoryCorruptException("generation floor has no matching immutable prepared record")
             }
             val currentRecords = records.filter { it.candidate.trustEpoch == currentEpoch }
             val highest = currentRecords.maxByOrNull { it.candidate.generation.value }
@@ -1090,6 +1193,12 @@ class ProfileRepository(
         if (orphanFloors.isNotEmpty()) throw ProfileRepositoryCorruptException("generation floor has no retained immutable state")
         val activation = readActivationStateLocked()
         val pendingActivation = readPendingActivationLocked()
+        val trustQuarantine = readTrustQuarantineLocked()
+        if (activation != null && trustQuarantine != null &&
+            trustQuarantine.activationSequence > activation.activationSequence
+        ) {
+            throw ProfileRepositoryCorruptException("activation sequence precedes trust quarantine")
+        }
         pendingActivation?.let { validatePendingSequence(it, activation) }
         val referencedCandidates = buildList {
             activation?.let { add(it.active); it.rollback?.let(::add) }
@@ -1102,6 +1211,7 @@ class ProfileRepository(
             val record = decodePrepared(readBoundedRecord(path), key, path.fileName.toString())
             if (record.candidate != candidate) throw ProfileRepositoryCorruptException("activation candidate conflicts with local state")
         }
+        if (pendingActivation == null) reconcileActivationTrustLocked()
         prunePreparedRecordsAndBlobsLocked()
     }
 
@@ -1168,7 +1278,8 @@ class ProfileRepository(
                 if (stateCount > MAX_STATE_RECORDS) throw ProfileRepositoryCorruptException("state entry bound exceeded")
                 val name = entry.fileName.toString()
                 if (name != ACTIVATION_FILE && name != PENDING_ACTIVATION_FILE &&
-                    name != ACTIVATION_FAILURE_FILE && !FLOOR_NAME.matches(name)
+                    name != ACTIVATION_FAILURE_FILE && name != TRUST_QUARANTINE_FILE &&
+                    !FLOOR_NAME.matches(name)
                 ) {
                     throw ProfileRepositoryCorruptException("unknown repository state entry")
                 }
@@ -1244,6 +1355,23 @@ class ProfileRepository(
         val path = activationFailurePath()
         return if (existsNoFollow(path)) decodeActivationFailure(readBoundedRecord(path)) else null
     }
+
+    private fun readTrustQuarantineLocked(): TrustQuarantineState? =
+        if (existsNoFollow(trustQuarantinePath)) {
+            decodeTrustQuarantine(readBoundedRecord(trustQuarantinePath))
+        } else {
+            null
+        }
+
+    private fun latestActivationSequenceLocked(): Long = maxOf(
+        readActivationStateLocked()?.activationSequence ?: 0L,
+        latestTerminalActivationSequenceLocked(),
+    )
+
+    private fun latestTerminalActivationSequenceLocked(): Long = maxOf(
+        readActivationFailureLocked()?.attemptedActivationSequence ?: 0L,
+        readTrustQuarantineLocked()?.activationSequence ?: 0L,
+    )
 
     private fun clearPendingActivation() {
         if (existsNoFollow(pendingActivationPath)) {
@@ -1409,6 +1537,17 @@ class ProfileRepository(
             output.writeBoolean(record.storageDeletionIrreversible)
         }
 
+    private fun encodeTrustQuarantine(record: TrustQuarantineState): ByteArray =
+        encodeRecord(TRUST_QUARANTINE_MAGIC) { output ->
+            output.writeLong(record.activationSequence)
+            output.writeInt(record.candidates.size)
+            record.candidates.forEach { quarantined ->
+                output.writeUTF(quarantined.role.name)
+                writeCandidate(output, quarantined.candidate)
+                output.writeUTF(quarantined.reason.name)
+            }
+        }
+
     private fun decodeActivationFailure(bytes: ByteArray): ActivationFailureState =
         decodeRecord(bytes, ACTIVATION_FAILURE_MAGIC) { input ->
             val sequence = input.readLong()
@@ -1420,6 +1559,32 @@ class ProfileRepository(
                 throw ProfileRepositoryCorruptException("activation failure reason is invalid", failure)
             }
             ActivationFailureState(sequence, candidate, reason, input.readBoolean())
+        }
+
+    private fun decodeTrustQuarantine(bytes: ByteArray): TrustQuarantineState =
+        decodeRecord(bytes, TRUST_QUARANTINE_MAGIC) { input ->
+            val sequence = input.readLong()
+            if (sequence <= 0) throw ProfileRepositoryCorruptException("quarantine activation sequence is invalid")
+            val count = input.readInt()
+            if (count !in 1..2) throw ProfileRepositoryCorruptException("quarantine candidate count is invalid")
+            val candidates = (0 until count).map {
+                val role = try {
+                    QuarantinedCandidateRole.valueOf(input.readUTF())
+                } catch (failure: IllegalArgumentException) {
+                    throw ProfileRepositoryCorruptException("quarantine candidate role is invalid", failure)
+                }
+                val candidate = readCandidate(input)
+                val reason = try {
+                    TrustQuarantineReason.valueOf(input.readUTF())
+                } catch (failure: IllegalArgumentException) {
+                    throw ProfileRepositoryCorruptException("trust quarantine reason is invalid", failure)
+                }
+                QuarantinedProfileCandidate(role, candidate, reason)
+            }
+            if (candidates.map { it.role }.distinct().size != candidates.size) {
+                throw ProfileRepositoryCorruptException("quarantine candidate roles are duplicated")
+            }
+            TrustQuarantineState(sequence, candidates)
         }
 
     private fun decodePendingActivation(bytes: ByteArray): PendingActivation =
@@ -1721,6 +1886,7 @@ class ProfileRepository(
         const val ACTIVATION_FILE = "activation.record"
         const val PENDING_ACTIVATION_FILE = "activation.pending"
         const val ACTIVATION_FAILURE_FILE = "activation.failure"
+        const val TRUST_QUARANTINE_FILE = "trust.quarantine"
         const val BLOB_SUFFIX = ".blob"
         const val PREPARED_SUFFIX = ".prepared"
         const val FLOOR_SUFFIX = ".floor"
@@ -1731,13 +1897,14 @@ class ProfileRepository(
         const val ACTIVATION_MAGIC = 0x50524143
         const val PENDING_ACTIVATION_MAGIC = 0x5052504e
         const val ACTIVATION_FAILURE_MAGIC = 0x50524641
+        const val TRUST_QUARANTINE_MAGIC = 0x50525154
         const val MAX_RECORD_BYTES = 16 * 1024
         const val RECORD_BUFFER_BYTES = 4 * 1024
         const val STREAM_BUFFER_BYTES = 64 * 1024
         const val MAX_ZERO_READS = 16
         const val MAX_PROFILES = 32
         const val MAX_GENERATIONS_PER_PROFILE = 64
-        const val MAX_STATE_RECORDS = MAX_PROFILES + 3
+        const val MAX_STATE_RECORDS = MAX_PROFILES + 4
         const val MAX_FILE_KEY_CHARS = 512
         const val MAX_FILE_TIMESTAMP_CHARS = 64
         const val DEFAULT_FETCH_TIMEOUT_MILLIS = 5L * 60 * 1000

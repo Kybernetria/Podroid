@@ -165,19 +165,18 @@ object VerifiedProfileJsonCodec {
     fun decode(
         envelopeBytes: ByteArray,
         approvedOrigins: ApprovedArtifactOrigins,
-        trustResolver: ProfileTrustResolver,
+        trustPolicy: ProfileTrustPolicy,
         verifier: Ed25519Verifier = TinkEd25519Verifier,
-    ): VmProfile = decodeManifest(envelopeBytes, approvedOrigins, trustResolver, verifier).profile
+    ): VmProfile = decodeManifest(envelopeBytes, approvedOrigins, trustPolicy, verifier).profile
 
     fun decodeManifest(
         envelopeBytes: ByteArray,
         approvedOrigins: ApprovedArtifactOrigins,
-        trustResolver: ProfileTrustResolver,
+        trustPolicy: ProfileTrustPolicy,
         verifier: Ed25519Verifier = TinkEd25519Verifier,
     ): VerifiedProfileManifest {
         val envelope = SignedProfileEnvelopeJsonCodec.decode(envelopeBytes)
-        val trustEpoch = trustResolver.currentTrustEpoch
-        val trustedKey = trustResolver.resolve(envelope.keyId)
+        val trustedKey = trustPolicy.resolve(envelope.keyId)
             ?: throw InvalidProfileSignatureException("profile signing key is not trusted")
         val publicKey = trustedKey.publicKey
         val payload = envelope.payloadBytes()
@@ -198,7 +197,7 @@ object VerifiedProfileJsonCodec {
             ),
             signingKeyId = envelope.keyId,
             signingKeyFingerprint = publicKey.fingerprint,
-            trustEpoch = trustEpoch,
+            trustEpoch = trustPolicy.trustEpoch,
         )
     }
 }

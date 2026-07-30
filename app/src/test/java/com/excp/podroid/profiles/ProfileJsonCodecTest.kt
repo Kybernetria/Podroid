@@ -54,12 +54,11 @@ class ProfileJsonCodecTest {
             ByteArray(ProfileLimits.ED25519_SIGNATURE_BYTES),
         )
         var capturedMessage: ByteArray? = null
-        var resolvedId: SigningKeyId? = null
         val failure = runCatching {
             VerifiedProfileJsonCodec.decode(
                 envelope,
                 origins,
-                trustResolver = resolver(testPublicKey) { resolvedId = it },
+                trustPolicy = policy(testPublicKey),
                 verifier = Ed25519Verifier { _, message, _ ->
                     capturedMessage = message.copyOf()
                     true
@@ -68,7 +67,6 @@ class ProfileJsonCodecTest {
         }.exceptionOrNull()
 
         assertTrue(failure is ProfileCodecException)
-        assertEquals(SigningKeyId("release-1"), resolvedId)
         assertArrayEquals(ProfileSigning.messageFor(invalidJsonPayload), capturedMessage)
         val expected = "com.excp.podroid.vm-profile.v1\u0000".toByteArray(Charsets.US_ASCII) + invalidJsonPayload
         assertEquals("com.excp.podroid.vm-profile.v1\u0000", ProfileSigning.DOMAIN_SEPARATOR)
@@ -89,7 +87,7 @@ class ProfileJsonCodecTest {
 
         assertEquals(
             ProfileGeneration(7),
-            VerifiedProfileJsonCodec.decode(envelope, origins, resolver(publicKey)).generation,
+            VerifiedProfileJsonCodec.decode(envelope, origins, policy(publicKey)).generation,
         )
 
         val changedPayload = (" " + validPayload()).toByteArray()
@@ -97,9 +95,22 @@ class ProfileJsonCodecTest {
             SigningKeyId("release-1"), changedPayload, signature,
         )
         val failure = runCatching {
-            VerifiedProfileJsonCodec.decode(changedEnvelope, origins, resolver(publicKey))
+            VerifiedProfileJsonCodec.decode(changedEnvelope, origins, policy(publicKey))
         }.exceptionOrNull()
         assertTrue(failure is InvalidProfileSignatureException)
+    }
+
+    @Test
+    fun `trust policy defensively captures one closed key snapshot`() {
+        val keyId = SigningKeyId("release-1")
+        val keys = mutableMapOf(keyId to TrustedProfileSigningKey(testPublicKey))
+        val policy = ProfileTrustPolicy(TrustEpoch(7), keys)
+
+        keys.clear()
+
+        assertEquals(TrustEpoch(7), policy.trustEpoch)
+        assertEquals(testPublicKey.fingerprint, policy.resolve(keyId)!!.publicKey.fingerprint)
+        assertEquals(null, policy.resolve(SigningKeyId("unknown")))
     }
 
     @Test
@@ -115,7 +126,7 @@ class ProfileJsonCodecTest {
             VerifiedProfileJsonCodec.decode(
                 envelope,
                 origins,
-                trustResolver = resolver(null),
+                trustPolicy = policy(null),
                 verifier = Ed25519Verifier { _, _, _ -> verificationCalled = true; true },
             )
         }.exceptionOrNull()
@@ -341,15 +352,13 @@ class ProfileJsonCodecTest {
         assertFails { SignedProfileEnvelopeJsonCodec.decode(shortSignature.toByteArray()) }
     }
 
-    private fun resolver(
-        key: Ed25519PublicKey?,
-        onResolve: (SigningKeyId) -> Unit = {},
-    ): ProfileTrustResolver = object : ProfileTrustResolver {
-        override val currentTrustEpoch = TrustEpoch(1)
-        override fun resolve(keyId: SigningKeyId): TrustedProfileSigningKey? {
-            onResolve(keyId)
-            return key?.let(::TrustedProfileSigningKey)
+    private fun policy(key: Ed25519PublicKey?): ProfileTrustPolicy {
+        val keys = if (key == null) {
+            emptyMap()
+        } else {
+            mapOf(SigningKeyId("release-1") to TrustedProfileSigningKey(key))
         }
+        return ProfileTrustPolicy(TrustEpoch(1), keys)
     }
 
     private fun validEnvelopeText(): String = SignedProfileEnvelopeJsonCodec.encode(

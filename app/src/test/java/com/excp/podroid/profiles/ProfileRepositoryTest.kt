@@ -28,7 +28,7 @@ class ProfileRepositoryTest {
     private val origins = ApprovedArtifactOrigins.of(APPROVED_ORIGIN)
     private val firstKey: KeyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
     private val secondKey: KeyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
-    private val trust = MutableTrustResolver(TrustEpoch(1)).apply { trust(KEY_ID, firstKey) }
+    private var trustPolicy = policy(TrustEpoch(1), KEY_ID to firstKey)
 
     @Test
     fun `prepare streams fixed CAS paths deduplicates and fully revalidates blobs`() {
@@ -88,21 +88,27 @@ class ProfileRepositoryTest {
     fun `same trust epoch is monotonic and higher trust epoch supersedes a poisoned high floor`() {
         val high = artifactBytes("epoch-one-high")
         val fetcher = RecordingFetcher(high)
-        val repository = repository(temporaryFolder.newFolder("epochs"), fetcher)
-        repository.prepare(envelope(ProfileLimits.MAX_PROFILE_GENERATION, artifacts = high))
+        val root = temporaryFolder.newFolder("epochs")
+        var repository = repository(root, fetcher)
+        val poisoned = repository.prepare(envelope(ProfileLimits.MAX_PROFILE_GENERATION, artifacts = high))
+        repository.activate(poisoned.candidate, GuestDataPolicy.PRESERVE_DATA)
 
         assertFailure<ProfileGenerationRollbackException> {
             repository.prepare(envelope(1, artifacts = high))
         }
 
-        trust.epoch = TrustEpoch(2)
-        trust.revoke(KEY_ID)
-        trust.trust(SECOND_KEY_ID, secondKey)
+        trustPolicy = policy(TrustEpoch(2), SECOND_KEY_ID to secondKey)
+        repository = repository(root, fetcher)
         val low = artifactBytes("epoch-two-low")
         fetcher.replace(low)
         val reset = repository.prepare(envelope(1, keyId = SECOND_KEY_ID, keyPair = secondKey, artifacts = low))
         assertEquals(ProfileGeneration(1), reset.candidate.generation)
         assertEquals(TrustEpoch(2), reset.candidate.trustEpoch)
+        assertNull(repository.activationState())
+        assertEquals(
+            TrustQuarantineReason.TRUST_EPOCH_OBSOLETE,
+            repository.lastTrustQuarantine()!!.candidates.single().reason,
+        )
     }
 
     @Test
@@ -121,19 +127,28 @@ class ProfileRepositoryTest {
     }
 
     @Test
-    fun `revoked prepared candidate cannot activate and current-active idempotency revalidates policy`() {
+    fun `repository captures trust for its lifetime and restart quarantines a revoked active`() {
         val artifacts = artifactBytes("revoked")
         val root = temporaryFolder.newFolder("revoked")
-        val repository = repository(root, RecordingFetcher(artifacts))
+        val storage = storageFor(root).also { it.writeText("preserved") }
+        val repository = repository(root, RecordingFetcher(artifacts), storage = storage)
         val prepared = repository.prepare(envelope(1, artifacts = artifacts))
-        repository.activate(prepared.candidate, GuestDataPolicy.PRESERVE_DATA)
+        val active = repository.activate(prepared.candidate, GuestDataPolicy.PRESERVE_DATA)
 
-        trust.revoke(KEY_ID)
+        trustPolicy = policy(TrustEpoch(1))
+        assertEquals(active, repository.activate(prepared.candidate, GuestDataPolicy.PRESERVE_DATA))
+
+        val restarted = repository(root, RecordingFetcher(artifacts), storage = storage)
+        restarted.recover()
+
+        assertNull(restarted.activationState())
+        assertEquals("preserved", storage.readText())
+        val quarantine = restarted.lastTrustQuarantine()!!
+        assertEquals(active.activationSequence, quarantine.activationSequence)
+        assertEquals(prepared.candidate, quarantine.candidates.single().candidate)
+        assertEquals(TrustQuarantineReason.SIGNING_KEY_NOT_TRUSTED, quarantine.candidates.single().reason)
         assertFailure<ProfileActivationException> {
-            repository.activate(prepared.candidate, GuestDataPolicy.PRESERVE_DATA)
-        }
-        assertFailure<ProfileActivationException> {
-            repository.issueDataDeletionConfirmation(prepared.candidate)
+            restarted.activate(prepared.candidate, GuestDataPolicy.PRESERVE_DATA)
         }
     }
 
@@ -161,8 +176,11 @@ class ProfileRepositoryTest {
         assertFailure<ProfileActivationException> { repository.rollback(2, GuestDataPolicy.PRESERVE_DATA) }
         assertFailure<ProfileActivationException> { repository.rollback(3, GuestDataPolicy.DELETE_DATA) }
 
-        trust.revoke(KEY_ID)
-        assertFailure<ProfileActivationException> { repository.rollback(3, GuestDataPolicy.PRESERVE_DATA) }
+        trustPolicy = policy(TrustEpoch(1))
+        val restarted = repository(root, fetcher, storage = storage)
+        assertFailure<ProfileActivationException> { restarted.rollback(3, GuestDataPolicy.PRESERVE_DATA) }
+        assertNull(restarted.activationState())
+        assertEquals("persistent-user-data", storage.readText())
     }
 
     @Test
@@ -317,13 +335,14 @@ class ProfileRepositoryTest {
         }
         val tombstone = storageTombstone(storage)
         Files.move(storage.toPath(), tombstone.toPath())
-        trust.revoke(KEY_ID)
+        trustPolicy = policy(TrustEpoch(1))
+        val restarted = repository(root, RecordingFetcher(artifacts), storage = storage)
 
-        repository.recover()
+        restarted.recover()
 
         assertEquals("original", storage.readText())
         assertFalse(tombstone.exists())
-        val failure = repository.lastActivationFailure()!!
+        val failure = restarted.lastActivationFailure()!!
         assertEquals(candidate, failure.candidate)
         assertFalse(failure.storageDeletionIrreversible)
         assertFalse(File(root, "state/activation.pending").exists())
@@ -345,9 +364,10 @@ class ProfileRepositoryTest {
         }
         Files.move(storage.toPath(), storageTombstone(storage).toPath())
         storage.writeText("recreated")
-        trust.revoke(KEY_ID)
+        trustPolicy = policy(TrustEpoch(1))
+        val restarted = repository(root, RecordingFetcher(artifacts), storage = storage)
 
-        repository.recover()
+        restarted.recover()
 
         assertEquals("recreated", storage.readText())
         assertEquals("original", storageQuarantine(storage).readText())
@@ -379,13 +399,14 @@ class ProfileRepositoryTest {
                 repository.issueDataDeletionConfirmation(candidate),
             )
         }
-        trust.revoke(KEY_ID)
+        trustPolicy = policy(TrustEpoch(1))
+        val restarted = repository(root, RecordingFetcher(artifacts), storage = storage)
 
-        repository.recover()
+        restarted.recover()
 
         assertFalse(storage.exists())
-        assertNull(repository.activationState())
-        assertTrue(repository.lastActivationFailure()!!.storageDeletionIrreversible)
+        assertNull(restarted.activationState())
+        assertTrue(restarted.lastActivationFailure()!!.storageDeletionIrreversible)
         assertFalse(File(root, "state/activation.pending").exists())
     }
 
@@ -443,18 +464,22 @@ class ProfileRepositoryTest {
     }
 
     @Test
-    fun `trust revocation after durable intent aborts before deletion`() {
-        val root = temporaryFolder.newFolder("intent-revocation")
+    fun `trust source mutation after durable intent cannot race destructive activation`() {
+        val root = temporaryFolder.newFolder("intent-policy-snapshot")
         val storage = storageFor(root).also { it.writeText("data") }
-        val artifacts = artifactBytes("intent-revocation")
-        var revokeOnIntentSync = true
+        val artifacts = artifactBytes("intent-policy-snapshot")
+        val mutableKeys = mutableMapOf(
+            KEY_ID to TrustedProfileSigningKey(Ed25519PublicKey.fromX509(firstKey.public.encoded)),
+        )
+        trustPolicy = ProfileTrustPolicy(TrustEpoch(1), mutableKeys)
+        var mutateOnIntentSync = true
         val durability = DirectoryDurability { directory ->
             FileChannelDirectoryDurability.force(directory)
-            if (revokeOnIntentSync && directory == File(root, "state").toPath() &&
+            if (mutateOnIntentSync && directory == File(root, "state").toPath() &&
                 File(root, "state/activation.pending").exists()
             ) {
-                revokeOnIntentSync = false
-                trust.revoke(KEY_ID)
+                mutateOnIntentSync = false
+                mutableKeys.clear()
             }
         }
         val repository = repository(
@@ -466,12 +491,11 @@ class ProfileRepositoryTest {
         val candidate = repository.prepare(envelope(1, artifacts = artifacts)).candidate
         val confirmation = repository.issueDataDeletionConfirmation(candidate)
 
-        assertFailure<ProfileActivationException> {
-            repository.activate(candidate, GuestDataPolicy.DELETE_DATA, confirmation)
-        }
+        val active = repository.activate(candidate, GuestDataPolicy.DELETE_DATA, confirmation)
 
-        assertEquals("data", storage.readText())
-        assertEquals(candidate, repository.lastActivationFailure()!!.candidate)
+        assertEquals(candidate, active.active)
+        assertFalse(storage.exists())
+        assertNull(repository.lastActivationFailure())
         assertFalse(File(root, "state/activation.pending").exists())
     }
 
@@ -526,14 +550,15 @@ class ProfileRepositoryTest {
                 repository.issueDataDeletionConfirmation(candidate),
             )
         }
-        trust.revoke(KEY_ID)
+        trustPolicy = policy(TrustEpoch(1))
 
         val restarted = repository(root, RecordingFetcher(artifacts), storage = storage)
         restarted.recover()
 
-        assertEquals(candidate, restarted.activationState()!!.active)
+        assertNull(restarted.activationState())
         assertFalse(File(root, "state/activation.pending").exists())
-        assertFailure<ProfileActivationException> { restarted.resolveActiveProfile() }
+        assertNull(restarted.resolveActiveProfile())
+        assertEquals(candidate, restarted.lastTrustQuarantine()!!.candidates.single().candidate)
     }
 
     @Test
@@ -615,13 +640,15 @@ class ProfileRepositoryTest {
         assertEquals(candidate, restarted.resolveActiveProfile()!!.candidate)
         assertEquals(candidate, restarted.resolveCandidate(candidate).candidate)
 
-        trust.revoke(KEY_ID)
-        assertFailure<ProfileActivationException> { restarted.resolveActiveProfile() }
-        assertFailure<ProfileActivationException> { restarted.resolveCandidate(candidate) }
-        trust.trust(KEY_ID, firstKey)
+        trustPolicy = policy(TrustEpoch(1))
+        val revoked = repository(root, RecordingFetcher(artifacts), storage = storage)
+        assertNull(revoked.resolveActiveProfile())
+        assertFailure<ProfileActivationException> { revoked.resolveCandidate(candidate) }
+
+        trustPolicy = policy(TrustEpoch(1), KEY_ID to firstKey)
+        val trustedAgain = repository(root, RecordingFetcher(artifacts), storage = storage)
         File(root, "blobs").listFiles()!!.first().writeText("corrupt")
-        assertFailure<ProfileRepositoryCorruptException> { restarted.resolveActiveProfile() }
-        assertFailure<ProfileRepositoryCorruptException> { restarted.resolveCandidate(candidate) }
+        assertFailure<ProfileRepositoryCorruptException> { trustedAgain.resolveCandidate(candidate) }
     }
 
     @Test
@@ -654,18 +681,58 @@ class ProfileRepositoryTest {
         )
         repository.prepare(envelope(1, artifacts = oldArtifacts))
 
-        trust.epoch = TrustEpoch(2)
-        trust.revoke(KEY_ID)
-        trust.trust(SECOND_KEY_ID, secondKey)
+        trustPolicy = policy(TrustEpoch(2), SECOND_KEY_ID to secondKey)
+        val restarted = repository(root, fetcher, limits = ProfileStoreLimits(totalBytes, ArtifactRole.entries.size, 0))
         val newArtifacts = artifactBytes("epoch-quota-new")
         fetcher.replace(newArtifacts)
-        val prepared = repository.prepare(
+        val prepared = restarted.prepare(
             envelope(1, keyId = SECOND_KEY_ID, keyPair = secondKey, artifacts = newArtifacts),
         )
 
         assertEquals(TrustEpoch(2), prepared.candidate.trustEpoch)
         assertEquals(3, File(root, "blobs").listFiles()!!.size)
         prepared.artifactFiles.values.forEach { assertTrue(it.exists()) }
+    }
+
+    @Test
+    fun `full active rollback quota is reclaimed after same epoch key revocation`() {
+        val root = temporaryFolder.newFolder("active-rollback-trust-quota")
+        val storage = storageFor(root).also { it.writeText("persistent-user-data") }
+        val firstArtifacts = artifactBytes("old-one")
+        val secondArtifacts = artifactBytes("old-two")
+        val totalBytes = (firstArtifacts.values + secondArtifacts.values).sumOf { it.size.toLong() }
+        val limits = ProfileStoreLimits(totalBytes, ArtifactRole.entries.size * 2, 0)
+        val fetcher = RecordingFetcher(firstArtifacts)
+        val original = repository(root, fetcher, storage = storage, limits = limits)
+        val first = original.prepare(envelope(1, artifacts = firstArtifacts))
+        original.activate(first.candidate, GuestDataPolicy.PRESERVE_DATA)
+        fetcher.replace(secondArtifacts)
+        val second = original.prepare(envelope(2, artifacts = secondArtifacts))
+        original.activate(second.candidate, GuestDataPolicy.PRESERVE_DATA)
+        assertEquals(ArtifactRole.entries.size * 2, File(root, "blobs").listFiles()!!.size)
+
+        trustPolicy = policy(TrustEpoch(1), SECOND_KEY_ID to secondKey)
+        val restarted = repository(root, fetcher, storage = storage, limits = limits)
+        restarted.recover()
+
+        assertNull(restarted.resolveActiveProfile())
+        assertEquals("persistent-user-data", storage.readText())
+        val quarantine = restarted.lastTrustQuarantine()!!
+        assertEquals(setOf(first.candidate, second.candidate), quarantine.candidates.map { it.candidate }.toSet())
+        assertTrue(quarantine.candidates.all { it.reason == TrustQuarantineReason.SIGNING_KEY_NOT_TRUSTED })
+        assertEquals(ArtifactRole.entries.size, File(root, "blobs").listFiles()!!.size)
+
+        val replacementArtifacts = artifactBytes("new-key")
+        fetcher.replace(replacementArtifacts)
+        val replacement = restarted.prepare(
+            envelope(3, keyId = SECOND_KEY_ID, keyPair = secondKey, artifacts = replacementArtifacts),
+        )
+
+        assertEquals(SECOND_KEY_ID, replacement.candidate.signingKeyId)
+        assertNull(restarted.resolveActiveProfile())
+        assertEquals(ArtifactRole.entries.size, File(root, "blobs").listFiles()!!.size)
+        replacement.artifactFiles.values.forEach { assertTrue(it.exists()) }
+        assertEquals("persistent-user-data", storage.readText())
     }
 
     @Test
@@ -728,6 +795,20 @@ class ProfileRepositoryTest {
     }
 
     @Test
+    fun `floor missing its immutable prepared state fails before blob collection`() {
+        val root = temporaryFolder.newFolder("orphan-floor")
+        val artifacts = artifactBytes("orphan-floor")
+        val repository = repository(root, RecordingFetcher(artifacts))
+        repository.prepare(envelope(1, artifacts = artifacts))
+        val blobs = File(root, "blobs").listFiles()!!.toSet()
+        assertTrue(File(root, "prepared").walkTopDown().single { it.isFile }.delete())
+
+        assertFailure<ProfileRepositoryCorruptException> { repository.recover() }
+
+        assertEquals(blobs, File(root, "blobs").listFiles()!!.toSet())
+    }
+
+    @Test
     fun `prepared filenames and future trust epochs are bound and fail closed`() {
         val root = temporaryFolder.newFolder("record-binding")
         val artifacts = artifactBytes("record-binding")
@@ -739,16 +820,15 @@ class ProfileRepositoryTest {
         assertFailure<ProfileRepositoryCorruptException> { repository.recover() }
         assertTrue(renamed.renameTo(record))
 
-        trust.epoch = TrustEpoch(2)
-        trust.revoke(KEY_ID)
-        trust.trust(SECOND_KEY_ID, secondKey)
+        trustPolicy = policy(TrustEpoch(2), SECOND_KEY_ID to secondKey)
         val newer = artifactBytes("future-epoch")
         repository(root, RecordingFetcher(newer)).prepare(
             envelope(1, keyId = SECOND_KEY_ID, keyPair = secondKey, artifacts = newer),
         )
-        trust.epoch = TrustEpoch(1)
-        trust.trust(KEY_ID, firstKey)
-        assertFailure<ProfileRepositoryCorruptException> { repository.recover() }
+        trustPolicy = policy(TrustEpoch(1), KEY_ID to firstKey)
+        assertFailure<ProfileRepositoryCorruptException> {
+            repository(root, RecordingFetcher(artifacts)).recover()
+        }
     }
 
     @Test
@@ -826,7 +906,7 @@ class ProfileRepositoryTest {
         repositoryDirectory = root,
         storageFile = storage,
         approvedOrigins = origins,
-        trustResolver = trust,
+        trustPolicy = trustPolicy,
         artifactFetcher = fetcher,
         verifier = JcaEd25519Verifier,
         directoryDurability = durability,
@@ -918,15 +998,15 @@ class ProfileRepositoryTest {
         }
     }
 
-    private class MutableTrustResolver(var epoch: TrustEpoch) : ProfileTrustResolver {
-        private val keys = mutableMapOf<SigningKeyId, TrustedProfileSigningKey>()
-        override val currentTrustEpoch: TrustEpoch get() = epoch
-        fun trust(keyId: SigningKeyId, keyPair: KeyPair) {
-            keys[keyId] = TrustedProfileSigningKey(Ed25519PublicKey.fromX509(keyPair.public.encoded))
-        }
-        fun revoke(keyId: SigningKeyId) { keys.remove(keyId) }
-        override fun resolve(keyId: SigningKeyId): TrustedProfileSigningKey? = keys[keyId]
-    }
+    private fun policy(
+        epoch: TrustEpoch,
+        vararg trustedKeys: Pair<SigningKeyId, KeyPair>,
+    ): ProfileTrustPolicy = ProfileTrustPolicy(
+        epoch,
+        trustedKeys.associate { (keyId, keyPair) ->
+            keyId to TrustedProfileSigningKey(Ed25519PublicKey.fromX509(keyPair.public.encoded))
+        },
+    )
 
     private companion object {
         const val APPROVED_ORIGIN = "https://profiles.example:443"
