@@ -11,6 +11,7 @@ object ProfileLimits {
     const val MAX_PAYLOAD_BYTES = 32 * 1024
     const val MAX_KEY_ID_CHARS = 64
     const val MAX_PROFILE_ID_CHARS = 64
+    const val MAX_DATA_COMPATIBILITY_ID_CHARS = 64
     const val MAX_URL_CHARS = 2_048
     const val ED25519_SIGNATURE_BYTES = 64
     const val MAX_ED25519_PUBLIC_KEY_BYTES = 128
@@ -36,6 +37,19 @@ value class ProfileId(val value: String) {
     init {
         require(value.length in 1..ProfileLimits.MAX_PROFILE_ID_CHARS && value.matches(SAFE_ID)) {
             "profile_id must be a lowercase safe identifier"
+        }
+    }
+
+    private companion object {
+        val SAFE_ID = Regex("[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?")
+    }
+}
+
+@JvmInline
+value class DataCompatibilityId(val value: String) {
+    init {
+        require(value.length in 1..ProfileLimits.MAX_DATA_COMPATIBILITY_ID_CHARS && value.matches(SAFE_ID)) {
+            "data_compatibility must be a lowercase safe identifier"
         }
     }
 
@@ -175,6 +189,7 @@ data class ProfileArtifact(
 class VmProfile(
     val id: ProfileId,
     val generation: ProfileGeneration,
+    val dataCompatibility: DataCompatibilityId,
     artifacts: List<ProfileArtifact>,
 ) {
     val artifacts: List<ProfileArtifact> = Collections.unmodifiableList(artifacts.toList())
@@ -198,9 +213,12 @@ class VmProfile(
     fun artifact(role: ArtifactRole): ProfileArtifact = artifacts.single { it.role == role }
 
     override fun equals(other: Any?): Boolean =
-        other is VmProfile && id == other.id && generation == other.generation && artifacts == other.artifacts
+        other is VmProfile && id == other.id && generation == other.generation &&
+            dataCompatibility == other.dataCompatibility && artifacts == other.artifacts
 
-    override fun hashCode(): Int = 31 * (31 * id.hashCode() + generation.hashCode()) + artifacts.hashCode()
+    override fun hashCode(): Int =
+        31 * (31 * (31 * id.hashCode() + generation.hashCode()) + dataCompatibility.hashCode()) + artifacts.hashCode()
 
-    override fun toString(): String = "VmProfile(id=$id, generation=$generation, artifacts=$artifacts)"
+    override fun toString(): String =
+        "VmProfile(id=$id, generation=$generation, dataCompatibility=$dataCompatibility, artifacts=$artifacts)"
 }

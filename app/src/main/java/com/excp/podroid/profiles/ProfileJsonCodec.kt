@@ -2,6 +2,7 @@ package com.excp.podroid.profiles
 
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
+import java.security.MessageDigest
 import java.util.Base64
 
 open class ProfileCodecException(message: String, cause: Throwable? = null) :
@@ -46,6 +47,7 @@ object ProfilePayloadJsonCodec {
 
         val profileId = root.requiredString("profile_id", "profile payload")
         val generation = root.requiredLong("generation", "profile payload")
+        val dataCompatibility = root.requiredString("data_compatibility", "profile payload")
         val artifactsValue = root["artifacts"] as? JsonValue.ArrayValue
             ?: throw ProfileCodecException("artifacts must be an array")
         if (artifactsValue.value.size != ArtifactRole.entries.size) {
@@ -67,7 +69,12 @@ object ProfilePayloadJsonCodec {
                     sizeBytes = ArtifactSizeBytes(artifact.requiredLong("size_bytes", "artifact[$index]")),
                 )
             }
-            VmProfile(ProfileId(profileId), ProfileGeneration(generation), artifacts)
+            VmProfile(
+                ProfileId(profileId),
+                ProfileGeneration(generation),
+                DataCompatibilityId(dataCompatibility),
+                artifacts,
+            )
         }
     }
 
@@ -84,13 +91,14 @@ object ProfilePayloadJsonCodec {
             "\"version\":${ProfileLimits.PAYLOAD_VERSION}," +
             "\"profile_id\":${jsonString(profile.id.value)}," +
             "\"generation\":${profile.generation.value}," +
+            "\"data_compatibility\":${jsonString(profile.dataCompatibility.value)}," +
             "\"artifacts\":[$artifacts]" +
             "}").toByteArray(Charsets.UTF_8)
         require(encoded.size <= ProfileLimits.MAX_PAYLOAD_BYTES) { "encoded profile payload exceeds the byte bound" }
         return encoded
     }
 
-    private val PAYLOAD_FIELDS = setOf("version", "profile_id", "generation", "artifacts")
+    private val PAYLOAD_FIELDS = setOf("version", "profile_id", "generation", "data_compatibility", "artifacts")
     private val ARTIFACT_FIELDS = setOf("role", "url", "sha256", "size_bytes")
 }
 
@@ -143,6 +151,12 @@ object SignedProfileEnvelopeJsonCodec {
     private val ENVELOPE_FIELDS = setOf("version", "key_id", "payload", "signature")
 }
 
+data class VerifiedProfileManifest(
+    val profile: VmProfile,
+    /** SHA-256 of the exact signed payload bytes, used as the manifest identity. */
+    val manifestSha256: Sha256Digest,
+)
+
 /** Verifies the envelope before parsing its payload and resolves keys only by signed-envelope key ID. */
 object VerifiedProfileJsonCodec {
     fun decode(
@@ -150,7 +164,14 @@ object VerifiedProfileJsonCodec {
         approvedOrigins: ApprovedArtifactOrigins,
         resolvePublicKey: (SigningKeyId) -> Ed25519PublicKey?,
         verifier: Ed25519Verifier = JcaEd25519Verifier,
-    ): VmProfile {
+    ): VmProfile = decodeManifest(envelopeBytes, approvedOrigins, resolvePublicKey, verifier).profile
+
+    fun decodeManifest(
+        envelopeBytes: ByteArray,
+        approvedOrigins: ApprovedArtifactOrigins,
+        resolvePublicKey: (SigningKeyId) -> Ed25519PublicKey?,
+        verifier: Ed25519Verifier = JcaEd25519Verifier,
+    ): VerifiedProfileManifest {
         val envelope = SignedProfileEnvelopeJsonCodec.decode(envelopeBytes)
         val publicKey = resolvePublicKey(envelope.keyId)
             ?: throw InvalidProfileSignatureException("profile signing key is not trusted")
@@ -163,7 +184,14 @@ object VerifiedProfileJsonCodec {
             throw ProfileVerificationException("profile signature verification failed", failure)
         }
         if (!verified) throw InvalidProfileSignatureException("profile signature is invalid")
-        return ProfilePayloadJsonCodec.decode(payload, approvedOrigins)
+        return VerifiedProfileManifest(
+            profile = ProfilePayloadJsonCodec.decode(payload, approvedOrigins),
+            manifestSha256 = Sha256Digest(
+                MessageDigest.getInstance("SHA-256").digest(payload).joinToString("") {
+                    (it.toInt() and 0xff).toString(16).padStart(2, '0')
+                },
+            ),
+        )
     }
 }
 

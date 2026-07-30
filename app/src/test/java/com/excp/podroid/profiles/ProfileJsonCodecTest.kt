@@ -18,12 +18,13 @@ class ProfileJsonCodecTest {
 
         assertEquals(ProfileId("alpine-direct"), decoded.id)
         assertEquals(ProfileGeneration(7), decoded.generation)
+        assertEquals(DataCompatibilityId("alpine-direct-v1"), decoded.dataCompatibility)
         assertEquals(ArtifactRole.entries.toSet(), decoded.artifacts.map { it.role }.toSet())
         assertEquals("$APPROVED_ORIGIN/kernel", decoded.artifact(ArtifactRole.KERNEL).url.value)
         assertEquals(decoded, ProfilePayloadJsonCodec.decode(ProfilePayloadJsonCodec.encode(decoded), origins))
 
         val mutableArtifacts = decoded.artifacts.toMutableList()
-        val immutableProfile = VmProfile(decoded.id, decoded.generation, mutableArtifacts)
+        val immutableProfile = VmProfile(decoded.id, decoded.generation, decoded.dataCompatibility, mutableArtifacts)
         mutableArtifacts.clear()
         assertEquals(ArtifactRole.entries.size, immutableProfile.artifacts.size)
     }
@@ -288,6 +289,20 @@ class ProfileJsonCodecTest {
     }
 
     @Test
+    fun `data compatibility is required signed and constrained`() {
+        listOf("", "UPPER", "../escape", "a".repeat(ProfileLimits.MAX_DATA_COMPATIBILITY_ID_CHARS + 1)).forEach { value ->
+            val payload = validPayload().replace("alpine-direct-v1", value)
+            assertFails(value) { ProfilePayloadJsonCodec.decode(payload.toByteArray(), origins) }
+        }
+        assertFails {
+            ProfilePayloadJsonCodec.decode(
+                validPayload().replace("\"data_compatibility\":\"alpine-direct-v1\",", "").toByteArray(),
+                origins,
+            )
+        }
+    }
+
+    @Test
     fun `strict JSON rejects malformed UTF8 nesting excess entries and trailing data`() {
         assertFails { ProfilePayloadJsonCodec.decode(byteArrayOf(0xc3.toByte(), 0x28), origins) }
         assertFails { ProfilePayloadJsonCodec.decode((validPayload() + " true").toByteArray(), origins) }
@@ -357,6 +372,7 @@ class ProfileJsonCodecTest {
             "\"version\":1," +
             "\"profile_id\":\"$profileId\"," +
             "\"generation\":$generation," +
+            "\"data_compatibility\":\"alpine-direct-v1\"," +
             "\"artifacts\":[${actualArtifacts.joinToString(",")}]" +
             "}"
     }
