@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod guest_ssh;
+pub mod host_management;
 
 use std::fmt;
 use std::time::Instant;
@@ -48,6 +49,8 @@ impl VmId {
 pub enum HostConnection {
     Disconnected,
     PreviewOnly,
+    /// Authenticated Android-host management identity; never a guest SSH identity.
+    AuthenticatedManagement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,8 +65,8 @@ impl HostStatus {
         identity: Option<HostId>,
     ) -> Result<Self, ValidationError> {
         match (connection, identity.is_some()) {
-            (HostConnection::PreviewOnly, false) => {
-                return Err(ValidationError::PreviewIdentityRequired);
+            (HostConnection::PreviewOnly | HostConnection::AuthenticatedManagement, false) => {
+                return Err(ValidationError::ConnectedIdentityRequired)
             }
             (HostConnection::Disconnected, true) => {
                 return Err(ValidationError::DisconnectedIdentityNotAllowed);
@@ -291,7 +294,7 @@ impl std::error::Error for BoundaryError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValidationError {
     InvalidHostId,
-    PreviewIdentityRequired,
+    ConnectedIdentityRequired,
     DisconnectedIdentityNotAllowed,
     UptimeOutOfRange,
     UptimeRequiresRunningVm,
@@ -322,8 +325,8 @@ fn validate_error(message: &str) -> Result<(), ValidationError> {
 /// The controller's complete lifecycle authority.
 ///
 /// Implementations must return a fresh authoritative snapshot after each operation. This ticket
-/// intentionally supplies only [`PreviewVmService`]; a live authenticated implementation belongs
-/// to ticket #16.
+/// controller-core supplies [`PreviewVmService`] and the transport-abstract mapping adapter in
+/// [`host_management`]. No live authenticated transport implementation is included.
 pub trait VmServiceBoundary: Send + 'static {
     fn refresh(&mut self) -> Result<ControllerSnapshot, BoundaryError>;
     fn start(&mut self) -> Result<ControllerSnapshot, BoundaryError>;

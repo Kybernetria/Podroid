@@ -46,6 +46,7 @@ impl PresentationState {
         let host_connection = match snapshot.host().connection() {
             HostConnection::Disconnected => "Disconnected",
             HostConnection::PreviewOnly => "Preview only (not live)",
+            HostConnection::AuthenticatedManagement => "Authenticated management",
         };
         let vm = snapshot.vm();
         Self {
