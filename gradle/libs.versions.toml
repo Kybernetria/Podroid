@@ -24,6 +24,7 @@ coroutines = "1.9.0"
 
 # DataStore
 datastore = "1.2.1"
+tink = "1.18.0"
 
 # Termux terminal
 termux = "v0.118.1"
@@ -68,6 +69,7 @@ kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 
 # DataStore
 androidx-datastore-preferences = { group = "androidx.datastore", name = "datastore-preferences", version.ref = "datastore" }
+tink-android = { group = "com.google.crypto.tink", name = "tink-android", version.ref = "tink" }
 
 # Termux terminal
 termux-terminal-emulator = { group = "com.github.termux.termux-app", name = "terminal-emulator", version.ref = "termux" }

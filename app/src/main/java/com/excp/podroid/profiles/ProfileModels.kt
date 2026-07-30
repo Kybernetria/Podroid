@@ -14,7 +14,10 @@ object ProfileLimits {
     const val MAX_DATA_COMPATIBILITY_ID_CHARS = 64
     const val MAX_URL_CHARS = 2_048
     const val ED25519_SIGNATURE_BYTES = 64
-    const val MAX_ED25519_PUBLIC_KEY_BYTES = 128
+    const val ED25519_PUBLIC_KEY_BYTES = 32
+    const val ED25519_X509_PUBLIC_KEY_BYTES = 44
+    const val MAX_PROFILE_GENERATION = Long.MAX_VALUE - 1L
+    const val MAX_TRUST_EPOCH = Long.MAX_VALUE - 1L
     const val MAX_ARTIFACT_BYTES = 4L * 1024 * 1024 * 1024
     const val MAX_TOTAL_ARTIFACT_BYTES = 6L * 1024 * 1024 * 1024
 }
@@ -61,7 +64,18 @@ value class DataCompatibilityId(val value: String) {
 @JvmInline
 value class ProfileGeneration(val value: Long) {
     init {
-        require(value > 0) { "generation must be a positive integer" }
+        require(value in 1..ProfileLimits.MAX_PROFILE_GENERATION) {
+            "generation must be within the supported positive bound"
+        }
+    }
+}
+
+@JvmInline
+value class TrustEpoch(val value: Long) {
+    init {
+        require(value in 1..ProfileLimits.MAX_TRUST_EPOCH) {
+            "trust epoch must be within the supported positive bound"
+        }
     }
 }
 

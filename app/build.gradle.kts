@@ -545,6 +545,9 @@ dependencies {
     // DataStore (app settings)
     implementation(libs.androidx.datastore.preferences)
 
+    // Pinned Android-compatible Ed25519 implementation for minSdk 26.
+    implementation(libs.tink.android)
+
     // Vendored Termux terminal emulator & view (MatanZ/termux-app:sixel4 — Sixel + iTerm2 image support)
     implementation(project(":terminal-emulator"))
     implementation(project(":terminal-view"))

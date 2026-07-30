@@ -155,26 +155,31 @@ data class VerifiedProfileManifest(
     val profile: VmProfile,
     /** SHA-256 of the exact signed payload bytes, used as the manifest identity. */
     val manifestSha256: Sha256Digest,
+    val signingKeyId: SigningKeyId,
+    val signingKeyFingerprint: Sha256Digest,
+    val trustEpoch: TrustEpoch,
 )
 
-/** Verifies the envelope before parsing its payload and resolves keys only by signed-envelope key ID. */
+/** Verifies before payload parsing and retains the APK trust decision needed for later revalidation. */
 object VerifiedProfileJsonCodec {
     fun decode(
         envelopeBytes: ByteArray,
         approvedOrigins: ApprovedArtifactOrigins,
-        resolvePublicKey: (SigningKeyId) -> Ed25519PublicKey?,
-        verifier: Ed25519Verifier = JcaEd25519Verifier,
-    ): VmProfile = decodeManifest(envelopeBytes, approvedOrigins, resolvePublicKey, verifier).profile
+        trustResolver: ProfileTrustResolver,
+        verifier: Ed25519Verifier = TinkEd25519Verifier,
+    ): VmProfile = decodeManifest(envelopeBytes, approvedOrigins, trustResolver, verifier).profile
 
     fun decodeManifest(
         envelopeBytes: ByteArray,
         approvedOrigins: ApprovedArtifactOrigins,
-        resolvePublicKey: (SigningKeyId) -> Ed25519PublicKey?,
-        verifier: Ed25519Verifier = JcaEd25519Verifier,
+        trustResolver: ProfileTrustResolver,
+        verifier: Ed25519Verifier = TinkEd25519Verifier,
     ): VerifiedProfileManifest {
         val envelope = SignedProfileEnvelopeJsonCodec.decode(envelopeBytes)
-        val publicKey = resolvePublicKey(envelope.keyId)
+        val trustEpoch = trustResolver.currentTrustEpoch
+        val trustedKey = trustResolver.resolve(envelope.keyId)
             ?: throw InvalidProfileSignatureException("profile signing key is not trusted")
+        val publicKey = trustedKey.publicKey
         val payload = envelope.payloadBytes()
         val verified = try {
             verifier.verify(publicKey, ProfileSigning.messageFor(payload), envelope.signatureBytes())
@@ -191,6 +196,9 @@ object VerifiedProfileJsonCodec {
                     (it.toInt() and 0xff).toString(16).padStart(2, '0')
                 },
             ),
+            signingKeyId = envelope.keyId,
+            signingKeyFingerprint = publicKey.fingerprint,
+            trustEpoch = trustEpoch,
         )
     }
 }

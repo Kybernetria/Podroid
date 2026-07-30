@@ -11,6 +11,9 @@ import org.junit.Test
 
 class ProfileJsonCodecTest {
     private val origins = ApprovedArtifactOrigins.of(APPROVED_ORIGIN)
+    private val testPublicKey = Ed25519PublicKey.fromX509(
+        KeyPairGenerator.getInstance("Ed25519").generateKeyPair().public.encoded,
+    )
 
     @Test
     fun `payload model and deterministic codec round trip`() {
@@ -56,10 +59,7 @@ class ProfileJsonCodecTest {
             VerifiedProfileJsonCodec.decode(
                 envelope,
                 origins,
-                resolvePublicKey = {
-                    resolvedId = it
-                    Ed25519PublicKey.fromX509(byteArrayOf(1))
-                },
+                trustResolver = resolver(testPublicKey) { resolvedId = it },
                 verifier = Ed25519Verifier { _, message, _ ->
                     capturedMessage = message.copyOf()
                     true
@@ -89,7 +89,7 @@ class ProfileJsonCodecTest {
 
         assertEquals(
             ProfileGeneration(7),
-            VerifiedProfileJsonCodec.decode(envelope, origins, { publicKey }).generation,
+            VerifiedProfileJsonCodec.decode(envelope, origins, resolver(publicKey)).generation,
         )
 
         val changedPayload = (" " + validPayload()).toByteArray()
@@ -97,7 +97,7 @@ class ProfileJsonCodecTest {
             SigningKeyId("release-1"), changedPayload, signature,
         )
         val failure = runCatching {
-            VerifiedProfileJsonCodec.decode(changedEnvelope, origins, { publicKey })
+            VerifiedProfileJsonCodec.decode(changedEnvelope, origins, resolver(publicKey))
         }.exceptionOrNull()
         assertTrue(failure is InvalidProfileSignatureException)
     }
@@ -115,7 +115,7 @@ class ProfileJsonCodecTest {
             VerifiedProfileJsonCodec.decode(
                 envelope,
                 origins,
-                resolvePublicKey = { null },
+                trustResolver = resolver(null),
                 verifier = Ed25519Verifier { _, _, _ -> verificationCalled = true; true },
             )
         }.exceptionOrNull()
@@ -271,7 +271,7 @@ class ProfileJsonCodecTest {
 
     @Test
     fun `generation is a positive int64 and profile id is constrained`() {
-        listOf("0", "-1", "1.0", "1e0", "9223372036854775808", "\"1\"").forEach { generation ->
+        listOf("0", "-1", "1.0", "1e0", "9223372036854775807", "9223372036854775808", "\"1\"").forEach { generation ->
             assertFails(generation) {
                 ProfilePayloadJsonCodec.decode(validPayload(generation = generation).toByteArray(), origins)
             }
@@ -282,9 +282,11 @@ class ProfileJsonCodecTest {
             }
         }
         assertEquals(
-            Long.MAX_VALUE,
-            ProfilePayloadJsonCodec.decode(validPayload(generation = Long.MAX_VALUE.toString()).toByteArray(), origins)
-                .generation.value,
+            ProfileLimits.MAX_PROFILE_GENERATION,
+            ProfilePayloadJsonCodec.decode(
+                validPayload(generation = ProfileLimits.MAX_PROFILE_GENERATION.toString()).toByteArray(),
+                origins,
+            ).generation.value,
         )
     }
 
@@ -337,6 +339,17 @@ class ProfileJsonCodecTest {
             Base64.getEncoder().encodeToString(ByteArray(ProfileLimits.ED25519_SIGNATURE_BYTES - 1)),
         )
         assertFails { SignedProfileEnvelopeJsonCodec.decode(shortSignature.toByteArray()) }
+    }
+
+    private fun resolver(
+        key: Ed25519PublicKey?,
+        onResolve: (SigningKeyId) -> Unit = {},
+    ): ProfileTrustResolver = object : ProfileTrustResolver {
+        override val currentTrustEpoch = TrustEpoch(1)
+        override fun resolve(keyId: SigningKeyId): TrustedProfileSigningKey? {
+            onResolve(keyId)
+            return key?.let(::TrustedProfileSigningKey)
+        }
     }
 
     private fun validEnvelopeText(): String = SignedProfileEnvelopeJsonCodec.encode(
