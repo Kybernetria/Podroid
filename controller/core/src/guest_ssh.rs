@@ -1307,7 +1307,7 @@ mod tests {
     fn enrollment_streams_key_only_on_stdin_and_always_deletes_it() {
         let (root, config, fingerprint) = fixture();
         let key = root.join("headscale.key");
-        write_secret(&key, b"tskey-auth-one-use-value\n");
+        write_secret(&key, b"synthetic-enrollment-value\n");
         let runner = FakeRunner::success(fingerprint);
         let client = OpenSshGuestClient::with_runner(
             runner,
@@ -1326,9 +1326,9 @@ mod tests {
         assert!(!key.exists());
         let calls = client.runner.calls.lock().unwrap();
         let args = calls[1].1.join(" ");
-        assert!(!args.contains("tskey-auth"));
+        assert!(!args.contains("synthetic-enrollment-value"));
         assert!(args.contains("--auth-key-stdin"));
-        assert_eq!(calls[1].2, b"tskey-auth-one-use-value\n");
+        assert_eq!(calls[1].2, b"synthetic-enrollment-value\n");
         assert!(calls[1].3.deadline > Duration::from_secs(100));
         assert!(calls[1].3.deadline <= ENROLLMENT_TIMEOUT);
         fs::remove_dir_all(root).unwrap();
@@ -1363,7 +1363,7 @@ mod tests {
     fn acquired_enrollment_key_is_removed_when_parameters_are_invalid() {
         let (root, config, fingerprint) = fixture();
         let key = root.join("headscale.key");
-        write_secret(&key, b"tskey-auth-one-use-value\n");
+        write_secret(&key, b"synthetic-enrollment-value\n");
         let client = OpenSshGuestClient::with_runner(
             FakeRunner::success(fingerprint),
             Path::new("/fake/ssh"),
