@@ -1,6 +1,6 @@
 # phonectl
 
-`phonectl` is the CLI adapter over `controller-core`. Ticket #13 implements direct SSH to the **Linux guest**; this is separate from the restricted Android-host management endpoint planned by ticket #16.
+`phonectl` is the CLI adapter over `controller-core`. Ticket #13 implements direct SSH to the **Linux guest**; this is separate from ticket #16's frozen restricted Android-host management contract, which has no live transport composition yet.
 
 ## Trust setup
 

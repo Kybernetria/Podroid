@@ -752,6 +752,7 @@ fn parse_json(payload: &[u8]) -> Result<JsonValue, CodecError> {
         cursor: 0,
     };
     let value = parser.parse_value(0)?;
+    parser.skip_whitespace();
     if parser.cursor != parser.bytes.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -1040,8 +1041,9 @@ pub trait RequestIdSource: Send + 'static {
 
 /// The sole host-management mapping seam into [`VmServiceBoundary`].
 ///
-/// It stores only the last authoritative generation. Mutations cannot be emitted before a status
-/// response. A successful start advances the runtime generation once; stop preserves it.
+/// It stores only the last authoritative generation. Mutations consume that generation before
+/// exchange and restore it only from a validated success, so every failed or uncertain mutation
+/// requires a fresh status. A successful start advances runtime generation once; stop preserves it.
 pub struct HostManagementVmService<E, I> {
     exchange: E,
     request_ids: I,
@@ -1062,18 +1064,22 @@ impl<E, I> HostManagementVmService<E, I> {
 
 impl<E: HostManagementExchange, I: RequestIdSource> HostManagementVmService<E, I> {
     fn perform(&mut self, operation: Operation) -> Result<ControllerSnapshot, BoundaryError> {
+        let generation = match operation {
+            Operation::VmDefaultStatus => {
+                self.generation = None;
+                None
+            }
+            Operation::VmDefaultStart | Operation::VmDefaultStop => {
+                Some(self.generation.take().ok_or_else(status_required_error)?)
+            }
+            Operation::ProtocolDescribe => return Err(protocol_boundary_error("invalid mapping")),
+        };
         let request_id = self.request_ids.next_request_id()?;
         let request = match operation {
             Operation::VmDefaultStatus => Request::status(request_id),
-            Operation::VmDefaultStart => Request::start(
-                request_id,
-                self.generation.ok_or_else(status_required_error)?,
-            ),
-            Operation::VmDefaultStop => Request::stop(
-                request_id,
-                self.generation.ok_or_else(status_required_error)?,
-            ),
-            Operation::ProtocolDescribe => return Err(protocol_boundary_error("invalid mapping")),
+            Operation::VmDefaultStart => Request::start(request_id, generation.expect("mutation")),
+            Operation::VmDefaultStop => Request::stop(request_id, generation.expect("mutation")),
+            Operation::ProtocolDescribe => unreachable!("rejected above"),
         };
         let frame = encode_request_frame(&request);
         let mut response_frame = [0u8; FRAME_HEADER_BYTES + MAX_RESPONSE_BYTES];
@@ -1367,6 +1373,80 @@ mod tests {
     }
 
     #[test]
+    fn normative_lifecycle_stage_uptime_and_error_boundaries_round_trip() {
+        let request = Request::status(id());
+        let cases = [
+            VmStatus::new(
+                VmLifecycle::Stopped,
+                VmBackend::Unknown,
+                BootStage::Idle,
+                None,
+                None,
+            )
+            .unwrap(),
+            VmStatus::new(
+                VmLifecycle::Starting,
+                VmBackend::QemuTcg,
+                BootStage::Installing,
+                None,
+                None,
+            )
+            .unwrap(),
+            VmStatus::new(
+                VmLifecycle::Starting,
+                VmBackend::QemuTcg,
+                BootStage::StartingSsh,
+                None,
+                None,
+            )
+            .unwrap(),
+            VmStatus::new(
+                VmLifecycle::Starting,
+                VmBackend::AvfPvm,
+                BootStage::AlmostReady,
+                None,
+                None,
+            )
+            .unwrap(),
+            VmStatus::new(
+                VmLifecycle::Running,
+                VmBackend::AvfPvm,
+                BootStage::Ready,
+                Some(crate::MAX_UPTIME_SECONDS),
+                None,
+            )
+            .unwrap(),
+            VmStatus::new(
+                VmLifecycle::Stopping,
+                VmBackend::QemuTcg,
+                BootStage::Ready,
+                None,
+                None,
+            )
+            .unwrap(),
+            VmStatus::new(
+                VmLifecycle::Error,
+                VmBackend::Unknown,
+                BootStage::Failed,
+                None,
+                Some("stable_error"),
+            )
+            .unwrap(),
+        ];
+        for status in cases {
+            let response = Response::success(
+                id(),
+                Success::VmStatus(ManagedVmStatus::new(Generation::new(4).unwrap(), status)),
+            );
+            let encoded = encode_response_payload(&response).unwrap();
+            assert_eq!(
+                decode_response_payload(&encoded, &request).unwrap(),
+                response
+            );
+        }
+    }
+
+    #[test]
     fn response_schema_rejects_unknown_duplicate_missing_float_and_trailing_content() {
         let request = Request::status(id());
         let valid = String::from_utf8(
@@ -1394,9 +1474,11 @@ mod tests {
             decode_response_payload(float.as_bytes(), &request),
             Err(CodecError::MalformedJson)
         );
-        let trailing = format!("{valid}\n");
+        let trailing_whitespace = format!(" \t{valid}\r\n");
+        assert!(decode_response_payload(trailing_whitespace.as_bytes(), &request).is_ok());
+        let trailing_content = format!("{valid}x");
         assert_eq!(
-            decode_response_payload(trailing.as_bytes(), &request),
+            decode_response_payload(trailing_content.as_bytes(), &request),
             Err(CodecError::TrailingBytes)
         );
     }
@@ -1448,6 +1530,107 @@ mod tests {
             framed_response[..response.len()].copy_from_slice(&response);
             Ok(response.len())
         }
+    }
+
+    struct ManyIds(u8);
+
+    impl RequestIdSource for ManyIds {
+        fn next_request_id(&mut self) -> Result<RequestId, BoundaryError> {
+            self.0 = self
+                .0
+                .checked_add(1)
+                .ok_or_else(|| protocol_boundary_error("ID overflow"))?;
+            RequestId::parse(&format!("123e4567-e89b-42d3-a456-4266141740{:02x}", self.0))
+                .map_err(|_| protocol_boundary_error("invalid generated ID"))
+        }
+    }
+
+    struct FailingSecondId(u8);
+
+    impl RequestIdSource for FailingSecondId {
+        fn next_request_id(&mut self) -> Result<RequestId, BoundaryError> {
+            self.0 += 1;
+            if self.0 == 2 {
+                return Err(protocol_boundary_error("request ID unavailable"));
+            }
+            RequestId::parse(&format!("123e4567-e89b-42d3-a456-4266141740{:02x}", self.0))
+                .map_err(|_| protocol_boundary_error("invalid generated ID"))
+        }
+    }
+
+    struct FailingMutationExchange {
+        operations: std::sync::Arc<std::sync::Mutex<Vec<Operation>>>,
+    }
+
+    impl HostManagementExchange for FailingMutationExchange {
+        fn exchange_v1(
+            &mut self,
+            framed_request: &[u8],
+            framed_response: &mut [u8],
+            _deadline: Duration,
+        ) -> Result<usize, BoundaryError> {
+            let request = decode_request_frame(framed_request).unwrap();
+            self.operations.lock().unwrap().push(request.operation());
+            if request.operation().is_mutation() {
+                return Err(protocol_boundary_error("uncertain mutation exchange"));
+            }
+            let response = encode_response_frame(&Response::success(
+                request.request_id.clone(),
+                Success::VmStatus(stopped(3)),
+            ))
+            .unwrap();
+            framed_response[..response.len()].copy_from_slice(&response);
+            Ok(response.len())
+        }
+    }
+
+    #[test]
+    fn request_id_failure_also_consumes_generation_until_status_refresh() {
+        let operations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let exchange = FailingMutationExchange {
+            operations: operations.clone(),
+        };
+        let host = HostId::parse("phone.example").unwrap();
+        let mut service = HostManagementVmService::new(exchange, FailingSecondId(0), host);
+
+        service.refresh().unwrap();
+        assert!(service.start().is_err());
+        assert!(service.stop().is_err());
+        service.refresh().unwrap();
+        assert_eq!(
+            *operations.lock().unwrap(),
+            vec![Operation::VmDefaultStatus, Operation::VmDefaultStatus]
+        );
+    }
+
+    #[test]
+    fn failed_mutation_consumes_generation_until_status_refresh() {
+        let operations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let exchange = FailingMutationExchange {
+            operations: operations.clone(),
+        };
+        let host = HostId::parse("phone.example").unwrap();
+        let mut service = HostManagementVmService::new(exchange, ManyIds(0), host);
+
+        service.refresh().unwrap();
+        assert!(service.start().is_err());
+        assert!(service.stop().is_err());
+        assert_eq!(
+            *operations.lock().unwrap(),
+            vec![Operation::VmDefaultStatus, Operation::VmDefaultStart]
+        );
+
+        service.refresh().unwrap();
+        assert!(service.stop().is_err());
+        assert_eq!(
+            *operations.lock().unwrap(),
+            vec![
+                Operation::VmDefaultStatus,
+                Operation::VmDefaultStart,
+                Operation::VmDefaultStatus,
+                Operation::VmDefaultStop,
+            ]
+        );
     }
 
     #[test]

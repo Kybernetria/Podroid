@@ -73,7 +73,12 @@ class AuditPolicyTest {
     fun `completion invariants require fixed errors for rejected and indeterminate outcomes`() {
         val base = completion(AuditOutcome.SUCCEEDED, null)
         assertEquals(AuditOutcome.SUCCEEDED, base.outcome)
+        assertTrue(runCatching { completion(AuditOutcome.ADMITTED, null) }.isFailure)
+        assertTrue(runCatching { completion(AuditOutcome.SUCCEEDED, ManagementErrorCode.INTERNAL_ERROR) }.isFailure)
         assertTrue(runCatching { completion(AuditOutcome.REJECTED, null) }.isFailure)
+        assertTrue(runCatching {
+            completion(AuditOutcome.REJECTED, ManagementErrorCode.INDETERMINATE)
+        }.isFailure)
         assertTrue(runCatching { completion(AuditOutcome.INDETERMINATE, ManagementErrorCode.INTERNAL_ERROR) }.isFailure)
         assertEquals(
             ManagementErrorCode.INDETERMINATE,

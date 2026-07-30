@@ -47,7 +47,7 @@ data class SshUserCertificate(
     val certificateFingerprintSha256: String,
 ) {
     init {
-        require(serial >= 0)
+        require(serial > 0)
         require(keyId.length in 1..ManagementLimits.MAX_KEY_ID_CHARS && keyId.none(Char::isISOControl))
         require(principals.size <= 4 && principals.all { it.length in 1..64 && it.none(Char::isISOControl) })
         require(criticalOptions.size <= 16 && extensions.size <= 16)

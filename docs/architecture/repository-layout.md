@@ -15,10 +15,10 @@ Milestone 1 began with tracked ownership markers only. Tickets #6–#15 add VM i
 | `vm-core/lifecycle/` | Serialized VM state machine | README skeleton |
 | `transport/api/` | Transport-neutral authenticated connection interfaces | Ticket #15 Kotlin contracts in `app/.../transport/api`; extraction deferred |
 | `transport/tailscale-android/` | Official Tailscale/libtailscale Android adapter | Ticket #15 verified debug packaging + unavailable fail-closed provider boundary |
-| `management/protocol/` | Versioned restricted management messages | README skeleton |
-| `management/ssh-server/` | Restricted SSH endpoint; never a host shell | README skeleton |
+| `management/protocol/` | Versioned restricted management messages | Ticket #16 frozen v1 specification + pure Kotlin/Rust codecs and policy |
+| `management/ssh-server/` | Restricted SSH endpoint; never a host shell | Ticket #16 channel/certificate policy only; no SSH runtime/listener composition |
 | `controller/core/` | Shared controller client logic | Preview boundary plus ticket #13 strict direct guest-SSH status/exec/enrollment |
-| `controller/phonectl/` | CLI adapter | Ticket #13 strict guest-SSH CLI; Host-management protocol deferred to #16 |
+| `controller/phonectl/` | CLI adapter | Ticket #13 strict guest SSH; ticket #16 Host codec remains uncomposed |
 | `controller/desktop-ui/` | Slint desktop adapter | Ticket #9 external preview UI; no phone transport or Android packaging |
 | `profiles/schemas/` | Versioned profile schemas | README skeleton |
 | `profiles/alpine-direct/` | Initial known-good Alpine profile | README skeleton |

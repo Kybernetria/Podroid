@@ -29,13 +29,24 @@ data class ManagementAuditRecord(
         require(clientIdentitySha256.matches(Regex("[0-9a-f]{64}")))
         require(ifGeneration == null || ifGeneration >= 0)
         require(resultingGeneration == null || resultingGeneration >= 0)
-        if (stage == AuditStage.PRE_DISPATCH) {
-            require(outcome == AuditOutcome.ADMITTED)
-            require(resultingGeneration == null && errorCode == null)
+        when (stage) {
+            AuditStage.PRE_DISPATCH -> {
+                require(outcome == AuditOutcome.ADMITTED)
+                require(resultingGeneration == null && errorCode == null)
+            }
+            AuditStage.COMPLETION -> require(outcome in setOf(
+                AuditOutcome.SUCCEEDED,
+                AuditOutcome.REJECTED,
+                AuditOutcome.INDETERMINATE,
+            ))
         }
-        if (outcome == AuditOutcome.REJECTED) require(errorCode != null)
-        if (outcome == AuditOutcome.INDETERMINATE) {
-            require(errorCode == ManagementErrorCode.INDETERMINATE)
+        when (outcome) {
+            AuditOutcome.ADMITTED, AuditOutcome.SUCCEEDED -> require(errorCode == null)
+            AuditOutcome.REJECTED -> require(
+                errorCode != null && errorCode != ManagementErrorCode.INDETERMINATE
+            )
+            AuditOutcome.INDETERMINATE ->
+                require(errorCode == ManagementErrorCode.INDETERMINATE)
         }
     }
 
@@ -51,7 +62,7 @@ data class ManagementAuditRecord(
         "outcome" to outcome.name.lowercase(),
         "if_generation" to (ifGeneration?.toString() ?: ""),
         "resulting_generation" to (resultingGeneration?.toString() ?: ""),
-        "error_code" to (errorCode?.name ?: ""),
+        "error_code" to (errorCode?.wireName ?: ""),
     ).also { fields ->
         require(fields.size == 11 && fields.values.all { it.length <= ManagementLimits.MAX_AUDIT_FIELD_CHARS })
     }

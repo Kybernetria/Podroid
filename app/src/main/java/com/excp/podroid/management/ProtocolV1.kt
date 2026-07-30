@@ -72,7 +72,9 @@ enum class ManagementErrorCode(val retryable: Boolean) {
     PROVIDER_UNAVAILABLE(true),
     INTERRUPTED(true),
     INDETERMINATE(false),
-    INTERNAL_ERROR(true),
+    INTERNAL_ERROR(true);
+
+    val wireName: String get() = name.lowercase()
 }
 
 enum class ManagementExecExitCode(val code: Int) {

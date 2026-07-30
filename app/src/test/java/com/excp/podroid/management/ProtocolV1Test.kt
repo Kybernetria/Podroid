@@ -16,6 +16,9 @@ class ProtocolV1Test {
             assertEquals(operation, parsed.operation)
             assertEquals(null, parsed.ifGeneration)
             assertTrue(parsed.payloadSha256.matches(Regex("[0-9a-f]{64}")))
+            val withWhitespace = ManagementRequestParser.parseFramed(frame(" \t$payload\r\n"))
+            assertEquals(operation, withWhitespace.operation)
+            assertTrue(withWhitespace.payloadSha256 != parsed.payloadSha256)
         }
         val encoded = ManagementFrameCodec.encodeResponse("{}".toByteArray())
         assertArrayEquals(byteArrayOf(0, 0, 0, 2, 123, 125), encoded)
@@ -75,6 +78,7 @@ class ProtocolV1Test {
         assertTrue(ManagementErrorCode.INDETERMINATE.retryable.not())
         assertTrue(ManagementErrorCode.BUSY.retryable)
         assertTrue(ManagementErrorCode.AUDIT_UNAVAILABLE.retryable)
+        assertEquals("generation_mismatch", ManagementErrorCode.GENERATION_MISMATCH.wireName)
         assertEquals((0..14).toList(), ManagementErrorCode.entries.map { it.ordinal })
         assertEquals(listOf(0, 64, 69, 70, 75), ManagementExecExitCode.entries.map { it.code })
         assertEquals(4, ManagementOperation.entries.size)

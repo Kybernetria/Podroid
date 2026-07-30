@@ -21,7 +21,8 @@ The frozen v1 wire contract is:
 - `version` is the integer `1` and `request_id` is a canonical lowercase UUIDv4;
 - the complete operation allowlist, in protocol-description order, is `protocol.describe`, `vm.default.status`, `vm.default.start`, and `vm.default.stop`;
 - every request has exactly `version`, `request_id`, `operation`, and `parameters`; read parameters are empty, while `if_generation` is the mutation parameters object's sole mandatory non-negative int64 field; a successful start response advances the runtime generation by one and a successful stop preserves it;
-- VM identity is always `default`; lifecycle, backend, boot stage, uptime, and error combinations are parsed through the existing constrained `VmStatus` model; and
+- VM identity is always `default`; lifecycle/backend/boot-stage combinations, running-only uptime through 315,360,000 seconds, and error-only 1..256-byte control-free diagnostics are parsed through the constrained `VmStatus` model;
+- a mutation consumes the cached authoritative generation before exchange and only a validated success restores it, so any failed or uncertain mutation requires a fresh status before another mutation; and
 - failures contain only a stable code and its required `retryable` boolean. `busy`, `timeout`, `audit_unavailable`, `capacity_exceeded`, `provider_unavailable`, `interrupted`, and `internal_error` are retryable; `invalid_request`, `unsupported_version`, `unknown_operation`, `unauthenticated`, `forbidden`, `generation_mismatch`, `conflict`, and `indeterminate` are not. A mismatched pair is invalid.
 
 `protocol.describe` returns and verifies the command literal, ordered allowlist, and both frame caps. There is no arbitrary command, shell, file, QMP, forwarding, workload, or scheduler field in any host-management v1 type.

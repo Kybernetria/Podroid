@@ -162,7 +162,10 @@ def main() -> None:
         ("cloud-backup", "device-transfer"),
     )
 
-    gradle = (ROOT / "app/build.gradle.kts").read_text(encoding="utf-8").lower()
+    gradle_source = (ROOT / "app/build.gradle.kts").read_text(encoding="utf-8")
+    if "verifyHostManagementBoundary" not in gradle_source:
+        fail("Host-management boundary verifier is not wired into Gradle")
+    gradle = gradle_source.lower()
     for dependency in ("apache.sshd", "mina-sshd", "sshj"):
         if dependency in gradle:
             fail(f"SSH runtime dependency unexpectedly present: {dependency}")

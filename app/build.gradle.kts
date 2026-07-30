@@ -106,6 +106,22 @@ val verifyHostTransportBoundary by tasks.registering(Exec::class) {
     )
 }
 
+val verifyHostManagementBoundary by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Checks the disabled restricted Host-management v1 boundary."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", rootProject.file("tests/verify_host_management_boundary.py"))
+    inputs.files(
+        rootProject.file("tests/verify_host_management_boundary.py"),
+        rootProject.fileTree("app/src/main/java/com/excp/podroid/management") { include("**/*.kt") },
+        rootProject.fileTree("app/src/test/java/com/excp/podroid/management") { include("**/*.kt") },
+        rootProject.fileTree("management") { include("**/*.md") },
+        rootProject.file("docs/adr/0008-restricted-ssh-host-protocol.md"),
+        rootProject.file("app/src/main/res/xml/backup_rules.xml"),
+        rootProject.file("app/src/main/res/xml/data_extraction_rules.xml")
+    )
+}
+
 val verifyPackagedDebugLibTailscale by tasks.registering(Exec::class) {
     group = "verification"
     description = "Statically verifies debug APK libtailscale ABI, ELF, provenance, and manifest policy."
@@ -338,7 +354,8 @@ tasks.named("preBuild") {
         verifyMinimalGuestArtifact,
         verifyVmInstancePaths,
         verifyUiVmBoundary,
-        verifyHostTransportBoundary
+        verifyHostTransportBoundary,
+        verifyHostManagementBoundary
     )
 }
 
@@ -371,7 +388,8 @@ tasks.named("check") {
         verifyUiVmBoundary,
         testUiVmBoundaryVerifier,
         testLibTailscaleAndroidVerifier,
-        verifyHostTransportBoundary
+        verifyHostTransportBoundary,
+        verifyHostManagementBoundary
     )
 }
 
@@ -384,7 +402,8 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
         verifyUiVmBoundary,
         testUiVmBoundaryVerifier,
         testLibTailscaleAndroidVerifier,
-        verifyHostTransportBoundary
+        verifyHostTransportBoundary,
+        verifyHostManagementBoundary
     )
 }
 
