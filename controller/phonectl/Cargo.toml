@@ -1,5 +1,5 @@
 [package]
-name = "controller-core"
+name = "phonectl"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -9,4 +9,5 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-nix.workspace = true
+controller-core.workspace = true
+signal-hook.workspace = true

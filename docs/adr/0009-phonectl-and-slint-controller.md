@@ -8,7 +8,9 @@ Operators need both scriptable command-line access and a desktop experience with
 
 ## Decision
 
-Provide `phonectl` as the CLI controller and a Slint-based **external desktop** controller. Both are thin adapters over shared `controller/core` logic and the same versioned management protocol. Slint is not embedded in or packaged with the Android Host APK.
+Provide `phonectl` as the CLI controller and a Slint-based **external desktop** controller. For Android-host management, both are thin adapters over shared `controller/core` logic and the same versioned management protocol. Slint is not embedded in or packaged with the Android Host APK.
+
+`phonectl` may additionally expose direct Linux-guest SSH operations from shared core. That guest path is not the host-management protocol: it uses separate endpoints, host keys, client keys, authorization, and connection state, and cannot grant an Android-host shell, arbitrary Android filesystem access, or QMP. MVP SSH commands run as guest root and therefore retain access to the pre-existing bounded guest-to-Android bridge operations, including managed port-forward and VM power requests; this privileged guest authority must be documented rather than confused with the future restricted host-management credential.
 
 Ticket #9 may establish the presentation and core boundary before a remote transport exists. Until ticket #16 defines and implements restricted host management, that prototype must use a conspicuously labeled, bounded in-memory preview boundary and must not claim live phone connectivity.
 

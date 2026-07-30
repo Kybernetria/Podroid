@@ -62,7 +62,9 @@ The controller owns:
 - `phonectl` command semantics and the Slint desktop experience; and
 - controller-side storage of user-approved connection material.
 
-The controller communicates only through the versioned restricted management protocol over an authenticated transport. It cannot invoke arbitrary host commands, reach QMP directly, write Android persistence directly, or schedule containers. Requests remain subject to host authorization and lifecycle serialization.
+For Android-host lifecycle and management, the controller communicates only through the versioned restricted management protocol over an authenticated transport. It cannot invoke arbitrary Android-host commands, reach QMP directly, write Android persistence directly, or schedule containers. Requests remain subject to host authorization and lifecycle serialization.
+
+For explicit Linux-guest provisioning and diagnostics, the controller may connect directly to the guest's SSH service or a fixed scoped phone endpoint. That path uses an independently approved guest host key and guest-only private key. The SSH transport cannot request forwarding, a PTY, Android shell/filesystem access, or QMP. MVP command execution authenticates as guest root, so it carries the same guest authority as the local root console, including access to the existing bounded guest-to-Android bridge operations (`podroid-forward`, `podroid-power`, `podroid-open`, notifications, and server mode). This does not create an Android shell or arbitrary Android filesystem/QMP authority, but the guest credential is privileged and must be protected accordingly. Guest and Android-host endpoints, host keys, client keys, authorization, and persisted connection state must never be shared.
 
 The controller may be offline after setup. The Android host continues VM lifecycle duties, and the guest continues networking and Swarm workloads, without controller heartbeats or leases. On reconnection, the controller reads authoritative current state rather than replaying assumptions.
 
@@ -74,18 +76,22 @@ The controller may be offline after setup. The Android host continues VM lifecyc
 4. **No hidden transport authority.** Every transport implements the same connection interface and cannot expand management commands or privileges.
 5. **One active VM is atomic.** Start/stop transitions must eventually be serialized by the Android VM service; controllers and guests cannot race around that policy.
 6. **Offline is normal.** Loss of a controller does not stop the VM or workloads. Loss of management transport affects manageability, not guest workload ownership.
+7. **Controller trust domains stay separate.** Direct guest SSH authorizes guest-only operations; the restricted host-management endpoint authorizes only its versioned host protocol. Credentials and connection state are never reused across them.
 
 ## Direction of dependencies
 
 ```text
 controller UI/CLI -> controller core -> management protocol -> transport API
-                                                     |
-                                                     v
-Android platform -> VM service -> VM lifecycle/model -> QEMU/QMP/storage
-                                                     |
-                                                     v
-                                              Linux guest profile
-                                              + guest workload plane
+                         |                                   |
+                         |                                   v
+                         |                         Android VM service -> lifecycle/model
+                         |                                   |
+                         |                                   v
+                         |                            QEMU/AVF/storage
+                         |                                   |
+                         | direct verified guest SSH         v
+                         +-------------------------> Linux guest profile
+                                                    + guest workload plane
 ```
 
 The diagram is a dependency and authority guide, not a statement that Milestone 1 code exists.

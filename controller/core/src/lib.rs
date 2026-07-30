@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod guest_ssh;
+
 use std::fmt;
 use std::time::Instant;
 
@@ -451,18 +453,20 @@ mod tests {
         );
     }
 
+    type VmStatusConstructor = fn(
+        VmLifecycle,
+        VmBackend,
+        BootStage,
+        Option<u64>,
+        Option<&str>,
+    ) -> Result<VmStatus, ValidationError>;
+
     #[test]
     fn text_dto_apis_borrow_and_reject_oversized_input_before_retaining_it() {
         let _: fn(&str) -> Result<HostId, ValidationError> = HostId::parse;
         let _: fn(&str) -> Result<BoundaryMessage, ValidationError> = BoundaryMessage::parse;
         let _: fn(&str) -> Result<BoundaryError, ValidationError> = BoundaryError::internal;
-        let _: fn(
-            VmLifecycle,
-            VmBackend,
-            BootStage,
-            Option<u64>,
-            Option<&str>,
-        ) -> Result<VmStatus, ValidationError> = VmStatus::new;
+        let _: VmStatusConstructor = VmStatus::new;
 
         // The only large allocation belongs to this test caller. Each DTO receives a borrow and
         // rejects it, so no constructor can consume and retain the caller's unbounded allocation.

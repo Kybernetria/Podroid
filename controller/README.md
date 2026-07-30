@@ -2,17 +2,20 @@
 
 This directory is a standalone Rust Cargo workspace for operator-side clients. It is not linked into, packaged with, or granted authority by the Android Host APK.
 
-Ticket #9 implements only:
+Implemented controller components are:
 
-- `core`: validated host/default-VM state, action policy, and the narrow `VmServiceBoundary` (`refresh`, `start`, `stop`);
-- `desktop-ui`: a Slint presentation adapter; and
-- `PreviewVmService`: an explicitly non-live, bounded in-memory demonstration boundary.
+- `core`: validated host/default-VM state, action policy, the narrow `VmServiceBoundary`, and ticket #13's bounded direct guest-SSH client;
+- `desktop-ui`: a Slint presentation adapter over the non-live preview boundary;
+- `phonectl`: the ticket #13 CLI adapter for verified direct guest SSH; and
+- `PreviewVmService`: an explicitly non-live, bounded in-memory demonstration boundary for the desktop UI.
 
 ## Preview limitation
 
 **The desktop application does not connect to a phone.** It shows `preview-host`, keeps one `default` VM state in process memory, and discards that state when the desktop process exits. Start and Stop mutate only that preview object. The worker owns no QMP, shell, filesystem, arbitrary-command, workload, scheduler, Android Binder, credential, or transport capability.
 
-The authenticated, restricted remote-management protocol and its controller adapter belong to ticket #16. That adapter will implement the same narrow service boundary after protocol authentication, authorization, input bounds, deadlines, and compatibility rules are specified. It must replace—not bypass—the preview at the composition edge; Slint remains dependent only on core.
+The authenticated, restricted **Android-host** management protocol and its controller adapter belong to ticket #16. That adapter will implement the same narrow service boundary after protocol authentication, authorization, input bounds, deadlines, and compatibility rules are specified. It must replace—not bypass—the preview at the composition edge; Slint remains dependent only on core.
+
+Ticket #13 guest SSH is deliberately separate: it reaches Dropbear inside the Linux guest directly, verifies an out-of-band host key, and never grants an Android shell or forwarding capability. See [`phonectl/README.md`](phonectl/README.md).
 
 Closing the window drops the request sender and allows the worker to exit. It deliberately sends no Stop request. A future live boundary must preserve that behavior so controller loss never acts as a host-service or VM lease.
 

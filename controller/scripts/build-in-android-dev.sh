@@ -14,6 +14,7 @@ distrobox enter "${box_name}" -- bash -lc '
     cd "$1/controller"
     cargo fmt --all --check
     cargo check --workspace --locked
+    cargo clippy --workspace --all-targets --locked -- -D warnings
     cargo test --workspace --locked
-    cargo build --package podroid-desktop-controller --locked
+    cargo build --package podroid-desktop-controller --package phonectl --locked
 ' bash "${repository_root}"
