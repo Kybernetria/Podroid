@@ -192,6 +192,16 @@ class MinimalGuestVerifierTest(unittest.TestCase):
             self.assertNotEqual(malformed.returncode, 0)
             self.assertEqual(marker.read_text(), "031\n")
 
+    def test_network_selects_device_backed_nic_not_virtual_helpers(self):
+        network_path = REPO_ROOT / "build-rootfs/files/etc/init.d/podroid-network"
+        network = network_path.read_text()
+        self.assertIn('/sys/class/net/$_candidate/device', network)
+        self.assertNotIn('$2 != "lo" {print $2; exit}', network)
+        self.assertLess(
+            network.index('/sys/class/net/$_candidate/device'),
+            network.index('ip link set "$NETIF" up'),
+        )
+
     def test_failed_migration_cannot_advance_marker_or_reach_ready_dependency(self):
         bootstrap_path = REPO_ROOT / "build-rootfs/files/etc/init.d/podroid-bootstrap"
         network_path = REPO_ROOT / "build-rootfs/files/etc/init.d/podroid-network"

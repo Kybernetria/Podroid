@@ -14,8 +14,17 @@ start() {
 
     NETIF=""
     for _i in $(seq 1 10); do
-        NETIF=$(ip -o link show 2>/dev/null | awk -F': ' '$2 != "lo" {print $2; exit}')
-        NETIF=${NETIF%%@*}
+        # Select only a device-backed NIC. tailscaled creates dummy0/tailscale0
+        # before this service runs; assigning SLIRP to either silently blackholes
+        # all guest traffic. QEMU virtio-net and AVF's NIC both expose a device
+        # entry under sysfs.
+        for _candidate in $(ip -o link show 2>/dev/null | awk -F': ' '$2 != "lo" {print $2}'); do
+            _candidate=${_candidate%%@*}
+            if [ -e "/sys/class/net/$_candidate/device" ]; then
+                NETIF=$_candidate
+                break
+            fi
+        done
         [ -n "$NETIF" ] && break
         sleep 0.05
     done
