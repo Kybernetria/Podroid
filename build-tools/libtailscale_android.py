@@ -333,8 +333,15 @@ def parse_elf(data: bytes, label: str) -> dict[str, object]:
         if p_offset + p_filesz > len(data):
             raise VerificationError(f"{label}: program segment exceeds file")
         if p_type == PT_LOAD:
-            if p_align != 16_384:
-                raise VerificationError(f"{label}: PT_LOAD alignment is {p_align}, expected 16384")
+            if (
+                p_align < 16_384
+                or p_align % 16_384 != 0
+                or p_align & (p_align - 1) != 0
+            ):
+                raise VerificationError(
+                    f"{label}: PT_LOAD alignment is {p_align}, "
+                    "expected a power-of-two multiple of 16384"
+                )
             if (p_vaddr - p_offset) % p_align != 0:
                 raise VerificationError(f"{label}: incongruent PT_LOAD offset/address")
             loads.append((p_offset, p_vaddr, p_filesz, p_align))

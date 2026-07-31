@@ -93,6 +93,33 @@ object HostMetrics {
         null
     }
 
+    /**
+     * Android's java.lang.Process API does not expose pid(), even though the
+     * host JDK does. Linux exposes each thread's direct children in procfs.
+     * Snapshotting the bounded union immediately around ProcessBuilder.start()
+     * lets the QEMU engine identify exactly the newly-created child.
+     */
+    fun directChildPids(): Set<Int>? = try {
+        val tasks = File("/proc/self/task").listFiles()
+            ?.filter { it.name.all(Char::isDigit) }
+            ?.takeIf { it.size <= 1_024 }
+            ?: return null
+        buildSet {
+            tasks.forEach { task ->
+                File(task, "children").readText()
+                    .split(Regex("\\s+"))
+                    .filter { it.isNotEmpty() }
+                    .mapNotNullTo(this) { value ->
+                        value.toLongOrNull()
+                            ?.takeIf { it in 1..Int.MAX_VALUE.toLong() }
+                            ?.toInt()
+                    }
+            }
+        }
+    } catch (_: Exception) {
+        null
+    }
+
     /** VmRSS from /proc/[pid]/status, in megabytes. */
     fun processVmRssMb(pid: Int): Long? {
         val kb = try {

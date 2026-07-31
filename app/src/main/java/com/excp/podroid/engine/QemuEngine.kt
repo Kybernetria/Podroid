@@ -48,6 +48,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
+import java.nio.file.Files
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -131,19 +133,22 @@ class QemuEngine @Inject constructor(
     override val runningSinceMs: Long? get() = _runningSinceMs
 
     override fun emulatorRssMb(): Long? {
-        val proc = process?.takeIf { it.isAlive } ?: return null
-        val pid = HostMetrics.processPid(proc) ?: return null
+        process?.takeIf { it.isAlive } ?: return null
+        val pid = runtimePid ?: return null
         return HostMetrics.processVmRssMb(pid)
     }
 
     override fun emulatorPid(): Int? {
-        val proc = process?.takeIf { it.isAlive } ?: return null
-        return HostMetrics.processPid(proc)
+        process?.takeIf { it.isAlive } ?: return null
+        return runtimePid
     }
 
     @Volatile
     var process: Process? = null
         private set
+
+    @Volatile
+    private var runtimePid: Int? = null
 
     /** Unix socket paths exposed to TerminalViewModel for the bridge binary. */
     val serialSockPath: String get() = vmPaths.serialSocket.absolutePath
@@ -431,6 +436,7 @@ class QemuEngine @Inject constructor(
         }
 
         var processOwner: QemuProcessOwner<Process, Int>? = null
+        var spawnedPid: Int? = null
         var capturedOwner: QemuRuntimeOwner? = null
         var publishedOwner: PublishedQemuOwner? = null
         try {
@@ -440,8 +446,15 @@ class QemuEngine @Inject constructor(
             Log.d(TAG, "Launching backend=qemu argCount=${cmd.size} forwardCount=${portForwards.size}")
 
             val nativeDir = context.applicationInfo.nativeLibraryDir
+            val launcherPidFile = File(vmPaths.qemuWorkingDirectory, ".launcher-pid")
+            try {
+                Files.deleteIfExists(launcherPidFile.toPath())
+            } catch (e: IOException) {
+                throw IOException("Unable to clear stale launcher PID handshake", e)
+            }
             val pb = ProcessBuilder(cmd).directory(vmPaths.qemuWorkingDirectory)
             pb.environment()["LD_LIBRARY_PATH"] = "$nativeDir:${vmPaths.qemuDataDirectory.absolutePath}"
+            pb.environment()["PODROID_LAUNCHER_PID_FILE"] = launcherPidFile.absolutePath
             // Discard QEMU's stdout. Nothing routes there today (serial/QMP use
             // sockets), but user extra args like `-monitor stdio` could, and an
             // unread OS pipe would fill its buffer and deadlock the VM. Redirect
@@ -467,12 +480,23 @@ class QemuEngine @Inject constructor(
             }
             val owner = QemuProcessOwner<Process, Int>(
                 commit = { child ->
-                    val pid = HostMetrics.processPid(child)?.toLong()
+                    if (!child.isAlive) {
+                        val earlyStderr = readBoundedEarlyStderr(child.errorStream)
+                        recordRedactedStderr(earlyStderr)
+                        val category = classifyEarlyQemuFailure(earlyStderr)
+                        throw IOException(
+                            "QEMU exited before ownership commit " +
+                                "(code ${child.exitValue()}, category $category)"
+                        )
+                    }
+                    val pid = spawnedPid
+                        ?: HostMetrics.processPid(child)
                         ?: throw IOException("QEMU pid unavailable at ownership commit")
-                    val record = runtimeOwnerStore.capture(pid, generation)
+                    val record = runtimeOwnerStore.capture(pid.toLong(), generation)
                     capturedOwner = record
                     launchGate.commitLaunch(generation) {
                         process = child
+                        runtimePid = pid
                         // Publication is atomic and occurs only after this
                         // generation passed the process-commit fence.
                         publishedOwner = runtimeOwnerStore.publish(record)
@@ -498,7 +522,36 @@ class QemuEngine @Inject constructor(
                     // ProcessBuilder.start(). The surrounding NonCancellable owner
                     // block guarantees that a returned child cannot be discarded
                     // by prompt cancellation before commit-or-reap completes.
-                    if (launchGate.mayLaunch(generation)) pb.start() else null
+                    if (launchGate.mayLaunch(generation)) {
+                        val childrenBefore = HostMetrics.directChildPids()
+                        pb.start().also {
+                            repeat(100) {
+                                if (launcherPidFile.isFile &&
+                                    !Files.isSymbolicLink(launcherPidFile.toPath()) &&
+                                    launcherPidFile.length() in 2..31
+                                ) {
+                                    spawnedPid = launcherPidFile.readText()
+                                        .trim()
+                                        .toLongOrNull()
+                                        ?.takeIf { pid -> pid in 1..Int.MAX_VALUE.toLong() }
+                                        ?.toInt()
+                                    if (spawnedPid != null) return@repeat
+                                }
+                                Thread.sleep(2)
+                            }
+                            if (spawnedPid == null) {
+                                val childrenAfter = HostMetrics.directChildPids()
+                                spawnedPid = if (childrenBefore != null && childrenAfter != null) {
+                                    (childrenAfter - childrenBefore).singleOrNull()
+                                } else {
+                                    null
+                                }
+                            }
+                            launcherPidFile.delete()
+                        }
+                    } else {
+                        null
+                    }
                 }
             }
             if (proc == null) {
@@ -739,6 +792,7 @@ class QemuEngine @Inject constructor(
         qemuDispatcher?.close()
         qemuDispatcher = null
         process = null
+        runtimePid = null
         terminalSlot.clear()?.finishIfRunning()
         sessionClientDelegate = null
         _consoleText.value = ""
@@ -958,6 +1012,30 @@ class QemuEngine @Inject constructor(
         } else {
             appendLine("qemu stderr: [redacted; last ${lineLengths.size} line length(s): ${lineLengths.joinToString()}]")
         }
+    }
+
+    private fun readBoundedEarlyStderr(stream: InputStream): String {
+        val bytes = ByteArray(4_096)
+        var used = 0
+        while (used < bytes.size) {
+            val count = stream.read(bytes, used, bytes.size - used)
+            if (count < 0) break
+            if (count == 0) continue
+            used += count
+        }
+        return String(bytes, 0, used, Charsets.UTF_8)
+    }
+
+    private fun classifyEarlyQemuFailure(stderr: String): String = when {
+        stderr.contains("could not load kernel", ignoreCase = true) -> "kernel-load"
+        stderr.contains("cannot link executable", ignoreCase = true) ||
+            stderr.contains("library ", ignoreCase = true) -> "dynamic-linker"
+        stderr.contains("permission denied", ignoreCase = true) -> "permission"
+        stderr.contains("address already in use", ignoreCase = true) -> "socket-conflict"
+        stderr.contains("invalid option", ignoreCase = true) ||
+            stderr.contains("invalid parameter", ignoreCase = true) -> "invalid-argument"
+        stderr.isBlank() -> "no-stderr"
+        else -> "other-redacted"
     }
 
     /** Retain only lengths for the most recent [STDERR_TAIL_LINES] non-blank lines. */

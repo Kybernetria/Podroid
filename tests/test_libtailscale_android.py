@@ -159,8 +159,16 @@ class LibTailscaleAndroidVerifierTest(unittest.TestCase):
         self.assertEqual(["libtailscale.so"], info["dtNeeded"])
         with self.assertRaisesRegex(verifier.VerificationError, "AArch64"):
             verifier.parse_elf(synthetic_elf(machine=62), "wrong-arch")
+        self.assertEqual(
+            [65_536],
+            verifier.parse_elf(synthetic_elf(alignment=65_536), "larger-alignment")[
+                "loadAlignments"
+            ],
+        )
         with self.assertRaisesRegex(verifier.VerificationError, "alignment"):
             verifier.parse_elf(synthetic_elf(alignment=4096), "wrong-alignment")
+        with self.assertRaisesRegex(verifier.VerificationError, "alignment"):
+            verifier.parse_elf(synthetic_elf(alignment=49_152), "non-power-of-two-alignment")
 
     def test_jni_shim_must_depend_on_official_library(self):
         pin = dict(verifier.load_pin(REPO_ROOT))

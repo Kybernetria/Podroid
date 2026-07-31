@@ -26,10 +26,35 @@
  *       podroid-launcher.c -o libpodroid-launcher.so
  */
 
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/prctl.h>
 #include <unistd.h>
+
+static void publish_pid(void) {
+    const char *path = getenv("PODROID_LAUNCHER_PID_FILE");
+    if (path == NULL || path[0] != '/') {
+        return;
+    }
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return;
+    }
+
+    char value[32];
+    int length = snprintf(value, sizeof(value), "%ld\n", (long)getpid());
+    if (length <= 0 || length >= (int)sizeof(value) ||
+        write(fd, value, (size_t)length) != length) {
+        (void)close(fd);
+        (void)unlink(path);
+        return;
+    }
+    (void)fsync(fd);
+    (void)close(fd);
+}
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -52,6 +77,11 @@ int main(int argc, char *argv[]) {
     if (getppid() == 1) {
         return 1;
     }
+
+    /* Publish the launcher's PID through a private one-use file. execve keeps
+     * this PID, giving Android callers a supported ownership identity even on
+     * runtimes whose java.lang.Process has no pid() API. */
+    publish_pid();
 
     /* exec the real QEMU. PR_SET_PDEATHSIG is preserved across execve()
      * (only cleared on setuid execs, which we never do). */
