@@ -2,7 +2,7 @@
 
 ## libtailscale
 
-[`libtailscale/`](libtailscale/) is the unmodified official [`tailscale/libtailscale`](https://github.com/tailscale/libtailscale) repository pinned as a Git submodule. Clone it with:
+[`libtailscale/`](libtailscale/) is the unmodified official [`tailscale/libtailscale`](https://github.com/tailscale/libtailscale) repository pinned as a Git submodule. A merely present or empty directory is not an initialized checkout: the Android verifier rejects it rather than accidentally running Git commands against the parent repository. Clone it, including any nested submodules, with:
 
 ```bash
 distrobox enter android-dev -- bash -lc '

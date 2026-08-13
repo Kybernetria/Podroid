@@ -57,8 +57,60 @@ done
 # barrier=1: write barriers ON so ext4's journal ordering is durable. The
 #   guest's flushes reach storage.img through QEMU's writeback cache, which
 #   honors flushes, keeping the on-disk journal consistent for recovery.
+# e2fsck uses status 1 (and sometimes 2) after successfully repairing a
+#   filesystem. Never interpret those repair statuses as "not formatted".
+#   Status 4 is an uncorrected filesystem error and is also non-destructive.
+# A newly-created image carries this exact raw-device marker. The marker is
+# written by the Android backend before the image is exposed to the guest and
+# is cleared after a successful format. A missing marker is never treated as
+# proof of a blank image: it means the image is legacy, damaged, or unknown.
+BLANK_IMAGE_MARKER='PODROID-BLANK-IMAGE-V1'
+blank_image_marker_present() {
+    marker_bytes="$(dd if=/dev/vda bs=1 count=${#BLANK_IMAGE_MARKER} 2>/dev/null)" || return 1
+    [ "$marker_bytes" = "$BLANK_IMAGE_MARKER" ]
+}
+clear_blank_image_marker() {
+    dd if=/dev/zero of=/dev/vda bs=1 count=${#BLANK_IMAGE_MARKER} conv=notrunc 2>/dev/null
+}
+
+# Only an explicit creation marker plus a successful no-signature probe is
+# treated as the first-boot/no-filesystem case. blkid's status 2 is its
+# explicit "no recognizable token" result; a missing, failed, or ambiguous
+# probe is not proof of a blank image. A recognized filesystem of any type is
+# never formatted from this path.
+recover_persistent_ext4() {
+    fsck_status=0
+    e2fsck -y /dev/vda >/dev/null 2>&1 || fsck_status=$?
+    case "$fsck_status" in
+        0|1|2)
+            return 0
+            ;;
+        8)
+            if ! blank_image_marker_present; then
+                echo "FATAL: /dev/vda lacks the explicit blank-image creation marker; refusing to format" > /dev/console
+                return 1
+            fi
+            blkid_status=0
+            blkid_output="$(blkid -p -o export /dev/vda 2>/dev/null)" || blkid_status=$?
+            if [ "$blkid_status" -ne 2 ] || [ -n "$blkid_output" ]; then
+                echo "FATAL: /dev/vda is not positively proven blank (blkid status $blkid_status)" > /dev/console
+                return 1
+            fi
+            mkfs.ext4 -q -F /dev/vda \
+                || { echo "FATAL: mkfs.ext4 failed; refusing to continue" > /dev/console; return 1; }
+            clear_blank_image_marker \
+                || { echo "FATAL: could not clear the consumed blank-image marker" > /dev/console; return 1; }
+            ;;
+        *)
+            echo "FATAL: e2fsck failed with status $fsck_status; refusing to format /dev/vda" > /dev/console
+            return 1
+            ;;
+    esac
+}
+
 if ! mount -t ext4 -o rw,noatime,commit=1,barrier=1 /dev/vda /mnt/persist 2>/dev/null; then
-    e2fsck -y /dev/vda >/dev/null 2>&1 || mkfs.ext4 -q -F /dev/vda
+    recover_persistent_ext4 \
+        || { echo "FATAL: persistent ext4 recovery failed" > /dev/console; ls -l /dev/vd* > /dev/console 2>&1; exec sh; }
     mount -t ext4 -o rw,noatime,commit=1,barrier=1 /dev/vda /mnt/persist \
         || { echo "FATAL: persistent ext4 (/dev/vda) mount failed" > /dev/console; ls -l /dev/vd* > /dev/console 2>&1; exec sh; }
 fi

@@ -85,7 +85,15 @@ class AndroidNotificationPoster @Inject constructor(
             .setAutoCancel(true)
             .setPriority(prio)
             .build()
-        NotificationManagerCompat.from(context).notify(notifId, n)
+        try {
+            if (!notificationsPermitted()) {
+                throw SecurityException("notifications not permitted")
+            }
+            NotificationManagerCompat.from(context).notify(notifId, n)
+        } catch (denied: SecurityException) {
+            // Permission can be revoked between the preflight and notify().
+            throw denied
+        }
         return notifId
     }
 }

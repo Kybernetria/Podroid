@@ -42,7 +42,7 @@ Commands:
   clean         Remove build artifacts and temporary containers
 
 Options:
-  --fast        Skip QEMU native builds if binaries already exist
+  --fast        Skip QEMU native builds only when the complete pinned cache verifies
   --help        Show this help message
 
 Environment:
@@ -62,29 +62,6 @@ find_ndk() {
     else
         return 1
     fi
-}
-
-# ── Verification Helpers ──────────────────────────────────────────────────────
-verify_16kb_align() {
-    local lib="$1"
-    python3 - "$lib" << 'EOF'
-import struct, sys
-path = sys.argv[1]
-with open(path, 'rb') as f:
-    data = f.read()
-e_phoff = struct.unpack_from('<Q', data, 32)[0]
-e_phentsize = struct.unpack_from('<H', data, 54)[0]
-e_phnum = struct.unpack_from('<H', data, 56)[0]
-aligns = []
-for i in range(e_phnum):
-    off = e_phoff + i * e_phentsize
-    if struct.unpack_from('<I', data, off)[0] == 1:
-        aligns.append(struct.unpack_from('<Q', data, off + 48)[0])
-ok = all(a >= 16384 for a in aligns)
-if not ok:
-    print(f"FAILED: {path} is not 16KB page aligned!")
-    sys.exit(1)
-EOF
 }
 
 # ── Build Functions ───────────────────────────────────────────────────────────
@@ -146,6 +123,25 @@ build_rootfs() {
     success "Built ${ASSETS}/alpine-rootfs.squashfs ($(du -h "${ASSETS}/alpine-rootfs.squashfs" | cut -f1)), system-version ${sysver:-0}"
 }
 
+QEMU_CACHE_VERIFIER="${SCRIPT_DIR}/build-tools/verify_qemu_cache.py"
+
+qemu_artifacts_present() {
+    python3 "$QEMU_CACHE_VERIFIER" \
+        --jni-directory "$JNILIBS" \
+        --qemu-directory "$ASSETS/qemu" \
+        --qemu-version "$(grep -E '^podroidQemuVersion=' "${SCRIPT_DIR}/gradle.properties" | cut -d= -f2)" \
+        >/dev/null 2>&1
+}
+
+build_qemu_if_needed() {
+    command -v python3 >/dev/null || error "Python 3 is required for QEMU cache verification"
+    if [ "$FAST" = true ] && qemu_artifacts_present; then
+        log "QEMU artifacts, keymaps, alignment, and provenance are valid; skipping native QEMU build (--fast)."
+        return 0
+    fi
+    build_qemu
+}
+
 build_qemu() {
     local qemu_ver
     qemu_ver=$(grep -E '^podroidQemuVersion=' "${SCRIPT_DIR}/gradle.properties" | cut -d= -f2)
@@ -157,17 +153,30 @@ build_qemu() {
     log "Extracting QEMU artifacts..."
     docker rm -f podroid-qemu-extract 2>/dev/null || true
     docker create --name podroid-qemu-extract podroid-qemu-builder /bin/true
-    
-    mkdir -p "$JNILIBS" "$ASSETS/qemu/keymaps"
+
+    mkdir -p "$JNILIBS"
+    local qemu_stage="${ASSETS}/.qemu-build-${BASHPID}"
+    rm -rf "$qemu_stage"
+    mkdir -p "$qemu_stage/keymaps"
     docker cp podroid-qemu-extract:/libqemu-system-aarch64.so "$JNILIBS/"
     docker cp podroid-qemu-extract:/libslirp.so               "$JNILIBS/"
     docker cp podroid-qemu-extract:/libpodroid-bridge.so      "$JNILIBS/"
     docker cp podroid-qemu-extract:/libpodroid-launcher.so    "$JNILIBS/"
-    docker cp podroid-qemu-extract:/qemu/efi-virtio.rom        "$ASSETS/qemu/"
-    docker cp podroid-qemu-extract:/qemu/keymaps/.             "$ASSETS/qemu/keymaps/"
+    docker cp podroid-qemu-extract:/qemu/efi-virtio.rom        "$qemu_stage/"
+    docker cp podroid-qemu-extract:/qemu/keymaps/.             "$qemu_stage/keymaps/"
     docker rm podroid-qemu-extract >/dev/null
-    
-    verify_16kb_align "$JNILIBS/libqemu-system-aarch64.so"
+
+    python3 "$QEMU_CACHE_VERIFIER" \
+        --jni-directory "$JNILIBS" \
+        --qemu-directory "$qemu_stage" \
+        --qemu-version "$qemu_ver" \
+        --write-manifest
+    python3 "$QEMU_CACHE_VERIFIER" \
+        --jni-directory "$JNILIBS" \
+        --qemu-directory "$qemu_stage" \
+        --qemu-version "$qemu_ver"
+    rm -rf "$ASSETS/qemu"
+    mv "$qemu_stage" "$ASSETS/qemu"
     success "QEMU and bridge ready."
 }
 
@@ -268,14 +277,14 @@ case "$1" in
     kernel)    build_kernel ;;
     initramfs) build_initramfs ;;
     rootfs)    build_rootfs ;;
-    qemu)      build_qemu ;;
+    qemu)      build_qemu_if_needed ;;
     apk)       build_apk ;;
     deploy)    build_apk && deploy_apk ;;
     test)      run_boot_test ;;
     all)
         build_initramfs
         build_rootfs
-        build_qemu
+        build_qemu_if_needed
         build_apk
         ;;
     clean)

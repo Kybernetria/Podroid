@@ -1,5 +1,6 @@
 package com.excp.podroid.engine.avf.ninep
 
+import android.os.Build
 import android.util.Log
 import java.io.ByteArrayOutputStream
 import java.io.EOFException
@@ -97,6 +98,27 @@ interface StatSource {
 object OsStatSource : StatSource {
     override fun lstat(path: String): StatInfo {
         val st = android.system.Os.lstat(path)
+        val atimeSec: Long
+        val atimeNsec: Long
+        val mtimeSec: Long
+        val mtimeNsec: Long
+        val ctimeSec: Long
+        val ctimeNsec: Long
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            atimeSec = st.st_atim.tv_sec
+            atimeNsec = st.st_atim.tv_nsec
+            mtimeSec = st.st_mtim.tv_sec
+            mtimeNsec = st.st_mtim.tv_nsec
+            ctimeSec = st.st_ctim.tv_sec
+            ctimeNsec = st.st_ctim.tv_nsec
+        } else {
+            atimeSec = st.st_atime
+            atimeNsec = 0
+            mtimeSec = st.st_mtime
+            mtimeNsec = 0
+            ctimeSec = st.st_ctime
+            ctimeNsec = 0
+        }
         return StatInfo(
             ino = st.st_ino,
             mode = st.st_mode.toLong(),
@@ -107,12 +129,12 @@ object OsStatSource : StatSource {
             rdev = st.st_rdev,
             blksize = st.st_blksize,
             blocks = st.st_blocks,
-            atimeSec = st.st_atim.tv_sec,
-            atimeNsec = st.st_atim.tv_nsec,
-            mtimeSec = st.st_mtim.tv_sec,
-            mtimeNsec = st.st_mtim.tv_nsec,
-            ctimeSec = st.st_ctim.tv_sec,
-            ctimeNsec = st.st_ctim.tv_nsec,
+            atimeSec = atimeSec,
+            atimeNsec = atimeNsec,
+            mtimeSec = mtimeSec,
+            mtimeNsec = mtimeNsec,
+            ctimeSec = ctimeSec,
+            ctimeNsec = ctimeNsec,
         )
     }
 }

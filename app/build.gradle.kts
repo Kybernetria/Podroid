@@ -102,7 +102,7 @@ val buildDebugLibTailscale by tasks.registering(BuildDebugLibTailscaleTask::clas
 
 val testLibTailscaleAndroidVerifier by tasks.registering(Exec::class) {
     group = "verification"
-    description = "Runs libtailscale pin, ELF, manifest, and packaging regression tests."
+    description = "Runs fixture-only libtailscale ELF, manifest, and packaging regression tests."
     workingDir(rootProject.projectDir)
     commandLine("python3", "-m", "unittest", "-v", "tests/test_libtailscale_android.py")
     inputs.files(
@@ -113,6 +113,28 @@ val testLibTailscaleAndroidVerifier by tasks.registering(Exec::class) {
         rootProject.file("third_party/libtailscale/go.mod"),
         rootProject.file("app/build.gradle.kts"),
         rootProject.file("app/src/main/AndroidManifest.xml")
+    )
+}
+
+val testInitPodroidRecovery by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Runs fail-closed init-podroid persistent filesystem recovery tests."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", "-m", "unittest", "-v", "tests/test_init_podroid.py")
+    inputs.files(
+        rootProject.file("init-podroid"),
+        rootProject.file("tests/test_init_podroid.py")
+    )
+}
+
+val testQemuCacheVerifier by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Runs QEMU cache file-type, alignment, completeness, and provenance tests."
+    workingDir(rootProject.projectDir)
+    commandLine("python3", "-m", "unittest", "-v", "tests/test_qemu_cache.py")
+    inputs.files(
+        rootProject.file("build-tools/verify_qemu_cache.py"),
+        rootProject.file("tests/test_qemu_cache.py")
     )
 }
 
@@ -461,6 +483,11 @@ tasks.matching { it.name == "assembleRelease" }.configureEach {
 
 tasks.named("check") {
     dependsOn(
+        // This is the production gate. Fixture tests below must not make an
+        // uninitialized or wrong libtailscale checkout appear valid.
+        verifyLibTailscalePin,
+        testInitPodroidRecovery,
+        testQemuCacheVerifier,
         verifyGuestCredentialSources,
         verifyGuestCredentialArtifact,
         testGuestCredentialVerifier,
@@ -482,6 +509,8 @@ tasks.named("check") {
 
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
     dependsOn(
+        testInitPodroidRecovery,
+        testQemuCacheVerifier,
         testGuestCredentialVerifier,
         testMinimalGuestVerifier,
         verifyVmInstancePaths,

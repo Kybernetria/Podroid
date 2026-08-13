@@ -108,6 +108,9 @@ class PodroidService : Service() {
 
     override fun onBind(intent: Intent?): IBinder = localBinder
 
+    @SuppressLint("BinderGetCallingInMainThread")
+    private fun binderCallingUid(): Int = Binder.getCallingUid()
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
@@ -176,7 +179,7 @@ class PodroidService : Service() {
                     if (engine.sessionClientDelegate === client) engine.sessionClientDelegate = null
                 }
             },
-            caller = CallerUidVerifier.sameUid(Process.myUid()) { Binder.getCallingUid() },
+            caller = CallerUidVerifier.sameUid(Process.myUid(), ::binderCallingUid),
         )
         localBinder = LocalBinder(endpoint)
     }

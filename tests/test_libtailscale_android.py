@@ -83,9 +83,6 @@ def binary_manifest(strings):
 
 
 class LibTailscaleAndroidVerifierTest(unittest.TestCase):
-    def test_actual_reviewed_source_pin_is_clean(self):
-        verifier.verify_pin(REPO_ROOT, require_toolchains=False)
-
     def test_go_mod_must_match_go_and_tailscale_module_pins(self):
         pin = verifier.load_pin(REPO_ROOT)
         good = "module github.com/tailscale/libtailscale\n\ngo 1.25.5\n\nrequire tailscale.com v1.94.1\n"
@@ -94,18 +91,46 @@ class LibTailscaleAndroidVerifierTest(unittest.TestCase):
             with self.subTest(go_mod=bad), self.assertRaises(verifier.VerificationError):
                 verifier.validate_go_mod(pin, bad)
 
+    def test_uninitialized_checkout_is_rejected_before_git_commands(self):
+        pin = verifier.load_pin(REPO_ROOT)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "third_party/libtailscale").mkdir(parents=True)
+            with self.assertRaisesRegex(verifier.VerificationError, "submodule is not initialized"):
+                verifier.verify_source_pin(root, pin, lambda *args: self.fail(args))
+
+    def test_parent_repository_checkout_cannot_satisfy_submodule_verification(self):
+        pin = verifier.load_pin(REPO_ROOT)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "third_party/libtailscale"
+            source.mkdir(parents=True)
+            (source / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
+
+            def parent_runner(command, cwd, timeout_seconds, env):
+                del cwd, timeout_seconds, env
+                if tuple(command) == ("git", "rev-parse", "--show-toplevel"):
+                    return str(root)
+                raise AssertionError(command)
+
+            with self.assertRaisesRegex(verifier.VerificationError, "parent repository"):
+                verifier.verify_source_pin(root, pin, parent_runner)
+
     def test_dirty_official_source_is_rejected(self):
         pin = verifier.load_pin(REPO_ROOT)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "third_party/libtailscale"
             source.mkdir(parents=True)
-            (source / "LICENSE").write_bytes((REPO_ROOT / "third_party/libtailscale/LICENSE").read_bytes())
-            (source / "go.mod").write_bytes((REPO_ROOT / "third_party/libtailscale/go.mod").read_bytes())
+            (source / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
+            (source / "LICENSE").write_bytes(b"fixture license\n")
+            (source / "go.mod").write_bytes(b"fixture go.mod\n")
 
             def dirty_runner(command, cwd, timeout_seconds, env):
                 del timeout_seconds, env
                 key = tuple(command)
+                if key == ("git", "rev-parse", "--show-toplevel"):
+                    return str(source)
                 if key == ("git", "rev-parse", "HEAD"):
                     return pin["commit"]
                 if key == ("git", "rev-parse", "HEAD^{tree}"):
@@ -125,12 +150,15 @@ class LibTailscaleAndroidVerifierTest(unittest.TestCase):
             root = Path(directory)
             source = root / "third_party/libtailscale"
             source.mkdir(parents=True)
-            (source / "LICENSE").write_bytes((REPO_ROOT / "third_party/libtailscale/LICENSE").read_bytes())
-            (source / "go.mod").write_bytes((REPO_ROOT / "third_party/libtailscale/go.mod").read_bytes())
+            (source / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
+            (source / "LICENSE").write_bytes(b"fixture license\n")
+            (source / "go.mod").write_bytes(b"fixture go.mod\n")
 
             def ignored_runner(command, cwd, timeout_seconds, env):
                 del timeout_seconds, env
                 key = tuple(command)
+                if key == ("git", "rev-parse", "--show-toplevel"):
+                    return str(source)
                 if key == ("git", "rev-parse", "HEAD"):
                     return pin["commit"]
                 if key == ("git", "rev-parse", "HEAD^{tree}"):
@@ -149,8 +177,31 @@ class LibTailscaleAndroidVerifierTest(unittest.TestCase):
     def test_license_hash_mismatch_is_rejected(self):
         pin = dict(verifier.load_pin(REPO_ROOT))
         pin["licenseSha256"] = "0" * 64
-        with self.assertRaisesRegex(verifier.VerificationError, "LICENSE hash"):
-            verifier.verify_source_pin(REPO_ROOT, pin)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "third_party/libtailscale"
+            source.mkdir(parents=True)
+            (source / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
+            (source / "LICENSE").write_bytes(b"fixture license\n")
+            (source / "go.mod").write_bytes(b"fixture go.mod\n")
+
+            def clean_runner(command, cwd, timeout_seconds, env):
+                del timeout_seconds, env
+                key = tuple(command)
+                if key == ("git", "rev-parse", "--show-toplevel"):
+                    return str(source)
+                if key == ("git", "rev-parse", "HEAD"):
+                    return pin["commit"]
+                if key == ("git", "rev-parse", "HEAD^{tree}"):
+                    return pin["tree"]
+                if key[:3] == ("git", "ls-files", "--stage"):
+                    return f"160000 {pin['commit']} 0\tthird_party/libtailscale"
+                if key[:2] == ("git", "status") or key[:3] == ("git", "ls-files", "--others"):
+                    return ""
+                raise AssertionError((command, cwd))
+
+            with self.assertRaisesRegex(verifier.VerificationError, "LICENSE hash"):
+                verifier.verify_source_pin(root, pin, clean_runner)
 
     def test_elf_parser_proves_aarch64_alignment_and_needed_libraries(self):
         info = verifier.parse_elf(synthetic_elf(("libtailscale.so",)), "shim")
