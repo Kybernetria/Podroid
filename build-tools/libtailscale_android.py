@@ -163,8 +163,25 @@ def verify_source_pin(
     runner: Runner = run_command,
 ) -> None:
     source = repo_root / "third_party/libtailscale"
-    if not source.is_dir():
-        raise VerificationError("libtailscale submodule is not initialized")
+    if source.is_symlink() or not source.is_dir() or not (source / ".git").exists():
+        raise VerificationError(
+            "libtailscale submodule is not initialized; run "
+            "git submodule update --init --recursive"
+        )
+
+    try:
+        source_root = Path(
+            runner(["git", "rev-parse", "--show-toplevel"], source, 30, None)
+        ).resolve()
+    except (OSError, VerificationError, ValueError) as error:
+        raise VerificationError(
+            "libtailscale submodule is not initialized; run "
+            "git submodule update --init --recursive"
+        ) from error
+    if source_root != source.resolve():
+        raise VerificationError(
+            "libtailscale path resolves to the parent repository, not an initialized submodule"
+        )
 
     head = runner(["git", "rev-parse", "HEAD"], source, 30, None)
     tree = runner(["git", "rev-parse", "HEAD^{tree}"], source, 30, None)

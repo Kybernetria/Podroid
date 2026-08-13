@@ -32,6 +32,7 @@ import com.excp.podroid.util.HostMetrics
 import com.excp.podroid.util.LogProxy
 import com.excp.podroid.vm.ResolvedVmBootPlan
 import com.excp.podroid.vm.UefiNoCloudVmBootPlan
+import com.excp.podroid.vm.BlankStorageImageMarker
 import com.excp.podroid.vm.VmBootFiles
 import com.excp.podroid.vm.VmId
 import com.excp.podroid.vm.VmPathSecurity
@@ -971,11 +972,16 @@ class QemuEngine @Inject constructor(
                 // place when larger — the guest's first-boot resize2fs claims the
                 // new space; truncating to shrink would corrupt the filesystem.
                 desiredBytes > current -> {
-                    runCatching {
-                        java.io.RandomAccessFile(storageFile, "rw").use { it.setLength(desiredBytes) }
-                    }.onSuccess {
-                        Log.i(TAG, "storage.img grown ${current / (1024 * 1024)}MB → ${storageSizeGb}GB (guest resize2fs on next boot)")
-                    }.onFailure { Log.e(TAG, "Failed to grow storage.img", it) }
+                    try {
+                        java.io.RandomAccessFile(storageFile, "rw").use { image ->
+                            image.setLength(desiredBytes)
+                            image.fd.sync()
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to grow storage.img", e)
+                        throw IOException("Couldn't grow the VM disk image: ${e.message}", e)
+                    }
+                    Log.i(TAG, "storage.img grown ${current / (1024 * 1024)}MB → ${storageSizeGb}GB (guest resize2fs on next boot)")
                     return
                 }
                 else -> {
@@ -986,8 +992,8 @@ class QemuEngine @Inject constructor(
         }
 
         try {
-            java.io.RandomAccessFile(storageFile, "rw").use { it.setLength(desiredBytes) }
-            Log.d(TAG, "Created storage.img (${storageSizeGb}GB)")
+            BlankStorageImageMarker.create(storageFile, desiredBytes)
+            Log.d(TAG, "Created marked blank storage.img (${storageSizeGb}GB)")
         } catch (e: Exception) {
             // Don't swallow: a 0-byte / missing storage.img would otherwise boot
             // into an opaque early-boot stop. Surface it so start() can report a
